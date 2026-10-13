@@ -116,3 +116,65 @@ def test_config_init_generates_validated_config(tmp_path, workspace):
     assert code == 2 and "exists" in err
     code, out, _ = run("--config", str(out_file), "--check-config")
     assert code == 0
+
+
+def test_check_config_diagnoses_missing_paths_and_tools(tmp_path):
+    cfg = tmp_path / "providers.yaml"
+    cfg.write_text(
+        yaml.safe_dump(
+            {
+                "workspace": {"allowed_roots": [str(tmp_path / "no-such-samples")], "data_dir": str(tmp_path / "data")},
+                "providers": [
+                    {
+                        "id": "gh",
+                        "enabled": True,
+                        "command": "no-such-engine-xyz",
+                        "adapter": "re_mcp",
+                        "env": {"GHIDRA_INSTALL_DIR": str(tmp_path / "no-ghidra")},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    code, out, _ = run("--config", str(cfg), "--check-config")
+    assert code == 1, "a missing workspace root is an error"
+    assert "allowed root does not exist" in out
+    assert "executable not found: no-such-engine-xyz" in out
+    assert "GHIDRA_INSTALL_DIR points to a missing directory" in out
+    assert not (tmp_path / "data").exists(), "diagnostics must not create directories"
+
+
+def test_config_init_create_dirs(tmp_path):
+    ws, data, out_file = tmp_path / "ws", tmp_path / "appdata" / "data", tmp_path / "config" / "providers.yaml"
+    code, _, err = run(
+        "config",
+        "init",
+        "--workspace",
+        str(ws),
+        "--data-dir",
+        str(data),
+        "--output",
+        str(out_file),
+        "--example",
+        str(EXAMPLE),
+    )
+    assert code == 2 and "--create-dirs" in err
+    code, _, err = run(
+        "config",
+        "init",
+        "--workspace",
+        str(ws),
+        "--data-dir",
+        str(data),
+        "--create-dirs",
+        "--output",
+        str(out_file),
+        "--example",
+        str(EXAMPLE),
+    )
+    assert code == 0, err
+    assert ws.is_dir() and data.is_dir()
+    code, out, _ = run("--config", str(out_file), "--check-config")
+    assert code == 0 and str(data) in out
+

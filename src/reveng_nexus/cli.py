@@ -75,9 +75,18 @@ def cmd_check_config(args: argparse.Namespace) -> int:
         f"dynamic analysis: {config.policy.dynamic.enabled}"
     )
     print(f"Workspace roots: {list(config.allowed_roots) or 'none (target intake disabled)'}")
+    print(f"Data directory: {config.data_dir}")
     for warning in config.warnings:
         print(f"warning: {warning}")
-    return 0
+    from .diagnostics import diagnose
+
+    findings = diagnose(config)
+    for finding in findings:
+        print(finding.render())
+    errors = [f for f in findings if f.level == "error"]
+    if findings:
+        print(f"Diagnostics: {len(errors)} error(s), {len(findings) - len(errors)} warning(s)")
+    return 1 if errors else 0
 
 
 def _find_example(explicit: str | None) -> Path | None:
@@ -107,8 +116,14 @@ def cmd_config_init(args: argparse.Namespace) -> int:
     workspace = [str(Path(w).expanduser().resolve()) for w in args.workspace]
     for w in workspace:
         if not Path(w).is_dir():
-            print(f"workspace folder does not exist: {w}", file=sys.stderr)
-            return 2
+            if args.create_dirs:
+                Path(w).mkdir(parents=True, exist_ok=True)
+                print(f"Created workspace folder {w}")
+            else:
+                print(f"workspace folder does not exist: {w} (pass --create-dirs to create it)", file=sys.stderr)
+                return 2
+    if args.data_dir and args.create_dirs:
+        Path(args.data_dir).expanduser().mkdir(parents=True, exist_ok=True)
     raw.setdefault("workspace", {})["allowed_roots"] = workspace
     if args.data_dir:
         # Keep the SQLite evidence DB out of synced folders (OneDrive/Dropbox) when possible.
@@ -288,7 +303,6 @@ def cmd_report(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     config = _load(args)
     transport = getattr(args, "transport", "stdio")
-
     async def run(manager):
         from .server import serve_http, serve_stdio
 
@@ -358,6 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
     ci.add_argument("--ghidra-dir", help="Ghidra install dir (written into Ghidra providers' env)")
     ci.add_argument("--ida-dir", help="IDA install dir (written into IDA providers' env)")
     ci.add_argument("--data-dir", help="Evidence DB/audit/reports folder (default: ./data)")
+    ci.add_argument("--create-dirs", action="store_true", help="Create the workspace and data folders if missing")
     ci.add_argument("--output", default="config/providers.yaml")
     ci.add_argument("--example", help="Path to providers.example.yaml")
     ci.add_argument("--force", action="store_true")
