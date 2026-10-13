@@ -1,0 +1,229 @@
+# RevEng Nexus provider configuration (schema used by reveng-nexus 0.2).
+#
+# Copy to config/providers.yaml (git-ignored) or generate one with:
+#   reveng-nexus config init --workspace C:/RE-Lab/samples --enable ghidra_remcp
+# then validate with:  reveng-nexus --config config/providers.yaml --check-config
+#
+# Every external provider below is DISABLED. Enabling one starts its process (or connects
+# to its URL) when the gateway starts. ${VAR} / ${VAR:-default} are expanded from your
+# environment in command, args, env and cwd. Never put API keys or tokens in this file.
+# Launch commands were verified against the upstream revisions listed in
+# docs/PROVIDER_MATRIX.md on 2026-10-13; "runtime" rows were actually executed.
+
+workspace:
+  # Nexus only reads files under these folders. Empty = target intake disabled.
+  allowed_roots: []
+  #  - "C:/RE-Lab/samples"
+  data_dir: ./data              # evidence DB, audit log, staged copies, provider logs, reports
+  max_artifact_size_mb: 250
+  follow_symlinks: false
+
+policy:
+  read_only: true               # block tools that modify analysis databases
+  allow_code_execution: false   # tools that run arbitrary code (execute_python, pyghidra, run_script)
+  code_execution_providers: []  # must list provider ids explicitly if the above is enabled
+  allow_lifecycle_passthrough: false
+  allow_remote_ai: false        # required (with model.allow_remote) for non-loopback model endpoints
+  dynamic_analysis:
+    enabled: false              # Frida etc. stay stopped unless this is true
+    authorized_devices: []      # e.g. ["emulator-5554"] — a disposable test device you control
+    authorized_targets: []      # e.g. ["com.example.mytestapp"] — apps you are authorised to test
+    allowed_tools: []           # instrumentation tools you explicitly allow, e.g. ["trace_method"]
+  global_blocked_tool_patterns: []
+
+analysis:
+  default_depth: standard       # quick | standard | deep
+  operation_timeout_seconds: 900
+  max_concurrent_provider_calls: 2
+  max_functions_to_decompile: 5
+  cross_engine_comparison: explicit   # explicit (nexus_compare_function) | auto (during analyze)
+  ai_enhancement: false
+  max_failover: 1
+  raw_output_limit_kb: 256
+
+routing:
+  preferred:
+    binary.decompile: [ghidra_remcp, ghidra_mcpy, ida_official, ida_rs, binary_ninja]
+    binary.functions: [ghidra_remcp, ghidra_mcpy, ida_rs, binary_ninja, builtin]
+
+server:
+  tool_mode: compact            # compact = nexus_* tools only; namespaced = also <provider>__<tool>
+
+providers:
+  # Always available: format parsing (pyelftools/pefile/own APK parser) + Capstone disassembly.
+  - id: builtin
+    name: RevEng Nexus built-in static engine
+    type: builtin
+    enabled: true
+    priority: 10
+
+  # --- Ghidra (open-source default path) ---------------------------------------------
+  # jtsylve/re-mcp Ghidra backend, stdio. Runtime-verified: re-mcp-ghidra 3.0.3, Ghidra 12.1.4, JDK 25.
+  # Needs Ghidra 12+ and JDK 21+; uvx downloads the pinned package into an isolated env.
+  - id: ghidra_remcp
+    name: Ghidra via re-mcp-ghidra
+    enabled: false
+    type: mcp_stdio
+    adapter: re_mcp
+    engine: ghidra
+    command: uvx
+    args: ["--python", "3.12", "re-mcp-ghidra==3.0.3"]
+    env:
+      GHIDRA_INSTALL_DIR: "${GHIDRA_INSTALL_DIR}"
+      GHIDRA_MCP_DISABLE_EXECUTE: "1"       # hide the sandboxed-Python "execute" meta-tool
+      GHIDRA_MCP_DISABLE_BATCH: "1"
+      GHIDRA_MCP_DISABLE_TOOL_SEARCH: "1"   # expose every tool so Nexus can classify each one
+      GHIDRA_MCP_MAX_WORKERS: "2"
+    protocol_mode: legacy
+    priority: 80
+    timeout_seconds: 600
+    startup_timeout_seconds: 900
+
+  # nightwing-us/mcpyghidra: one headless server per target, readiness JSON on stdout,
+  # then Streamable HTTP. Runtime-verified: mcpyghidra 0.8.0 + Ghidra 12.1.4.
+  # Same engine family as ghidra_remcp: agreement between the two is consistency only.
+  - id: ghidra_mcpy
+    name: Ghidra via MCPyGhidra (headless)
+    enabled: false
+    type: mcp_launched_http
+    adapter: mcpyghidra
+    engine: ghidra
+    command: uvx
+    args: ["--python", "3.12", "--from", "mcpyghidra==0.8.0", "mcpyghidra-headless", "{target}",
+           "--host", "127.0.0.1", "--port", "0", "--project-dir", "{workdir}"]
+    env:
+      GHIDRA_INSTALL_DIR: "${GHIDRA_INSTALL_DIR}"
+    launch:
+      startup_timeout_seconds: 900
+    protocol_mode: legacy
+    priority: 60
+    timeout_seconds: 600
+
+  # --- IDA Pro (licensed; pick ONE controller per IDA installation) --------------------
+  # Official Hex-Rays server (IDA 9.4+ with idalib). Analysis runs through execute_python,
+  # which Nexus blocks unless policy.allow_code_execution lists this provider id.
+  - id: ida_official
+    name: Hex-Rays IDA MCP (official)
+    enabled: false
+    type: mcp_stdio
+    adapter: ida_official
+    engine: ida
+    command: uvx
+    args: ["ida-mcp==20261008.0.1", "stdio", "--agent=reveng-nexus"]
+    conflict_group: ida
+    priority: 70
+    timeout_seconds: 600
+    startup_timeout_seconds: 600
+
+  # blacktop/ida-mcp-rs (Rust, idalib). Its own --read-only switch strips mutating tools.
+  - id: ida_rs
+    name: IDA via ida-mcp-rs
+    enabled: false
+    type: mcp_stdio
+    adapter: ida_rs
+    engine: ida
+    command: "${IDADIR}/ida-mcp.exe"
+    args: ["--read-only", "--toolsets=core,functions,disassembly,decompile,xrefs,control_flow,search,metadata"]
+    env:
+      IDADIR: "${IDADIR}"
+    conflict_group: ida
+    priority: 65
+    timeout_seconds: 600
+    startup_timeout_seconds: 600
+
+  # jtsylve/re-mcp IDA backend (alternative IDA driver; same tool names as the Ghidra backend).
+  - id: re_mcp_ida
+    name: IDA via re-mcp-ida
+    enabled: false
+    type: mcp_stdio
+    adapter: re_mcp
+    engine: ida
+    command: uvx
+    args: ["--python", "3.12", "re-mcp-ida==3.0.3"]
+    env:
+      IDADIR: "${IDADIR}"
+      IDA_MCP_DISABLE_EXECUTE: "1"
+      IDA_MCP_DISABLE_BATCH: "1"
+      IDA_MCP_DISABLE_TOOL_SEARCH: "1"
+    conflict_group: ida
+    protocol_mode: legacy
+    priority: 60
+    timeout_seconds: 600
+    startup_timeout_seconds: 900
+
+  # --- Binary Ninja (licensed; GUI must be running with the plugin's server on :9009) ----
+  - id: binary_ninja
+    name: Binary Ninja MCP (npm bridge)
+    enabled: false
+    type: mcp_stdio
+    adapter: binary_ninja
+    engine: binaryninja
+    command: npx
+    args: ["-y", "binary-ninja-mcp@1.0.0", "--host", "127.0.0.1", "--port", "9009"]
+    protocol_mode: legacy
+    priority: 55
+    timeout_seconds: 300
+
+  # --- Android ----------------------------------------------------------------------
+  # Qtty/jadx-mcp-server: build the JVM daemon with Maven first (see docs/PROVIDER_MATRIX.md).
+  # No LICENSE file upstream: use your own checkout; do not redistribute it.
+  - id: jadx
+    name: JADX MCP Server
+    enabled: false
+    type: mcp_stdio
+    adapter: jadx
+    engine: jadx
+    command: "${JADX_MCP_HOME}/.venv/Scripts/python.exe"   # Linux/macOS: .venv/bin/python
+    args: ["${JADX_MCP_HOME}/mcp_server/jadx_mcp.py"]
+    env:
+      JADX_URL: "http://127.0.0.1:8765"
+      JADX_PORT: "8765"
+      JADX_HEAP: "4g"
+    protocol_mode: legacy
+    priority: 70
+    timeout_seconds: 600
+    startup_timeout_seconds: 600
+
+  # monkeywave/frida-mobile-mcp — dynamic analysis. Starts only when policy.dynamic_analysis
+  # is enabled; protection-bypass, memory-write and custom-script tools are always blocked.
+  - id: frida_mobile
+    name: Frida Mobile MCP
+    enabled: false
+    type: mcp_stdio
+    adapter: frida_mobile
+    engine: frida
+    kind: dynamic
+    command: npx
+    args: ["-y", "frida-mobile-mcp@0.2.3", "--no-mobile-mcp"]
+    env:
+      FRIDA_DEVICE_ID: "${FRIDA_DEVICE_ID:-}"
+      FRIDA_MCP_ALLOW_CUSTOM_SCRIPTS: "0"
+      FRIDA_MCP_MEMORY_WRITE: "0"
+    protocol_mode: legacy
+    priority: 50
+    timeout_seconds: 120
+
+  # --- AI-assisted decompilation (optional) -----------------------------------------
+  # LLM4Decompile served by YOU behind an OpenAI-compatible /v1/completions endpoint, e.g.
+  #   vllm serve LLM4Binary/llm4decompile-6.7b-v2 --port 8000
+  # Weights are under the DeepSeek model licence (LICENSE-MODEL); Nexus never downloads them.
+  - id: llm4decompile
+    name: LLM4Decompile (local inference)
+    enabled: false
+    type: llm4decompile
+    model:
+      endpoint: "http://127.0.0.1:8000"
+      model: "LLM4Binary/llm4decompile-6.7b-v2"
+      variant: ref                # ref = refine Ghidra pseudocode (V2); end = from assembly (V1.5)
+      max_tokens: 1024
+      temperature: 0.0
+      allow_remote: false
+      api_key_env: ""             # name of an env var holding a key, if your server needs one
+    timeout_seconds: 300
+
+  # Any other MCP server you run yourself over Streamable HTTP (raw tools only, no adapter).
+  - id: remote_mcp_example
+    name: Example Streamable HTTP MCP endpoint
+    enabled: false
+    type: mcp_http
+    url: http://127.0.0.1:9100/mcp
