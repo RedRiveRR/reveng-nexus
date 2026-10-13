@@ -1,0 +1,378 @@
+"""Adapter for jtsylve/re-mcp (re-mcp-ghidra / re-mcp-ida), stdio transport.
+
+Runtime-verified on 2026-10-13 with re-mcp-ghidra 3.0.3 + Ghidra 12.1.4 (Windows 11,
+JDK 25) against the generated ELF fixture. Observed contract:
+
+* ``open_database(file_path, database_id, run_auto_analysis, keep_open)`` returns
+  immediately with status "opening"; ``wait_for_analysis(database=...)`` blocks until
+  ready. ``run_auto_analysis`` defaults to **False** upstream — without it function
+  bodies, string definitions and many xrefs are missing, so Nexus always passes True.
+* Every analysis tool requires ``database``.
+* Results are structured JSON (``structured_content``); pagination uses
+  ``offset/limit`` with ``has_more``.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..errors import ProviderCallError
+from .base import McpAdapter, UpstreamPin, fmt_address, function_ref, parse_address, parse_listing_lines
+
+_LIFECYCLE = {"open_database": "lifecycle", "close_database": "lifecycle", "wait_for_analysis": "lifecycle"}
+# Meta-tools proxy to *any* tool (including hidden mutating ones) by name, bypassing
+# per-tool classification, so Nexus never forwards them.
+_META = {"call": "blocked", "batch": "blocked", "execute": "blocked", "run_script": "execute"}
+_EXTRA = {
+    "save_database": "mutate",
+    "list_databases": "read",
+    "list_targets": "read",
+    "search_tools": "read",
+    "get_schema": "read",
+    "reanalyze_range": "mutate",
+    "assemble_instruction": "read",  # returns encoded bytes; patching is patch_asm
+    "export_all_pseudocode": "read",
+    "export_all_disassembly": "read",
+    "generate_signatures": "read",
+}
+
+
+class ReMcpAdapter(McpAdapter):
+    def database_id(self, sha256: str) -> str:
+        return "n" + sha256[:15]
+
+    async def prepare(self, provider, target) -> dict[str, Any]:
+        sessions = provider.adapter_state.setdefault("sessions", {})
+        if target.sha256 in sessions:
+            return sessions[target.sha256]
+        staged = target.staged_path(provider.id)
+        db = self.database_id(target.sha256)
+        warnings: list[str] = []
+        try:
+            payload, wait_payload = await self._open(provider, target, str(staged), db, force_new=False)
+        except ProviderCallError as first:
+            # Observed live: a project left in the staging dir by an interrupted session can be
+            # unreadable ("File not found: //<name>"). The database lives only in Nexus' private
+            # staging directory, so rebuilding it from the staged copy is safe.
+            warnings.append(f"existing engine database could not be reopened ({first.message[:160]}); rebuilt it")
+            payload, wait_payload = await self._open(provider, target, str(staged), db, force_new=True)
+        session = {"database": db, "open": payload, "ready": wait_payload, "warnings": warnings}
+        sessions[target.sha256] = session
+        return session
+
+    async def perform(self, provider, operation, target, params):
+        result = await super().perform(provider, operation, target, params)
+        session = provider.adapter_state.get("sessions", {}).get(target.sha256, {})
+        if session.get("warnings"):
+            result.warnings.extend(session.pop("warnings"))  # reported once, on the next result
+        return result
+
+    async def _open(self, provider, target, path: str, db: str, *, force_new: bool) -> tuple[Any, dict[str, Any]]:
+        args: dict[str, Any] = {"file_path": path, "database_id": db, "run_auto_analysis": True, "keep_open": True}
+        if force_new:
+            args["force_new"] = True
+        payload, _text, _raw = await self.call(provider, target, "open_database", args)
+        wait_payload, _t, _r = await self.call(
+            provider,
+            target,
+            "wait_for_analysis",
+            {"database": db},
+            timeout=float(provider.config.startup_timeout_seconds),
+        )
+        if not isinstance(wait_payload, dict) or wait_payload.get("status") != "ready":
+            raise ProviderCallError(f"{provider.id}: database did not become ready: {str(wait_payload)[:300]}")
+        return payload, wait_payload
+
+    async def release(self, provider, sha256: str) -> None:
+        session = provider.adapter_state.setdefault("sessions", {}).pop(sha256, None)
+        if not session or provider._owner is None or not provider._owner.alive:
+            return
+        try:
+            # Saving persists *Nexus' private* engine database (never the target) so the next
+            # session can reuse auto-analysis instead of finding a half-written project.
+            await provider.call_tool(
+                "close_database", {"database": session["database"], "save": True}, internal=True, target_sha256=sha256
+            )
+        except Exception:  # noqa: BLE001 - best effort; the worker dies with the provider anyway
+            pass
+
+    async def _paged(self, provider, target, tool: str, args: dict[str, Any], limit: int) -> tuple[list[dict], list]:
+        items: list[dict[str, Any]] = []
+        raws = []
+        offset = 0
+        while len(items) < limit:
+            page_args = {**args, "offset": offset, "limit": min(500, limit - len(items))}
+            payload, _text, raw = await self.call(provider, target, tool, page_args)
+            raws.append(raw)
+            page = (payload or {}).get("items", []) if isinstance(payload, dict) else []
+            items.extend(page)
+            if not page or not payload.get("has_more"):
+                break
+            offset += len(page)
+        return items, raws
+
+    # -- operations ----------------------------------------------------------------
+    async def op_binary_metadata(self, provider, target, session, params):
+        db = session["database"]
+        payload, _text, raw = await self.call(provider, target, "get_database_info", {"database": db})
+        info = payload if isinstance(payload, dict) else {}
+        ready = session.get("ready", {})
+        normalized = {
+            "processor": info.get("processor", ready.get("processor")),
+            "bits": info.get("bitness", ready.get("bitness")),
+            "file_type": info.get("file_type", ready.get("file_type")),
+            "function_count": info.get("function_count", ready.get("function_count")),
+            "image_base": parse_address(info.get("image_base") or info.get("min_address")),
+            "engine_info": {k: v for k, v in info.items() if k not in {"database", "file_path"}},
+        }
+        return self.result(
+            provider,
+            "binary.metadata",
+            "get_database_info",
+            normalized,
+            raw,
+            claim=f"{normalized['processor']} {normalized['file_type']}",
+        )
+
+    async def op_binary_functions(self, provider, target, session, params):
+        args: dict[str, Any] = {"database": session["database"]}
+        if params.get("query"):
+            args["filter_pattern"] = str(params["query"])
+        items, raws = await self._paged(provider, target, "list_functions", args, int(params.get("limit", 500)))
+        functions = []
+        for item in items:
+            start = parse_address(item.get("start"))
+            end = parse_address(item.get("end"))
+            functions.append(
+                {
+                    "name": item.get("name"),
+                    "address": start,
+                    "size": item.get("size")
+                    if item.get("size") is not None
+                    else (end - start if start and end else None),
+                    "end": end,
+                }
+            )
+        return self.result(
+            provider,
+            "binary.functions",
+            "list_functions",
+            {"functions": functions, "total": len(functions)},
+            raws,
+            claim=f"{len(functions)} functions",
+        )
+
+    async def op_binary_decompile(self, provider, target, session, params):
+        address, name, ref = function_ref(params)
+        payload, text, raw = await self.call(
+            provider, target, "decompile_function", {"address": ref, "database": session["database"]}
+        )
+        info = payload if isinstance(payload, dict) else {}
+        code = info.get("decompiled_code") or info.get("code") or text
+        resolved = parse_address(info.get("address")) or address
+        fname = info.get("function_name") or name
+        return self.result(
+            provider,
+            "binary.decompile",
+            "decompile_function",
+            {
+                "function": {"name": fname, "address": resolved},
+                "code": code.replace("\r\n", "\n"),
+                "language": "c-like pseudocode",
+            },
+            raw,
+            subject_type="function",
+            subject_address=resolved,
+            subject_name=fname,
+            claim=f"pseudocode for {fname or ref}",
+        )
+
+    async def op_binary_disassemble(self, provider, target, session, params):
+        address, name, ref = function_ref(params)
+        payload, text, raw = await self.call(
+            provider, target, "disassemble_function", {"address": ref, "database": session["database"]}
+        )
+        info = payload if isinstance(payload, dict) else {}
+        instructions = []
+        for item in info.get("instructions", []) or info.get("items", []) or []:
+            if isinstance(item, dict):
+                instructions.append(
+                    {
+                        "address": parse_address(item.get("address")),
+                        "bytes": (item.get("bytes") or "").replace(" ", "").lower() or None,
+                        "mnemonic": str(item.get("mnemonic", "")).lower(),
+                        "op_str": item.get("operands", item.get("op_str", "")),
+                    }
+                )
+        if not instructions:
+            listing = info.get("disassembly") or info.get("listing") or text
+            instructions = parse_listing_lines(str(listing))
+        resolved = parse_address(info.get("address")) or address
+        fname = info.get("function_name") or info.get("name") or name
+        return self.result(
+            provider,
+            "binary.disassemble",
+            "disassemble_function",
+            {"function": {"name": fname, "address": resolved}, "instructions": instructions},
+            raw,
+            subject_type="function",
+            subject_address=resolved,
+            subject_name=fname,
+            claim=f"{len(instructions)} instructions",
+        )
+
+    async def op_binary_xrefs(self, provider, target, session, params):
+        address, name, ref = function_ref(params)
+        direction = params.get("direction", "to")
+        tool = "get_xrefs_to" if direction == "to" else "get_xrefs_from"
+        items, raws = await self._paged(
+            provider, target, tool, {"address": ref, "database": session["database"]}, int(params.get("limit", 200))
+        )
+        refs = []
+        for item in items:
+            refs.append(
+                {
+                    "from": parse_address(item.get("from_address")),
+                    "to": parse_address(item.get("to_address")) if item.get("to_address") else address,
+                    "from_function": item.get("from_function") or None,
+                    "type": item.get("ref_type"),
+                    "is_call": item.get("is_call"),
+                }
+            )
+        return self.result(
+            provider,
+            "binary.xrefs",
+            tool,
+            {"subject": {"address": address, "name": name}, "direction": direction, "refs": refs},
+            raws,
+            subject_type="address" if address is not None else "function",
+            subject_address=address,
+            subject_name=name,
+            claim=f"{len(refs)} xrefs {direction}",
+        )
+
+    async def op_binary_cfg(self, provider, target, session, params):
+        address, name, ref = function_ref(params)
+        payload, _text, raw = await self.call(
+            provider, target, "get_basic_blocks", {"address": ref, "database": session["database"]}
+        )
+        blocks = []
+        for block in (
+            (payload or {}).get("blocks", (payload or {}).get("items", [])) if isinstance(payload, dict) else []
+        ):
+            blocks.append(
+                {
+                    "start": parse_address(block.get("start") or block.get("start_address")),
+                    "end": parse_address(block.get("end") or block.get("end_address")),
+                    "successors": [parse_address(s) for s in block.get("successors", []) or []],
+                }
+            )
+        return self.result(
+            provider,
+            "binary.cfg",
+            "get_basic_blocks",
+            {"function": {"address": address, "name": name}, "blocks": blocks},
+            raw,
+            subject_type="function",
+            subject_address=address,
+            subject_name=name,
+            claim=f"{len(blocks)} basic blocks",
+        )
+
+    async def op_binary_strings(self, provider, target, session, params):
+        args: dict[str, Any] = {"database": session["database"]}
+        if params.get("query"):
+            args["filter_pattern"] = str(params["query"])
+        if params.get("min_length"):
+            args["min_length"] = int(params["min_length"])
+        items, raws = await self._paged(provider, target, "get_strings", args, int(params.get("limit", 200)))
+        strings = [
+            {
+                "address": parse_address(i.get("address")),
+                "value": i.get("value"),
+                "length": i.get("length"),
+                "encoding": i.get("type"),
+            }
+            for i in items
+        ]
+        return self.result(
+            provider,
+            "binary.strings",
+            "get_strings",
+            {"strings": strings, "returned": len(strings)},
+            raws,
+            claim=f"{len(strings)} strings",
+        )
+
+    async def op_binary_imports(self, provider, target, session, params):
+        items, raws = await self._paged(
+            provider, target, "get_imports", {"database": session["database"]}, int(params.get("limit", 2000))
+        )
+        imports = [
+            {
+                "name": i.get("name"),
+                "library": i.get("module") or i.get("library"),
+                "address": parse_address(i.get("address")),
+            }
+            for i in items
+        ]
+        return self.result(
+            provider,
+            "binary.imports",
+            "get_imports",
+            {"imports": imports, "total": len(imports)},
+            raws,
+            claim=f"{len(imports)} imports",
+        )
+
+    async def op_binary_exports(self, provider, target, session, params):
+        items, raws = await self._paged(
+            provider, target, "get_exports", {"database": session["database"]}, int(params.get("limit", 2000))
+        )
+        exports = [{"name": i.get("name"), "address": parse_address(i.get("address"))} for i in items]
+        return self.result(
+            provider,
+            "binary.exports",
+            "get_exports",
+            {"exports": exports, "total": len(exports)},
+            raws,
+            claim=f"{len(exports)} exports",
+        )
+
+
+RE_MCP = ReMcpAdapter(
+    name="re_mcp",
+    engine="ghidra",
+    engine_family=None,
+    pin=UpstreamPin(
+        repository="https://github.com/jtsylve/re-mcp",
+        revision="7b38aa92952bd0621e8c964dc859f1515fe26a10",
+        package="re-mcp-ghidra / re-mcp-ida",
+        package_version="3.0.3",
+        verified="runtime",
+        verified_on="2026-10-13",
+        notes="Ghidra backend runtime-verified; IDA backend shares tool names but was not run (no IDA licence).",
+    ),
+    manifest={**_LIFECYCLE, **_META, **_EXTRA},
+    bindings={
+        "binary.metadata": ("open_database", "wait_for_analysis", "get_database_info"),
+        "binary.functions": ("open_database", "wait_for_analysis", "list_functions"),
+        "binary.decompile": ("open_database", "wait_for_analysis", "decompile_function"),
+        "binary.disassemble": ("open_database", "wait_for_analysis", "disassemble_function"),
+        "binary.xrefs": ("open_database", "wait_for_analysis", "get_xrefs_to", "get_xrefs_from"),
+        "binary.cfg": ("open_database", "wait_for_analysis", "get_basic_blocks"),
+        "binary.strings": ("open_database", "wait_for_analysis", "get_strings"),
+        "binary.imports": ("open_database", "wait_for_analysis", "get_imports"),
+        "binary.exports": ("open_database", "wait_for_analysis", "get_exports"),
+    },
+    trust_annotations=True,
+    protocol_mode="legacy",
+    limitations=(
+        "Workers create Ghidra/IDA databases next to the file they open; Nexus passes a staged copy.",
+        "Without run_auto_analysis upstream returns 1-byte function bounds and few xrefs/strings "
+        "(observed); Nexus always requests auto-analysis.",
+        "Set GHIDRA_MCP_DISABLE_EXECUTE=1 / GHIDRA_MCP_DISABLE_BATCH=1 so code-mode tools are not even offered.",
+    ),
+)
+
+_ = fmt_address  # re-exported for adapters that format addresses
