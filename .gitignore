@@ -1,0 +1,80 @@
+# --- Python build / cache ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- virtual environments ---
+.venv/
+venv/
+env/
+
+# --- local configuration and credentials (never commit) ---
+config/providers.yaml
+config/*.local.yaml
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+.mcp.json
+
+# --- RevEng Nexus runtime data: evidence DB, audit log, staged copies, engine projects, reports ---
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.log
+*.jsonl
+
+# --- analysis targets and engine artefacts (samples are never committed) ---
+samples/
+workspace/
+*.elf
+*.exe
+*.dll
+*.so
+*.dylib
+*.apk
+*.dex
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.bndb
+*.gpr
+*.rep/
+*_ghidra/
+
+# --- model weights and caches ---
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+models/
+.cache/
+
+# --- private Obsidian vault contents (the vault lives outside this repo) ---
+.obsidian/
+
+# --- editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

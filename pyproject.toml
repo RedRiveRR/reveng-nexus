@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reveng-nexus"
+version = "0.2.0"
+description = "A modular MCP gateway for AI-assisted, evidence-driven reverse engineering."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "RevEng Nexus contributors" }]
+# Ranges are bounded to the minor versions tested in docs/TESTING.md.
+dependencies = [
+  "mcp>=2.3.0,<2.4",
+  "PyYAML>=6.0.1,<7",
+  "jsonschema>=4.20,<5",
+  "anyio>=4.9,<5",
+  "httpx2>=2.10,<3",
+  "uvicorn>=0.31,<1",
+  "pyelftools==0.32",
+  "pefile==2024.8.26",
+]
+
+[project.optional-dependencies]
+disasm = ["capstone>=5.0.9,<6"]
+dev = [
+  "capstone>=5.0.9,<6",
+  "pytest>=9.0,<10",
+  "pytest-asyncio>=1.0,<2",
+  "ruff>=0.17,<0.18",
+  "mypy>=1.13",
+]
+
+[project.scripts]
+reveng-nexus = "reveng_nexus.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reveng_nexus"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "integration: needs a real external engine (opt-in via environment variables)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/fixtures/*.py" = ["E741"]
