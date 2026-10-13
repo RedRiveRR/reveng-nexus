@@ -1,0 +1,158 @@
+# RevEng Nexus
+
+**One local MCP gateway for evidence-driven, multi-engine reverse engineering.**
+
+RevEng Nexus gives Claude Code (or any MCP client) one stable set of `nexus_*` tools over
+several reverse-engineering engines. It identifies the artefact, routes each operation to a
+suitable engine, enforces a read-only-first policy, records every result as provenance-backed
+evidence, compares engines without hiding their disagreements, and exports reports. Each
+engine stays a separate, pinned, optional process with its own licence; nothing upstream is
+vendored.
+
+> **Status (0.2.0, 2026-10-13).** The gateway, policy engine, evidence store, comparison
+> and reporting are implemented and tested (158 tests pass; 2 are skipped by design: the
+> opt-in live Ghidra test, which **also passes when enabled** on this machine, and a symlink
+> test that needs Windows Developer Mode). The **Ghidra path is verified end to end with real Ghidra 12.1.4**
+> through two upstreams (re-mcp-ghidra 3.0.3 and MCPyGhidra 0.8.0). IDA, Binary Ninja, JADX
+> and Frida adapters are written against the pinned upstream source but **were not run**
+> here (no licence, GUI, Maven build or test device). LLM4Decompile is tested only against a
+> mock inference endpoint. See [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md).
+
+## What works today
+
+| Area | State |
+|---|---|
+| MCP gateway (stdio; loopback Streamable HTTP) | working; tested over a real stdio subprocess and over HTTP |
+| Built-in engine: ELF/PE/Mach-O/DEX/APK parsing, strings, Capstone disassembly, AndroidManifest decoding | working, always available |
+| Ghidra via `re-mcp-ghidra` (stdio) and `mcpyghidra-headless` (launched HTTP) | working (runtime-verified) |
+| Routing, sequential failover, per-provider concurrency, conflict-group locks, duplicate-capability detection | working (tested with real MCP mock engines) |
+| Cross-engine comparison (rebased identity, callees, constants, strings, call targets; per-group independence) | working |
+| Evidence store (SQLite, migrations), cases, findings, reviews, Markdown/JSON reports | working |
+| Policy: read-only, code execution, dynamic analysis, workspace guard, audit, redaction | enforced and tested |
+| IDA (official / ida-mcp-rs / re-mcp-ida), Binary Ninja, JADX, Frida | adapters exist; **not runtime-tested here** |
+| LLM4Decompile | adapter tested against a mock OpenAI-compatible server only |
+
+## Quick start (Windows PowerShell, Ghidra-first, no commercial software)
+
+Prerequisites: Python 3.11+ (3.12 tested), [uv](https://docs.astral.sh/uv/) (provides `uvx`),
+a JDK 21+, and [Ghidra 12.x](https://github.com/NationalSecurityAgency/ghidra/releases)
+extracted somewhere (12.1.4 was used for verification).
+
+```powershell
+cd reveng-nexus
+uv venv C:\venvs\reveng-nexus --python 3.12      # a venv outside OneDrive avoids sync churn
+$env:VIRTUAL_ENV = "C:\venvs\reveng-nexus"; uv pip install -e ".[disasm]"
+
+# Generate config/providers.yaml (git-ignored) for your machine:
+C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe config init `
+    --workspace C:\RE-Lab\samples `
+    --enable ghidra_remcp --enable ghidra_mcpy `
+    --ghidra-dir C:\tools\ghidra_12.1.4_PUBLIC `
+    --data-dir C:\RE-Lab\nexus-data
+
+# Start each enabled provider on its own and report health/tools (first run downloads the pinned packages):
+C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe --config config\providers.yaml providers check
+
+# Analyse an authorised sample from the workspace without an agent:
+C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe --config config\providers.yaml analyze C:\RE-Lab\samples\sample.elf --compare
+C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe --config config\providers.yaml report <case-id>
+```
+
+Linux/macOS: replace the paths, use `.venv/bin/reveng-nexus`, and for JADX use
+`.venv/bin/python` in its `command`.
+
+Without Ghidra, the gateway still runs: the built-in engine provides metadata, strings,
+imports/exports, symbol-table functions, Capstone disassembly and APK manifest analysis.
+Decompilation then reports `capability_unavailable` with the providers that could supply it.
+
+## Connect Claude Code
+
+Use absolute paths, because Claude Code may start the server from another working directory:
+
+```powershell
+claude mcp add reveng-nexus -- C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe `
+    --config "C:\Users\you\...\reveng-nexus\config\providers.yaml" serve
+```
+
+or, as a project-scoped `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "reveng-nexus": {
+      "command": "C:/venvs/reveng-nexus/Scripts/reveng-nexus.exe",
+      "args": ["--config", "C:/path/to/reveng-nexus/config/providers.yaml", "serve"]
+    }
+  }
+}
+```
+
+The server speaks MCP on stdout, so nothing else is printed there; diagnostics go to stderr
+and to per-provider logs in `<data_dir>/logs/`. The stdio launch above is exercised by
+`tests/test_server.py::test_gateway_runs_as_stdio_subprocess` with the MCP SDK client. The
+`claude mcp add` command itself was not run as part of this work.
+
+For MCP clients that only speak HTTP (for example GhidrAssist's MCP client):
+`reveng-nexus --config … serve --transport http --port 8765` serves
+`http://127.0.0.1:8765/mcp`. It binds loopback only and has no authentication.
+
+## Tool catalogue
+
+| Group | Tools |
+|---|---|
+| Discovery | `nexus_status`, `nexus_list_providers`, `nexus_list_capabilities`, `nexus_list_tools`, `nexus_plan_analysis` |
+| Intake | `nexus_inspect_target` (workspace check, SHA-256, format/arch, case), `nexus_list_targets` |
+| Native static | `nexus_analyze_binary`, `nexus_get_binary_metadata`, `nexus_list_functions`, `nexus_decompile_function`, `nexus_disassemble_function`, `nexus_get_xrefs`, `nexus_get_control_flow`, `nexus_search_strings`, `nexus_compare_function` |
+| AI (optional) | `nexus_ai_decompile` (always `ai_generated` / `unverified`) |
+| Android | `nexus_analyze_apk`, `nexus_inspect_android_components`, `nexus_get_class_source` (JADX) |
+| Dynamic | `nexus_dynamic_analysis_status` (read-only status; instrumentation is policy-gated) |
+| Findings/evidence | `nexus_record_finding`, `nexus_get_findings`, `nexus_record_evidence`, `nexus_get_evidence`, `nexus_review`, `nexus_export_report` |
+| Escape hatch | `nexus_call_provider_tool` (raw upstream tool, policy-checked and audited) |
+
+Every result carries an `evidence_id` and provenance (provider, original tool, engine,
+engine family, version, raw-output hash). `server.tool_mode: namespaced` additionally
+exposes each callable upstream tool as `<provider>__<tool>`.
+
+Typical agent flow: `nexus_status` → `nexus_inspect_target` → `nexus_analyze_binary` →
+focused tools → `nexus_compare_function` on important functions → `nexus_record_finding`
+citing evidence ids → `nexus_review` → `nexus_export_report`.
+
+## Optional engines (manual prerequisites)
+
+| Provider id | You must provide |
+|---|---|
+| `ida_official`, `ida_rs`, `re_mcp_ida` | A licensed IDA Pro 9.4+ (idalib). The official server analyses only through `execute_python`, which stays blocked unless you enable `policy.allow_code_execution` for it. Enable **one** IDA controller per installation (they share `conflict_group: ida`). |
+| `binary_ninja` | A licensed Binary Ninja with the `binary_ninja_mcp` plugin running its server on `127.0.0.1:9009`, and the target open in the GUI. |
+| `jadx` | A checkout of Qtty/jadx-mcp-server built with Maven (`mvn clean package`, JDK 17+), its Python venv, and `JADX_MCP_HOME` set. |
+| `frida_mobile` | An authorised, disposable test device with frida-server, plus `policy.dynamic_analysis` with explicit `authorized_devices`, `authorized_targets` and `allowed_tools`. |
+| `llm4decompile` | A locally served LLM4Decompile checkpoint behind `/v1/completions` (e.g. vLLM). Weights are under the DeepSeek model licence. |
+
+## Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, provider lifecycle, routing, evidence and comparison model
+- [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md): every upstream: pin, licence, launch command, verification level, limitations
+- [docs/SECURITY.md](docs/SECURITY.md): enforced controls (with tests), residual risks, deployment advice
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): environment, checks, how to add an adapter
+- [docs/TESTING.md](docs/TESTING.md): what the tests cover, and the exact results from this machine
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): upstream and dependency licences
+- [config/providers.example.yaml](config/providers.example.yaml): annotated configuration
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Target intake is disabled until workspace.allowed_roots is configured` | Add your samples folder to `workspace.allowed_roots`, or use `config init --workspace`. |
+| `executable 'uvx' was not found` | Install uv, or set `command` to an absolute path. |
+| `environment variables referenced in config are unset: ['GHIDRA_INSTALL_DIR']` | Set the variable, or rerun `config init --ghidra-dir`. |
+| Ghidra provider times out on first start | The first `uvx` run downloads packages and Ghidra analyses the file; raise `startup_timeout_seconds`. Check `<data_dir>/logs/<provider>.log`. |
+| `existing engine database could not be reopened … rebuilt it` | Expected after an interrupted session; Nexus rebuilt its private staged database. |
+| `capability_unavailable` | `nexus_list_capabilities` shows which providers could supply the operation and why each is unavailable. |
+| Tool shows `callable: false` | It is classified mutate, execute, dynamic or unknown. See `nexus_list_tools(include_blocked=true)` for the reason. Change policy only for an authorised need. |
+
+## Licence
+
+RevEng Nexus is MIT-licensed; that covers this repository only. Upstream engines, servers and
+model weights keep their own licences (GPL-3.0 for Binary Ninja MCP, none at all for
+jadx-mcp-server, the DeepSeek terms for LLM4Decompile weights, among others). See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Use Nexus only on software you are
+authorised to analyse, and run unknown samples in an isolated VM. Nexus provides no sandbox.
