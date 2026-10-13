@@ -303,6 +303,15 @@ def cmd_report(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     config = _load(args)
     transport = getattr(args, "transport", "stdio")
+    if transport == "http" and args.host not in {"127.0.0.1", "localhost", "::1"}:
+        # There is no authentication layer, so a non-loopback bind is refused rather than offered.
+        print(
+            f"Refusing to serve HTTP on {args.host!r}: RevEng Nexus has no authentication and binds "
+            "loopback only (127.0.0.1, localhost, ::1). Use stdio, or an authenticated reverse proxy you operate.",
+            file=sys.stderr,
+        )
+        return 2
+
     async def run(manager):
         from .server import serve_http, serve_stdio
 

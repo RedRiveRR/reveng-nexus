@@ -178,3 +178,7 @@ def test_config_init_create_dirs(tmp_path):
     code, out, _ = run("--config", str(out_file), "--check-config")
     assert code == 0 and str(data) in out
 
+
+def test_serve_http_refuses_non_loopback_bind():
+    code, _, err = run("--config", str(EXAMPLE), "serve", "--transport", "http", "--host", "0.0.0.0", "--port", "8799")
+    assert code == 2 and "Refusing to serve HTTP" in err and "Traceback" not in err

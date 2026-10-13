@@ -271,3 +271,49 @@ async def test_streamable_http_transport_on_loopback(config_factory, workspace):
             server.should_exit = True
     finally:
         await mgr.close()
+
+
+async def test_http_rejects_foreign_host_header(config_factory, workspace):
+    """DNS-rebinding protection: a request whose Host is not loopback must be refused."""
+    import socket
+
+    import anyio
+    import httpx2
+
+    from reveng_nexus.server import build_http_server
+
+    mgr = ProviderManager(config_factory(workspace, []))
+    await mgr.start()
+    try:
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        server = build_http_server(mgr, "127.0.0.1", port)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(server.serve)
+            for _ in range(100):
+                if server.started:
+                    break
+                await anyio.sleep(0.05)
+            body = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "1"},
+                },
+            }
+            headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+            async with httpx2.AsyncClient() as http:
+                evil = await http.post(
+                    f"http://127.0.0.1:{port}/mcp", json=body, headers={**headers, "Host": "attacker.example"}
+                )
+                good = await http.post(f"http://127.0.0.1:{port}/mcp", json=body, headers=headers)
+            assert evil.status_code in (400, 403, 421), evil.status_code
+            assert good.status_code == 200, good.status_code
+            server.should_exit = True
+    finally:
+        await mgr.close()
