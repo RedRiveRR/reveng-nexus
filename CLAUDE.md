@@ -4,9 +4,17 @@
 
 Build one local-first MCP gateway that combines specialized reverse-engineering engines while preserving each upstream's own runtime, release cadence, license and API. The gateway owns provider discovery/routing, policy gates, a target registry, evidence provenance and cross-engine comparison. It must not pretend an LLM-generated pseudocode reconstruction is ground truth.
 
+## Project memory (read first, read little)
+
+A private Obsidian vault next to this repo (`../reveng-nexus-obsidian`) holds the current
+state, decisions and next actions. Start every task with its `00 - Home/Start Here.md` and
+`00 - Home/Current State.md`, then only the notes the task needs (`Project Map.md`). Code
+and tests outrank notes. Update only the affected notes and add a session summary afterwards.
+Rules: `docs/OBSIDIAN_WORKFLOW.md`. If the vault is absent, skip this section.
+
 ## Orientation
 
-- Read `README.md`, `docs/ARCHITECTURE.md`, `docs/PROVIDER_MATRIX.md` and `docs/SECURITY.md` before changing the design. `docs/TESTING.md` lists what is verified and how.
+- Before changing the design, read the relevant one of `docs/ARCHITECTURE.md`, `docs/PROVIDER_MATRIX.md` or `docs/SECURITY.md`. `docs/TESTING.md` holds the observed test counts; `docs/DEPLOYMENT.md` the permanent Windows layout.
 - Code map: `config.py` (schema) · `policy.py`/`security.py` (tool classification) · `artifacts.py` (workspace guard, hashing, staging) · `formats/` (parsers) · `providers/` (built-in, MCP child, LLM4Decompile) · `adapters/` (one per upstream, pinned) · `registry.py` (lifecycle/routing/locks) · `compare.py` · `orchestrator.py` · `evidence.py` · `report.py` · `server.py` · `cli.py`.
 - Provider status as of 2026-10-13: Ghidra (`re_mcp`, `mcpyghidra` adapters) is **runtime-verified**. IDA, Binary Ninja, JADX and Frida adapters are **source-verified only**. LLM4Decompile is tested against a mock endpoint only.
 
