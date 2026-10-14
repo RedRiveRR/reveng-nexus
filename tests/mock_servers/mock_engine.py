@@ -182,6 +182,11 @@ def _page(items: list[Any], args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def on_list_tools(ctx, params) -> ListToolsResult:
+    subset = os.environ.get("MOCK_TOOLS_SUBSET")
+    if subset:
+        # Mimics re-mcp-ghidra with a broken engine backend: only meta/lifecycle tools are listed.
+        names = set(subset.split(","))
+        return ListToolsResult(tools=[t for t in TOOLS if t.name in names])
     if not PAGE:
         return ListToolsResult(tools=TOOLS)
     start = int(params.cursor) if params is not None and params.cursor else 0

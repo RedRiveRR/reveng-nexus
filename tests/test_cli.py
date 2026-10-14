@@ -182,3 +182,29 @@ def test_config_init_create_dirs(tmp_path):
 def test_serve_http_refuses_non_loopback_bind():
     code, _, err = run("--config", str(EXAMPLE), "serve", "--transport", "http", "--host", "0.0.0.0", "--port", "8799")
     assert code == 2 and "Refusing to serve HTTP" in err and "Traceback" not in err
+
+
+def test_providers_check_fails_when_no_operation_is_usable(tmp_path, workspace):
+    import sys as _sys
+
+    mock = str(Path(__file__).parent / "mock_servers" / "mock_engine.py")
+    cfg = write_config(
+        tmp_path,
+        workspace,
+        [
+            {
+                "id": "broken",
+                "enabled": True,
+                "type": "mcp_stdio",
+                "adapter": "re_mcp",
+                "engine": "ghidra",
+                "command": _sys.executable,
+                "args": [mock],
+                "env": {"MOCK_TOOLS_SUBSET": "call,close_database"},
+            }
+        ],
+    )
+    code, out, _ = run("--config", str(cfg), "providers", "check", "broken")
+    report = json.loads(out)
+    assert report["broken"]["health"]["status"] == "degraded"
+    assert code == 1, "a provider that can perform none of its operations must fail the check"

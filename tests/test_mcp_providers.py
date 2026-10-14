@@ -246,3 +246,18 @@ async def test_stale_engine_database_is_rebuilt_once_with_warning(config_factory
         assert not any("rebuilt" in w for w in second["result"].warnings), "reported once"
     finally:
         await mgr.close()
+
+
+async def test_connected_provider_without_usable_operations_is_degraded(config_factory, workspace):
+    """Regression (live, 2026-10-14): re-mcp-ghidra with a missing GHIDRA_INSTALL_DIR answered MCP but
+    listed only meta tools; health said 'ready' and every operation silently dropped out of routing."""
+    mgr = await started(
+        config_factory(workspace, [mock_engine("broken", env={"MOCK_TOOLS_SUBSET": "call,close_database"})])
+    )
+    try:
+        health = (await mgr.health())["broken"]
+        assert health["status"] == "degraded" and "none of the adapter's" in health["detail"]
+        reason = mgr.capability_registry()["operations"]["binary.decompile"][0]["reason"]
+        assert "backend failed to start" in reason
+    finally:
+        await mgr.close()

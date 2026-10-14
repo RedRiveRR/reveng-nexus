@@ -573,6 +573,25 @@ class McpProvider(AnalysisProvider):
                 await client.list_tools(cache_mode="refresh")
         except Exception as exc:  # noqa: BLE001
             return ProviderHealth("degraded", f"liveness probe failed: {_describe(exc)}", version=label)
+        if self.adapter is not None and self.adapter.bindings:
+            caps = self.adapter.capabilities(self)
+            usable = [op for op, status in caps.items() if status.get("available")]
+            if not usable:
+                # Observed with re-mcp-ghidra and a wrong GHIDRA_INSTALL_DIR: the MCP server answers,
+                # but its worker failed, so only a handful of meta tools are listed. Not "ready".
+                return ProviderHealth(
+                    "degraded",
+                    f"connected, but none of the adapter's {len(caps)} operations are usable "
+                    f"({len(self._tools)} tools listed); the engine backend may have failed: see {self.log_path}",
+                    version=label,
+                    extra={"usable_operations": []},
+                )
+            return ProviderHealth(
+                "ready",
+                f"{len(self._tools)} tools discovered; {len(usable)}/{len(caps)} operations usable",
+                version=label,
+                extra={"usable_operations": sorted(usable)},
+            )
         return ProviderHealth("ready", f"{len(self._tools)} tools discovered", version=label)
 
     # -- tools --------------------------------------------------------------------

@@ -85,7 +85,11 @@ class McpAdapter:
             if info is None:
                 return {
                     "available": False,
-                    "reason": f"tool {tool!r} not exposed by this upstream version (pinned: {self.pin.revision[:12]})",
+                    "reason": (
+                        f"tool {tool!r} is not in the server's current tool list: the upstream version differs "
+                        f"from the pin ({self.pin.revision[:12]}) or its engine backend failed to start "
+                        f"(see {provider.log_path})"
+                    ),
                     "tools": list(required),
                 }
             if not info.decision.allowed and info.classification.tool_class != "lifecycle":
