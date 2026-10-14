@@ -8,6 +8,8 @@ Behaviour switches (environment variables):
   MOCK_CRASH_TOOL          exit the process abruptly inside one tool (crash isolation tests)
   MOCK_ERROR_TOOL          return isError for one tool
   MOCK_PAGE_SIZE           tools/list page size (pagination tests)
+  MOCK_SLOW_LIST_AFTER / MOCK_SLOW_LIST_SECONDS   after N complete listings, sleep before every page
+  MOCK_PID_FILE            write this process's pid here (process-cleanup tests)
 It only *reads* the file handed to open_database; nothing is executed.
 """
 
@@ -181,7 +183,14 @@ def _page(items: list[Any], args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+LISTINGS = {"started": 0}
+
+
 async def on_list_tools(ctx, params) -> ListToolsResult:
+    if params is None or not params.cursor:
+        LISTINGS["started"] += 1
+    if LISTINGS["started"] > int(os.environ.get("MOCK_SLOW_LIST_AFTER", "1000000")):
+        await anyio.sleep(float(os.environ.get("MOCK_SLOW_LIST_SECONDS", "30")))
     subset = os.environ.get("MOCK_TOOLS_SUBSET")
     if subset:
         # Mimics re-mcp-ghidra with a broken engine backend: only meta/lifecycle tools are listed.
@@ -319,6 +328,8 @@ async def on_call_tool(ctx, params) -> CallToolResult:
 
 async def main() -> None:
     # MOCK_STARTUP_DELAY simulates a slow engine start (uvx install + JVM) before the MCP handshake.
+    if os.environ.get("MOCK_PID_FILE"):
+        Path(os.environ["MOCK_PID_FILE"]).write_text(str(os.getpid()), encoding="utf-8")
     await anyio.sleep(float(os.environ.get("MOCK_STARTUP_DELAY", "0")))
     server = Server("mock-engine", version=f"mock-{FLAVOR}", on_list_tools=on_list_tools, on_call_tool=on_call_tool)
     async with stdio_server() as (read_stream, write_stream):

@@ -27,6 +27,7 @@ from ..redaction import redact_text
 from .base import AnalysisProvider, OperationResult, ProviderHealth, TargetContext, ToolInfo
 
 _MAX_RESTARTS = 2
+_MAX_TOOL_PAGES = 100  # pagination guard; the whole listing also shares one deadline
 
 _PASSTHROUGH_ENV = ("JAVA_HOME", "GHIDRA_INSTALL_DIR", "IDADIR", "ANDROID_HOME", "ANDROID_SDK_ROOT")
 
@@ -69,6 +70,7 @@ class _ConnectionOwner:
         self._ready = asyncio.Event()
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._scope: anyio.CancelScope | None = None
         self.started_at: float | None = None
 
     @property
@@ -91,10 +93,15 @@ class _ConnectionOwner:
 
     async def _run(self) -> None:
         try:
-            async with self._connect(self) as client:
-                self.client = client
-                self._ready.set()
-                await self._stop.wait()
+            # close() cancels this scope rather than the task: an anyio cancellation honours the
+            # SDK's shielded transport shutdown (close stdin, kill the tree, drain stdout), whereas
+            # a native task.cancel() defeats it and livelocks on a server that never answers.
+            with anyio.CancelScope() as scope:
+                self._scope = scope
+                async with self._connect(self) as client:
+                    self.client = client
+                    self._ready.set()
+                    await self._stop.wait()
         except BaseException as exc:  # noqa: BLE001 - recorded and surfaced as provider health
             self.error = exc
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -107,12 +114,24 @@ class _ConnectionOwner:
         self._stop.set()
         if self._task is None:
             return
+        if not self._ready.is_set() and self._scope is not None:
+            # Still in the handshake, where _stop is never observed: stop it cooperatively now.
+            self._scope.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
         except (TimeoutError, asyncio.CancelledError):
-            self._task.cancel()
-            with contextlib.suppress(BaseException):
-                await self._task
+            if self._scope is not None:
+                self._scope.cancel()
+                await asyncio.wait({self._task}, timeout=timeout)
+            if not self._task.done():  # last resort; may orphan the child (see _run)
+                self._task.cancel()
+                await asyncio.wait({self._task}, timeout=timeout)
+            if not self._task.done():
+                # Every wait above is bounded: a task that swallows cancellation is abandoned and
+                # reported rather than hanging the gateway.
+                self.error = self.error or ProviderUnavailable(
+                    f"{self.label}: connection task did not stop after cancellation; abandoned"
+                )
         except BaseException:  # noqa: BLE001 - the owner already recorded its error
             pass
 
@@ -259,11 +278,21 @@ class McpProvider(AnalysisProvider):
         mode = self.config.protocol_mode
         if mode == "auto" and self.adapter is not None:
             mode = self.adapter.protocol_mode
+        # The client-wide default bounds only requests sent without their own budget, in practice
+        # the ``initialize`` handshake. Tool calls pass ``timeout_seconds`` explicitly and a whole
+        # ``tools/list`` pagination runs under one deadline (refresh_tools). Startup is already
+        # bounded by the owner's startup timeout, so the handshake must not be cut short by the
+        # (often much smaller) per-call timeout.
         return {
             "mode": mode,
-            "read_timeout_seconds": float(self.config.timeout_seconds),
+            "read_timeout_seconds": float(max(self.config.timeout_seconds, self._startup_budget())),
             "client_info": Implementation(name="reveng-nexus", version=__version__),
         }
+
+    def _startup_budget(self) -> float:
+        if self.config.type == "mcp_launched_http":
+            return float(self.config.launch.startup_timeout_seconds)
+        return float(self.config.startup_timeout_seconds)
 
     def _env(self) -> dict[str, str]:
         inherit = self.config.settings.get("inherit_env", [])
@@ -486,7 +515,8 @@ class McpProvider(AnalysisProvider):
         self.server_info = info.model_dump(exclude_none=True) if info is not None else {}
         self.started = True
         self.last_error = None
-        await self.refresh_tools(client)
+        # The first listing belongs to startup and may be as slow as the handshake.
+        await self.refresh_tools(client, budget=self._startup_budget())
         self.adapter_state.pop("sessions", None)
 
     async def _client_for(self, target: TargetContext | None) -> Any:
@@ -595,16 +625,33 @@ class McpProvider(AnalysisProvider):
         return ProviderHealth("ready", f"{len(self._tools)} tools discovered", version=label)
 
     # -- tools --------------------------------------------------------------------
-    async def refresh_tools(self, client: Any | None = None) -> list[ToolInfo]:
+    async def refresh_tools(self, client: Any | None = None, *, budget: float | None = None) -> list[ToolInfo]:
+        """Re-list the server's tools under ONE deadline for the whole pagination.
+
+        ``budget`` defaults to ``timeout_seconds``; the listing made right after a (re)connect
+        passes the startup budget. A hung or slowly paginating server therefore costs at most
+        ``budget`` seconds in total, never ``pages x per-page timeout``.
+        """
         client = client or await self._client_for(None)
+        limit = float(budget if budget is not None else self.config.timeout_seconds)
         tools: list[Any] = []
         cursor = None
-        for _ in range(100):  # pagination guard
-            page = await client.list_tools(cursor=cursor) if cursor else await client.list_tools()
-            tools.extend(page.tools)
-            cursor = page.next_cursor
-            if not cursor:
-                break
+        pages = 0
+        try:
+            with anyio.fail_after(limit):
+                for _ in range(_MAX_TOOL_PAGES):
+                    page = await client.list_tools(cursor=cursor) if cursor else await client.list_tools()
+                    pages += 1
+                    tools.extend(page.tools)
+                    cursor = page.next_cursor
+                    if not cursor:
+                        break
+        except TimeoutError:
+            raise ProviderUnavailable(
+                f"{self.id}: tools/list did not complete within {limit:.0f}s "
+                f"({pages} page(s), {len(tools)} tool(s) received)",
+                remediation="The server is hung or very slow; raise timeout_seconds or check the provider log.",
+            ) from None
         manifest = self.adapter.manifest if self.adapter else None
         trust_default = self.adapter.trust_annotations if self.adapter else False
         policy = self.runtime.policy

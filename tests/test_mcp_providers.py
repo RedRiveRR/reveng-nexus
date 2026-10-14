@@ -100,6 +100,31 @@ async def test_timeout_is_bounded_and_other_providers_keep_working(config_factor
         await mgr.close()
 
 
+async def test_handshake_is_bounded_by_startup_timeout_not_call_timeout(config_factory, workspace, elf_sample):
+    """Regression (2026-10-14): the MCP ``initialize`` request inherited the per-call
+    ``timeout_seconds``. Under full CPU load the 2 s timeout test's child could not answer in time and
+    failed with "Request 'initialize' timed out" (10 of 10 runs), although startup_timeout_seconds allowed it.
+
+    The ``never`` provider pins a second, older defect: abandoning a handshake with a native
+    task.cancel() defeated the SDK's shielded transport shutdown and livelocked forever whenever
+    startup_timeout_seconds < timeout_seconds and the server never answered."""
+    late = mock_engine("late", env={"MOCK_STARTUP_DELAY": "3"}, timeout_seconds=1, startup_timeout_seconds=30)
+    never = mock_engine("never", env={"MOCK_STARTUP_DELAY": "60"}, timeout_seconds=30, startup_timeout_seconds=2)
+    t0 = time.monotonic()
+    mgr = await started(config_factory(workspace, [late, never]))
+    assert time.monotonic() - t0 < 30, "an unanswered handshake must be abandoned within a bounded time"
+    try:
+        assert "late" not in mgr.provider_errors, mgr.provider_errors.get("late")
+        assert "no MCP handshake within 2s" in mgr.provider_errors["never"]
+        target = await target_of(mgr, elf_sample)
+        out = await mgr.perform("binary.functions", target, {}, provider_id="late")
+        assert out["result"].normalized["total"] == 5
+    finally:
+        t1 = time.monotonic()
+        await mgr.close()
+        assert time.monotonic() - t1 < 30
+
+
 async def test_crash_is_isolated_and_provider_restarts(config_factory, workspace, elf_sample):
     crashing = mock_engine("crashy", env={"MOCK_CRASH_TOOL": "get_strings"})
     mgr = await started(config_factory(workspace, [crashing, mock_engine("stable", engine="ida")]))
@@ -261,3 +286,110 @@ async def test_connected_provider_without_usable_operations_is_degraded(config_f
         assert "backend failed to start" in reason
     finally:
         await mgr.close()
+
+
+async def test_launched_http_handshake_uses_the_launch_startup_timeout(config_factory, workspace, elf_sample):
+    """mcp_launched_http: the server reports ready (port open) but answers ``initialize`` after 3 s.
+    The 1 s per-call timeout must not cut the handshake short; launch.startup_timeout_seconds applies."""
+    provider = mock_launched("mcpy", timeout_seconds=1)
+    provider["args"] = [*provider["args"], "--initialize-delay", "3"]
+    mgr = await started(config_factory(workspace, [provider]))
+    try:
+        target = await target_of(mgr, elf_sample)
+        out = await mgr.perform("binary.functions", target, {}, provider_id="mcpy")
+        assert out["result"].normalized["total"] == 5
+    finally:
+        await mgr.close()
+
+
+async def test_tool_listing_shares_one_deadline_and_the_provider_recovers(
+    config_factory, workspace, elf_sample, tmp_path
+):
+    """A re-list is bounded by ONE deadline for all pages (16 tools, 2 per page, 0.6 s per page would
+    be 4.8 s), the provider keeps serving from its last catalogue, and its process is reaped."""
+    import asyncio
+
+    pid_file = tmp_path / "child.pid"
+    env = {
+        "MOCK_PAGE_SIZE": "2",
+        "MOCK_SLOW_LIST_AFTER": "1",
+        "MOCK_SLOW_LIST_SECONDS": "0.6",
+        "MOCK_PID_FILE": str(pid_file),
+    }
+    mgr = await started(config_factory(workspace, [mock_engine("eng", env=env, timeout_seconds=2)]))
+    child = None
+    try:
+        assert mgr.provider_errors == {}, "the startup listing is not slowed"
+        child = int(pid_file.read_text(encoding="utf-8"))
+        t0 = time.monotonic()
+        await mgr.refresh_tools()
+        assert time.monotonic() - t0 < 4.0
+        assert "tools/list did not complete within 2s" in mgr.provider_errors["eng"]
+        target = await target_of(mgr, elf_sample)
+        out = await mgr.perform("binary.functions", target, {}, provider_id="eng")
+        assert out["result"].normalized["total"] == 5, "the last good catalogue is still in use"
+        assert _pid_alive(child)
+    finally:
+        await mgr.close()
+    for _ in range(40):
+        if not _pid_alive(child):
+            break
+        await asyncio.sleep(0.25)
+    assert not _pid_alive(child), "the child must not outlive the gateway"
+
+
+async def test_connection_owner_close_is_bounded_when_cooperative_cancel_is_ignored(tmp_path):
+    """The SDK's transport shutdown is shielded; if it never finishes, close() falls back to a
+    native cancel instead of waiting forever."""
+    import asyncio
+    import contextlib
+
+    import anyio
+
+    from reveng_nexus.providers.mcp import _ConnectionOwner
+
+    @contextlib.asynccontextmanager
+    async def shielded_handshake(owner):
+        with anyio.CancelScope(shield=True):
+            await anyio.sleep(30)
+        yield object()
+
+    owner = _ConnectionOwner("stubborn", shielded_handshake, tmp_path / "owner.log")
+    owner._task = asyncio.create_task(owner._run())
+    await asyncio.sleep(0.1)
+    t0 = time.monotonic()
+    await owner.close(timeout=0.5)
+    assert time.monotonic() - t0 < 3
+    assert owner._task.done() and not owner.alive
+
+
+async def test_connection_owner_close_abandons_a_task_that_swallows_cancellation(tmp_path):
+    import asyncio
+    import contextlib
+
+    from reveng_nexus.providers.mcp import _ConnectionOwner
+
+    release = asyncio.Event()
+
+    @contextlib.asynccontextmanager
+    async def swallowing(owner):
+        while not release.is_set():
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                continue
+        yield object()
+
+    owner = _ConnectionOwner("swallower", swallowing, tmp_path / "owner.log")
+    owner._task = asyncio.create_task(owner._run())
+    await asyncio.sleep(0.1)
+    t0 = time.monotonic()
+    await owner.close(timeout=0.3)
+    try:
+        assert time.monotonic() - t0 < 3, "every wait in close() is bounded"
+        assert not owner._task.done()
+        assert "did not stop after cancellation; abandoned" in str(owner.error)
+    finally:
+        release.set()
+        await asyncio.wait({owner._task}, timeout=5)
+    assert owner._task.done()

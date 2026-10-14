@@ -123,6 +123,7 @@ async def main() -> None:
     parser.add_argument("--project-dir")
     parser.add_argument("--fail", action="store_true")
     parser.add_argument("--spawn-child", help="start a sleeping grandchild and write its pid here")
+    parser.add_argument("--initialize-delay", type=float, default=0.0, help="delay the first MCP POST (initialize)")
     args = parser.parse_args()
     print("decaf_load() started", flush=True)  # noise before readiness, like the real server
     print("Registering plugins...", flush=True)
@@ -137,6 +138,17 @@ async def main() -> None:
         sys.exit(7)
     server = build_server(Path(args.binary))
     app = server.streamable_http_app(host=args.host)
+    if args.initialize_delay:
+        inner, pending = app, {"first_post": True}
+
+        async def delayed(scope, receive, send):
+            # A slow engine that is "ready" (port open) but answers its first MCP request late.
+            if scope["type"] == "http" and scope.get("method") == "POST" and pending["first_post"]:
+                pending["first_post"] = False
+                await asyncio.sleep(args.initialize_delay)
+            await inner(scope, receive, send)
+
+        app = delayed
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind((args.host, int(args.port)))
     port = sock.getsockname()[1]
