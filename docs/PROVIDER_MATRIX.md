@@ -1,39 +1,55 @@
 # Provider matrix
 
-Verification date: **2026-10-13**. Repositories were shallow-cloned at the commits below and
-read as data (nothing upstream was built or executed from the clones). Each row has a
-**verification level**:
+Last audited: **2026-10-13** (re-audited during the permanent-deployment pass).
+Upstream repositories were shallow-cloned at the commits below and read as data; nothing
+upstream was built or executed from those clones.
 
-- **runtime**: launched through RevEng Nexus on this machine (Windows 11 Pro 10.0.26200,
-  Python 3.12 via uv, Temurin JDK 25.0.2, Ghidra 12.1.4) against the generated benign ELF
-  fixture. Tool lists and argument shapes come from the live `tools/list`.
-- **source**: tool names and argument names read from the upstream source at the pinned
-  commit. The adapter exists and is unit-tested against mocks of that contract, but the real
-  engine was **not** available here (licence, GUI, device or build tool missing).
-- **snapshot**: taken from the upstream's own committed `tools/list` snapshot.
-- **reference**: not a runtime component.
+## Verification states
 
-Run `reveng-nexus --config config/providers.yaml providers check` after installing an engine.
-It starts each enabled provider on its own, lists its tools, shows which ones policy allows,
-and reports health. If an upstream renames a tool, the operation is reported as unavailable
-with the reason, rather than failing at call time.
+Each provider is in exactly one of these states. They are not interchangeable: reading an
+upstream's source is **not** verification.
+
+| State | Meaning |
+|---|---|
+| **S1 · Real integration tested** | Launched through RevEng Nexus against the real engine on this machine (Windows 11 Pro 10.0.26200, Python 3.12, Temurin JDK 25.0.2, Ghidra 12.1.4) using the benign generated ELF fixture, including the opt-in live test and the permanent-config CLI run. |
+| **S2 · Mock-tested only** | The adapter's contract is exercised by the test-suite against a local mock that imitates the upstream; the real upstream was never run. |
+| **S3 · Reviewed, not executed** | Adapter or manifest written from the upstream source or tool snapshot at the pinned commit. Only policy classification is unit-tested; no call was ever made to the real server or a mock of it. |
+| **S4 · Unavailable here** | The prerequisite (licence, GUI application, build tool, device, model weights) is missing on this machine. Listed in the *Blocked by* column. |
+| **S5 · Not implemented** | No integration exists, by design or not yet. |
+
+`reveng-nexus --config <providers.yaml> providers check` starts each enabled provider on its
+own, lists its tools and the policy decision for each, and reports health. Run it after
+installing an engine, before promoting a row.
 
 ## Summary
 
-| Provider id (example config) | Upstream | Pinned revision / package | Licence | Integration | Verification | Status here |
+| Provider id | Upstream | Pinned revision / package | Licence | Integration method | State | Blocked by |
 |---|---|---|---|---|---|---|
-| `builtin` | RevEng Nexus | this repo 0.2.0; pyelftools 0.32, pefile 2024.8.26, capstone 5.0.9 | MIT (+ Public domain / MIT / BSD-3) | in-process | runtime + unit tests | **working** |
-| `ghidra_remcp` | [jtsylve/re-mcp](https://github.com/jtsylve/re-mcp) (Ghidra backend) | `7b38aa9`; PyPI `re-mcp-ghidra==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | **runtime** | **working** (default open-source decompiler) |
-| `ghidra_mcpy` | [nightwing-us/mcpyghidra](https://github.com/nightwing-us/mcpyghidra) | `f1e130c` (tag v0.8.0); PyPI `mcpyghidra==0.8.0` | Apache-2.0 (NOTICE file) | launch → JSON readiness → Streamable HTTP, one server per target | **runtime** | **working** |
-| `ida_official` | [HexRaysSA/ida-mcp](https://github.com/HexRaysSA/ida-mcp) | `df6de79`; PyPI `ida-mcp==20261008.0.1` | MIT | stdio MCP child | snapshot | not run (needs licensed IDA 9.4+ with idalib) |
-| `ida_rs` | [blacktop/ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) | `15d16ab` (v9.5.0-beta.6); latest stable tag v9.4.5 | MIT | stdio MCP child (`--read-only`) | source | not run (needs licensed IDA Pro 9.4) |
-| `re_mcp_ida` | jtsylve/re-mcp (IDA backend) | `7b38aa9`; PyPI `re-mcp-ida==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | source (same tool contract as the runtime-verified Ghidra backend) | not run (needs licensed IDA 9+) |
-| `binary_ninja` | [fosdickio/binary_ninja_mcp](https://github.com/fosdickio/binary_ninja_mcp) | `8c5134e`; npm `binary-ninja-mcp@1.0.0` | **GPL-3.0** | stdio npm bridge → BN plugin HTTP `127.0.0.1:9009` | source | not run (needs Binary Ninja GUI + plugin) |
-| `jadx` | [Qtty/jadx-mcp-server](https://github.com/Qtty/jadx-mcp-server) | `4e6d890` (pom 1.0.0) | **no LICENSE file** (no rights granted) | stdio Python MCP → JVM daemon `127.0.0.1:8765` | source | not run (needs a Maven build; Maven absent) |
-| `frida_mobile` | [monkeywave/frida-mobile-mcp](https://github.com/monkeywave/frida-mobile-mcp) | `b2da55d`; npm `frida-mobile-mcp@0.2.3` | MIT | stdio npm child, **dynamic** (off by default) | source | not run (no authorised test device) |
-| `llm4decompile` | [albertan017/LLM4Decompile](https://github.com/albertan017/LLM4Decompile) | `85b364b` | code MIT; **weights: DeepSeek License Agreement** (LICENSE-MODEL) | OpenAI-compatible `/v1/completions` endpoint that **you** serve | unit-tested against a local mock endpoint | not run against real weights (no GPU/weights downloaded) |
-| — | [symgraph/GhidrAssist](https://github.com/symgraph/GhidrAssist) | `db0bb3d` | MIT | Ghidra **plugin** and MCP *client*; not a provider | source | optional companion (see below) |
-| — | [ram-elgov/awesome-llm-reverse-engineering](https://github.com/ram-elgov/awesome-llm-reverse-engineering) | `55366aa` | README states "MIT" (no separate LICENSE file) | reading list | reference | not a runtime dependency |
+| `builtin` | RevEng Nexus | repo 0.2.0; pyelftools 0.32, pefile 2024.8.26, capstone 5.0.9 | MIT (deps: Public domain / MIT / BSD-3) | in-process | **S1** | — |
+| `ghidra_remcp` | [jtsylve/re-mcp](https://github.com/jtsylve/re-mcp), Ghidra backend | `7b38aa9`; PyPI `re-mcp-ghidra==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | **S1** (+ S2 mock contract tests) | — |
+| `ghidra_mcpy` | [nightwing-us/mcpyghidra](https://github.com/nightwing-us/mcpyghidra) | `f1e130c` (v0.8.0); PyPI `mcpyghidra==0.8.0` | Apache-2.0 (+ NOTICE) | launch → JSON readiness → Streamable HTTP, one server per target | **S1** (+ S2) | — |
+| `re_mcp_ida` | jtsylve/re-mcp, IDA backend | `7b38aa9`; PyPI `re-mcp-ida==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | **S3**: same adapter as the S1 Ghidra backend, but never run against IDA | S4: licensed IDA 9+ |
+| `ida_official` | [HexRaysSA/ida-mcp](https://github.com/HexRaysSA/ida-mcp) | `df6de79`; PyPI `ida-mcp==20261008.0.1` | MIT | stdio MCP child; analysis only via `execute_python` (blocked by default) | **S3** (from the upstream tool snapshot) | S4: licensed IDA 9.4+ with idalib |
+| `ida_rs` | [blacktop/ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) | `15d16ab` (v9.5.0-beta.6); stable tag v9.4.5 | MIT | stdio MCP child (`--read-only`) | **S3** | S4: licensed IDA Pro 9.4 |
+| `binary_ninja` | [fosdickio/binary_ninja_mcp](https://github.com/fosdickio/binary_ninja_mcp) | `8c5134e`; npm `binary-ninja-mcp@1.0.0` | **GPL-3.0** | stdio npm bridge → BN plugin HTTP `127.0.0.1:9009` | **S3** | S4: Binary Ninja licence + GUI + plugin |
+| `jadx` | [Qtty/jadx-mcp-server](https://github.com/Qtty/jadx-mcp-server) | `4e6d890` (pom 1.0.0) | **no LICENSE file**: no redistribution rights | stdio Python MCP → JVM daemon `127.0.0.1:8765` | **S3** | S4: Maven build of the daemon (Maven not installed) |
+| `frida_mobile` | [monkeywave/frida-mobile-mcp](https://github.com/monkeywave/frida-mobile-mcp) | `b2da55d`; npm `frida-mobile-mcp@0.2.3` | MIT | stdio npm child, **dynamic**, disabled by policy | **S3** (policy manifest unit-tested) | S4: authorised test device |
+| `llm4decompile` | [albertan017/LLM4Decompile](https://github.com/albertan017/LLM4Decompile) | `85b364b` | code MIT; **weights: DeepSeek License Agreement** | OpenAI-compatible `/v1/completions` you serve | **S2** (mock HTTP endpoint, not MCP) | S4: served checkpoint/GPU (weights deliberately not downloaded) |
+| — | [symgraph/GhidrAssist](https://github.com/symgraph/GhidrAssist) | `db0bb3d` | MIT | none; it is a Ghidra plugin that can act as an MCP *client* of Nexus' loopback HTTP endpoint | **S5** as a provider; client path untested | S4: Ghidra GUI session for the client test |
+| — | [ram-elgov/awesome-llm-reverse-engineering](https://github.com/ram-elgov/awesome-llm-reverse-engineering) | `55366aa` | README states "MIT" | research reading list | **S5** (not a runtime component) | — |
+
+Unimplemented on purpose (S5): reviewed IDAPython templates for `ida_official` (decision
+pending; see CLAUDE.md), any Frida protection-bypass/memory-write/custom-script pass-through,
+automatic model-weight download, and an authenticated non-loopback HTTP mode.
+
+**Integration vs. redistribution.** Running an upstream as a separate process says nothing
+about the right to copy it. Binary Ninja MCP is GPL-3.0 and jadx-mcp-server has no licence,
+so neither may be vendored or redistributed with this project. Nexus only launches the
+operator's own installations.
+
+Caveat for `ghidra_mcpy` health: before any target is opened, health is `ready` on the basis
+that the launch command resolves, and its health detail says "no live session". Its tools
+are discovered, and policy-checked, when the first per-target server starts.
 
 All ten upstream repositories existed and had recent commits on the verification date
 (the most recent: ida-mcp 2026-10-08, ida-mcp-rs 2026-10-08, GhidrAssist 2026-09-20; the
