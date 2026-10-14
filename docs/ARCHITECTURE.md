@@ -77,6 +77,23 @@
 7. **Shut down.** Adapters close their sessions (re-mcp saves only Nexus's private engine
    database), owners exit, and process trees are terminated.
 
+### Timeouts and their bounds (since 2026-10-14)
+
+| Wait | Bound |
+|---|---|
+| Process start and MCP `initialize` handshake | `startup_timeout_seconds` (launched HTTP: `launch.startup_timeout_seconds`); the client's default read timeout is `max(timeout_seconds, startup budget)`, so a short per-call timeout cannot cut a slow but legitimate handshake short |
+| `tools/list` right after a (re)connect | **one** deadline for the whole pagination = the startup budget |
+| Any later re-list (`refresh_tools`) | **one** deadline for the whole pagination = `timeout_seconds` (default), at most 100 pages; a hung or slowly paginating server costs at most that budget, never pages × per-page timeout. On expiry the previous catalogue stays in use and the error is recorded in `provider_errors` |
+| Health liveness probe | 15 s (`health()` 30 s overall) |
+| Each tool call | `timeout_seconds`, passed explicitly; plus `analysis.operation_timeout_seconds` per operation |
+| Abandoning a connection (`close`) | cooperative anyio cancel first (lets the SDK's shielded transport shutdown close stdin, kill the process tree and drain stdout), then a native cancel; each wait is bounded by the close timeout (20 s), so at most about 3 × 20 s. A task that still does not stop is reported and abandoned instead of hanging the gateway |
+
+Trade-offs kept on purpose: a server whose initial listing takes longer than the startup budget
+fails to start. At gateway start the manager additionally caps handshake **and** initial listing
+together at `startup_timeout_seconds + 5`; a reconnect during an operation has no such joint cap
+(each step is bounded by the startup budget, so up to twice that, within
+`analysis.operation_timeout_seconds` when it happens inside an operation).
+
 ## Routing and conflicts
 
 - **Selection:** an explicit `provider_id` wins; otherwise `routing.preferred[operation]`,

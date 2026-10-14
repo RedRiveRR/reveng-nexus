@@ -1,46 +1,57 @@
 # Provider matrix
 
-Last audited: **2026-10-13** (re-audited during the permanent-deployment pass).
+Last audited: **2026-10-14**.
 Upstream repositories were shallow-cloned at the commits below and read as data; nothing
 upstream was built or executed from those clones.
 
 ## Verification states
 
-Each provider is in exactly one of these states. They are not interchangeable: reading an
-upstream's source is **not** verification.
+Re-audited **2026-10-14** against the installed environment. Each provider carries the
+strongest state it has actually reached, plus a blocker when live use is impossible here.
+Reading an upstream's source is **not** verification, and a passing mock is not a live test.
 
 | State | Meaning |
 |---|---|
-| **S1 · Real integration tested** | Launched through RevEng Nexus against the real engine on this machine (Windows 11 Pro 10.0.26200, Python 3.12, Temurin JDK 25.0.2, Ghidra 12.1.4) using the benign generated ELF fixture, including the opt-in live test and the permanent-config CLI run. |
-| **S2 · Mock-tested only** | The adapter's contract is exercised by the test-suite against a local mock that imitates the upstream; the real upstream was never run. |
-| **S3 · Reviewed, not executed** | Adapter or manifest written from the upstream source or tool snapshot at the pinned commit. Only policy classification is unit-tested; no call was ever made to the real server or a mock of it. |
-| **S4 · Unavailable here** | The prerequisite (licence, GUI application, build tool, device, model weights) is missing on this machine. Listed in the *Blocked by* column. |
-| **S5 · Not implemented** | No integration exists, by design or not yet. |
+| `live_analysis_verified` | A real read-only analysis ran through RevEng Nexus against the real engine on this machine, using a generated benign fixture, and its result was stored as evidence. |
+| `connection_verified` | The real upstream server started and answered `tools/list` through Nexus, but no analysis result was verified. |
+| `mock_tested` | The adapter's call path is exercised by tests against a local mock that imitates the upstream contract. The real upstream was never run. |
+| `unit_tested` | Only policy/manifest classification or config handling is unit-tested; no call path to the provider is exercised. |
+| `reviewed_not_tested` | The adapter was written from the upstream source or tool snapshot at the pinned commit; no test exercises it. |
+| `blocked` | Live use is impossible here; the *Blocker* column names the missing licence, software, build tool, device or model. |
+| `not_integrated` | No integration exists, by design or because evaluation is paused. |
 
-`reveng-nexus --config <providers.yaml> providers check` starts each enabled provider on its
-own, lists its tools and the policy decision for each, and reports health. Run it after
-installing an engine, before promoting a row.
+`reveng-nexus --config <providers.yaml> providers check <id>` starts a provider on its own,
+lists its tools with policy decisions, and reports health. Since 2026-10-14 it **fails**
+(exit 1) for a provider that answers MCP but can perform none of its operations; that case
+was observed live with re-mcp-ghidra and a wrong `GHIDRA_INSTALL_DIR`.
+
+**Contract corrections (2026-10-14).** The first mock fixtures for `ida_rs`, `binary_ninja` and `jadx` encoded the adapter author's assumptions. Reading the pinned upstream source showed several were wrong, and the adapters were fixed to match it (details and file references: [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)):
+- JADX returns `json.dumps(value)` for every tool, so source, manifest and main activity arrived as quoted, escaped JSON strings. They are now decoded exactly once, and `@`-bookkeeping entries are no longer data.
+- The Binary Ninja bridge never sets `isError` and prefixes some answers with `File: <path>`. Error text was accepted as HLIL/listing rows, the preamble became a function name, and its JSON list bodies were mis-parsed (including decompile-by-address). Errors are now raised, the preamble must name the target, and bodies are parsed per operation.
+- ida-mcp-rs strings carry `content` (was read as `value`, always `None`), imports have no module (was read as `module`), and `decompile`/`xrefs`/`basic_blocks` accept numeric addresses only (names were sent).
+- Unrecognised shapes give an empty result plus a warning with the raw output kept; code-labelled outputs (pseudocode, HLIL, Java) are never filled from an unexpected document.
 
 ## Summary
 
-| Provider id | Upstream | Pinned revision / package | Licence | Integration method | State | Blocked by |
+| Provider id | Upstream | Pinned revision / package | Licence | Integration method | Verification state | Blocker |
 |---|---|---|---|---|---|---|
-| `builtin` | RevEng Nexus | repo 0.2.0; pyelftools 0.32, pefile 2024.8.26, capstone 5.0.9 | MIT (deps: Public domain / MIT / BSD-3) | in-process | **S1** | — |
-| `ghidra_remcp` | [jtsylve/re-mcp](https://github.com/jtsylve/re-mcp), Ghidra backend | `7b38aa9`; PyPI `re-mcp-ghidra==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | **S1** (+ S2 mock contract tests) | — |
-| `ghidra_mcpy` | [nightwing-us/mcpyghidra](https://github.com/nightwing-us/mcpyghidra) | `f1e130c` (v0.8.0); PyPI `mcpyghidra==0.8.0` | Apache-2.0 (+ NOTICE) | launch → JSON readiness → Streamable HTTP, one server per target | **S1** (+ S2) | — |
-| `re_mcp_ida` | jtsylve/re-mcp, IDA backend | `7b38aa9`; PyPI `re-mcp-ida==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | **S3**: same adapter as the S1 Ghidra backend, but never run against IDA | S4: licensed IDA 9+ |
-| `ida_official` | [HexRaysSA/ida-mcp](https://github.com/HexRaysSA/ida-mcp) | `df6de79`; PyPI `ida-mcp==20261008.0.1` | MIT | stdio MCP child; analysis only via `execute_python` (blocked by default) | **S3** (from the upstream tool snapshot) | S4: licensed IDA 9.4+ with idalib |
-| `ida_rs` | [blacktop/ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) | `15d16ab` (v9.5.0-beta.6); stable tag v9.4.5 | MIT | stdio MCP child (`--read-only`) | **S3** | S4: licensed IDA Pro 9.4 |
-| `binary_ninja` | [fosdickio/binary_ninja_mcp](https://github.com/fosdickio/binary_ninja_mcp) | `8c5134e`; npm `binary-ninja-mcp@1.0.0` | **GPL-3.0** | stdio npm bridge → BN plugin HTTP `127.0.0.1:9009` | **S3** | S4: Binary Ninja licence + GUI + plugin |
-| `jadx` | [Qtty/jadx-mcp-server](https://github.com/Qtty/jadx-mcp-server) | `4e6d890` (pom 1.0.0) | **no LICENSE file**: no redistribution rights | stdio Python MCP → JVM daemon `127.0.0.1:8765` | **S3** | S4: Maven build of the daemon (Maven not installed) |
-| `frida_mobile` | [monkeywave/frida-mobile-mcp](https://github.com/monkeywave/frida-mobile-mcp) | `b2da55d`; npm `frida-mobile-mcp@0.2.3` | MIT | stdio npm child, **dynamic**, disabled by policy | **S3** (policy manifest unit-tested) | S4: authorised test device |
-| `llm4decompile` | [albertan017/LLM4Decompile](https://github.com/albertan017/LLM4Decompile) | `85b364b` | code MIT; **weights: DeepSeek License Agreement** | OpenAI-compatible `/v1/completions` you serve | **S2** (mock HTTP endpoint, not MCP) | S4: served checkpoint/GPU (weights deliberately not downloaded) |
-| — | [symgraph/GhidrAssist](https://github.com/symgraph/GhidrAssist) | `db0bb3d` | MIT | none; it is a Ghidra plugin that can act as an MCP *client* of Nexus' loopback HTTP endpoint | **S5** as a provider; client path untested | S4: Ghidra GUI session for the client test |
-| — | [ram-elgov/awesome-llm-reverse-engineering](https://github.com/ram-elgov/awesome-llm-reverse-engineering) | `55366aa` | README states "MIT" | research reading list | **S5** (not a runtime component) | — |
+| `builtin` | RevEng Nexus | repo 0.2.0; pyelftools 0.32, pefile 2024.8.26, capstone 5.0.9 | MIT (deps: Public domain / MIT / BSD-3) | in-process | `live_analysis_verified` (ELF, PE, Mach-O, APK fixtures) | — |
+| `ghidra_remcp` | [jtsylve/re-mcp](https://github.com/jtsylve/re-mcp), Ghidra backend | `7b38aa9`; PyPI `re-mcp-ghidra==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | `live_analysis_verified` (2026-10-14 re-run) + `mock_tested` | — |
+| `ghidra_mcpy` | [nightwing-us/mcpyghidra](https://github.com/nightwing-us/mcpyghidra) | `f1e130c` (v0.8.0); PyPI `mcpyghidra==0.8.0` | Apache-2.0 (+ NOTICE) | launch → JSON readiness → Streamable HTTP, one server per target | `live_analysis_verified` + `mock_tested` | — |
+| `re_mcp_ida` | jtsylve/re-mcp, IDA backend | `7b38aa9`; PyPI `re-mcp-ida==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | `mock_tested` (shared re_mcp adapter driven as `engine: ida` against the mock) | `blocked`: licensed IDA 9+ (none installed) |
+| `ida_official` | [HexRaysSA/ida-mcp](https://github.com/HexRaysSA/ida-mcp) | `df6de79`; PyPI `ida-mcp==20261008.0.1` | MIT | stdio MCP child; analysis only via `execute_python` (blocked by default) | `unit_tested` (manifest / code-execution gate) | `blocked`: licensed IDA 9.4+ with idalib |
+| `ida_rs` | [blacktop/ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) | `15d16ab` (v9.5.0-beta.6); stable tag v9.4.5 | MIT | stdio MCP child (`--read-only`) | `mock_tested` (mock fixtures built from the pinned upstream source, see [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md); never run against the real engine) | `blocked`: licensed IDA Pro 9.4; `IDADIR` unset |
+| `binary_ninja` | [fosdickio/binary_ninja_mcp](https://github.com/fosdickio/binary_ninja_mcp) | `8c5134e`; npm `binary-ninja-mcp@1.0.0` | **GPL-3.0** | stdio npm bridge → BN plugin HTTP `127.0.0.1:9009` | `mock_tested` (mock fixtures built from the pinned upstream source, see [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md); never run against the real engine) | `blocked`: Binary Ninja licence, GUI and plugin (nothing listening on 9009) |
+| `jadx` | [Qtty/jadx-mcp-server](https://github.com/Qtty/jadx-mcp-server) | `4e6d890` (pom 1.0.0) | **no LICENSE file**: no redistribution rights | stdio Python MCP → JVM daemon `127.0.0.1:8765` | `mock_tested` (mock fixtures built from the pinned upstream source, see [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md); never run against the real engine) | `blocked`: Maven build of the daemon (Maven absent; JDK 25 present); `JADX_MCP_HOME` unset |
+| `frida_mobile` | [monkeywave/frida-mobile-mcp](https://github.com/monkeywave/frida-mobile-mcp) | `b2da55d`; npm `frida-mobile-mcp@0.2.3` | MIT | stdio npm child, **dynamic**, never started while policy is off | `unit_tested` (dynamic gating, hard blocks, not started when disabled); **no mock contract tests** | `blocked`: no authorised test device; no frida/adb; policy disabled by design |
+| `llm4decompile` | [albertan017/LLM4Decompile](https://github.com/albertan017/LLM4Decompile) | `85b364b` | code MIT; **weights: DeepSeek License Agreement** | OpenAI-compatible `/v1/completions` you serve | `mock_tested` (local mock HTTP endpoint; not MCP) | `blocked`: no served checkpoint (nothing listening on 8000/8080/11434/1234); weights deliberately not downloaded |
+| `rea` | [morluto/rea](https://github.com/morluto/rea), npm `rea-agents` | candidate 6.4.0 (MIT, Node `^22.19 \|\| ^24.11 \|\| >=26`) | MIT | — | `not_integrated`: **evaluation paused** (2026-10-14) | installed Node 25.9.0 is outside REA's supported range; no REA code, config or download in this repo |
+| — | [symgraph/GhidrAssist](https://github.com/symgraph/GhidrAssist) | `db0bb3d` | MIT | none; Ghidra plugin acting as an MCP *client* of Nexus' loopback HTTP endpoint | `not_integrated` as a provider (by design); client path untested | Ghidra GUI session for the client test |
+| — | [ram-elgov/awesome-llm-reverse-engineering](https://github.com/ram-elgov/awesome-llm-reverse-engineering) | `55366aa` | README states "MIT" | research reading list | `not_integrated` (not a runtime component) | — |
 
-Unimplemented on purpose (S5): reviewed IDAPython templates for `ida_official` (decision
-pending; see CLAUDE.md), any Frida protection-bypass/memory-write/custom-script pass-through,
-automatic model-weight download, and an authenticated non-loopback HTTP mode.
+Unimplemented on purpose: reviewed IDAPython templates for `ida_official` (decision
+pending), any Frida protection-bypass/memory-write/custom-script pass-through, automatic
+model-weight download, an authenticated non-loopback HTTP mode, and REA (paused).
 
 **Integration vs. redistribution.** Running an upstream as a separate process says nothing
 about the right to copy it. Binary Ninja MCP is GPL-3.0 and jadx-mcp-server has no licence,
@@ -122,6 +133,8 @@ oldest: awesome-llm-reverse-engineering 2025-07-28).
   the surface. Adapter arguments come from `src/server/requests.rs` (`open_idb(path, idb_out)`,
   `decompile(address)`, `disasm_function_at(address|target_name)`, `xrefs_to/xrefs_from(address)`,
   …). `lumina_lookup` is blocked because it sends function metadata to Hex-Rays' Lumina service.
+- **Mock-tested 2026-10-14** (`tests/test_adapters_mocked.py`): discovery and policy classification, every bound operation normalised through Nexus with evidence provenance, refusals, provider errors, unexpected payloads, timeout, cancellation, crash/restart and shutdown. The mock reproduces the pinned tool and argument names; its response envelopes follow the pinned source ([ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)), not a live run.
+- An `open_idb` that triggered a reconnect lost its session record, so the next target switch never sent `close_idb` (one database per server). Fixed in the shared provider code (sessions reset in place).
 - Put all IDA providers in `conflict_group: ida`. Nexus serialises them per target and gives
   each its own staged copy, so two drivers never share one `.i64`.
 
@@ -131,6 +144,7 @@ oldest: awesome-llm-reverse-engineering 2025-07-28).
   `bridge/src/tools.ts`.
 - Nexus cannot load a file into Binary Ninja through this bridge. Before each operation it
   checks that `get_binary_status` names the target, and refuses otherwise.
+- **Mock-tested 2026-10-14** (`tests/test_adapters_mocked.py`): discovery and policy classification, every bound operation normalised through Nexus with evidence provenance, refusals, provider errors, unexpected payloads, timeout, cancellation, crash/restart and shutdown. The mock reproduces the pinned tool and argument names; its response envelopes follow the pinned source ([ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)), not a live run.
 - **GPL-3.0:** Nexus talks to it only as a separate process over MCP and does not copy or link
   its code.
 
@@ -139,6 +153,7 @@ oldest: awesome-llm-reverse-engineering 2025-07-28).
   it with `mvn clean package` (needs JDK 17+ and Maven), create a venv, then install
   `mcp_server/requirements.txt`. Set `JADX_MCP_HOME` and use a smaller `JADX_HEAP` than the
   upstream default of 24g.
+- **Mock-tested 2026-10-14** (`tests/test_adapters_mocked.py`): discovery and policy classification, every bound operation normalised through Nexus with evidence provenance, refusals, provider errors, unexpected payloads, timeout, cancellation, crash/restart and shutdown. The mock reproduces the pinned tool and argument names; its response envelopes follow the pinned source ([ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)), not a live run.
 - Upstream tools all observe; `load_apk` is treated as lifecycle.
 - **Licence:** the repository has no LICENSE file at the pinned commit, so no redistribution
   rights are granted. Use your own checkout and do not vendor it.

@@ -16,7 +16,13 @@ Rules: `docs/OBSIDIAN_WORKFLOW.md`. If the vault is absent, skip this section.
 
 - Before changing the design, read the relevant one of `docs/ARCHITECTURE.md`, `docs/PROVIDER_MATRIX.md` or `docs/SECURITY.md`. `docs/TESTING.md` holds the observed test counts; `docs/DEPLOYMENT.md` the permanent Windows layout.
 - Code map: `config.py` (schema) · `policy.py`/`security.py` (tool classification) · `artifacts.py` (workspace guard, hashing, staging) · `formats/` (parsers) · `providers/` (built-in, MCP child, LLM4Decompile) · `adapters/` (one per upstream, pinned) · `registry.py` (lifecycle/routing/locks) · `compare.py` · `orchestrator.py` · `evidence.py` · `report.py` · `server.py` · `cli.py`.
-- Provider status as of 2026-10-13: Ghidra (`re_mcp`, `mcpyghidra` adapters) is **runtime-verified**. IDA, Binary Ninja, JADX and Frida adapters are **source-verified only**. LLM4Decompile is tested against a mock endpoint only.
+- Provider status as of 2026-10-14 (states defined in `docs/PROVIDER_MATRIX.md`):
+  - Ghidra (`re_mcp`, `mcpyghidra` adapters) and the built-in engine: `live_analysis_verified`.
+  - IDA, Binary Ninja, JADX, Frida: blocked on missing licences, software or devices.
+  - `ida_rs`, `binary_ninja`, `jadx` adapters: `mock_tested`, with mock fixtures built from the pinned upstream source (`docs/ADAPTER_CONTRACTS.md`). That is a reading of code, not a live run. Change a mock only to match the pinned source, never to make an adapter test pass.
+  - Frida: `unit_tested` (gating only); it has no mock contract tests.
+  - LLM4Decompile: `mock_tested` only.
+  - REA: evaluation paused, not integrated. Do not resume without an explicit instruction.
 
 ## Development rules
 
