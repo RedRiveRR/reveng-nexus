@@ -41,26 +41,61 @@ AndroidManifest and a DEX header). No binaries are committed.
 | CLI commands | `test_cli.py` |
 | **Real Ghidra** through re-mcp-ghidra and MCPyGhidra | `tests/integration/test_ghidra_live.py` (opt-in) |
 
-## Results on the integration machine (2026-10-13)
+## Test accounting
 
-Environment: Windows 11 Pro 10.0.26200, Python 3.12 (uv-managed venv), mcp 2.3.0,
-Temurin JDK 25.0.2, Ghidra 12.1.4 (`ddac49f9…d2d4db`, matching GitHub's published digest),
-uv/uvx available; no IDA, Binary Ninja, Maven, adb or Frida.
+The suite collects **165 tests**. Two are environment-gated, not failing:
 
-| Command | Result |
+- `tests/integration/test_ghidra_live.py::test_live_ghidra_providers_end_to_end` is
+  skipped unless `REVENG_NEXUS_LIVE_GHIDRA=1` and `GHIDRA_INSTALL_DIR` are set.
+- `tests/test_artifacts_formats.py::test_guard_refuses_symlinks` is skipped when the OS
+  refuses to create a symlink (Windows without Developer Mode or admin). Its assertion is
+  unchanged; on a host that allows symlinks it runs.
+
+No test is deselected by marker configuration. `-m integration` only narrows a run.
+
+Earlier versions of this file and the README disagreed. A draft README said "159 passing",
+which was a count predicted before the final run, not an observed one. The suite had
+already grown from 154 to 160 tests over that session. This session added 5 tests (static
+diagnostics, `config init --create-dirs`, non-loopback HTTP refusal, DNS-rebinding
+rejection, background provider start), giving 165. Every count below was observed.
+
+## Results on the integration machine (2026-10-13, permanent deployment)
+
+Environment: Windows 11 Pro 10.0.26200, Python 3.12.13 in `%LOCALAPPDATA%\RevEngNexus\venv`,
+mcp 2.3.0, Temurin JDK 25.0.2, Ghidra 12.1.4 at
+`%LOCALAPPDATA%\Programs\Ghidra\ghidra_12.1.4_PUBLIC` (zip SHA-256 `ddac49f9…d2d4db`,
+matching GitHub's published digest), uv/uvx and Claude Code 2.1.296. No IDA, Binary Ninja,
+Maven, adb or Frida.
+
+| Command | Collected | Passed | Skipped | Failed | Deselected |
+|---|---|---|---|---|---|
+| `python -m pytest -q -rs` | 165 | **163** | 2 (live Ghidra, symlink) | 0 | 0 |
+| `REVENG_NEXUS_LIVE_GHIDRA=1 GHIDRA_INSTALL_DIR=<ghidra> python -m pytest tests/integration -m integration -v` | 1 | **1** | 0 | 0 | 0 |
+| same env, `python -m pytest -q -rs` (combined) | 165 | **164** | 1 (symlink) | 0 | 0 |
+
+| Other check | Result |
 |---|---|
-| `python -m pytest -q -rs` | **158 passed, 2 skipped** in ~66 s. Skipped: the live Ghidra test (opt-in) and `test_guard_refuses_symlinks` (creating symlinks needs Developer Mode/admin on this host) |
-| `REVENG_NEXUS_LIVE_GHIDRA=1 … pytest tests/integration -m integration -W error::ResourceWarning` | **1 passed** in ~40 s |
 | `python -m compileall -q src tests` | ok |
-| `ruff check src tests` | All checks passed |
-| `ruff format --check src tests` | 57 files already formatted |
-| `python -m mypy src --ignore-missing-imports` | Success: no issues found in 34 source files |
-| `python -m reveng_nexus --config config/providers.example.yaml --check-config` | Config valid; 11 providers; enabled: builtin |
-| `uv build --wheel`, then install into a fresh venv | wheel with 39 files; `reveng-nexus --version` = 0.2.0; `--check-config` ok from outside the repo |
-| `reveng-nexus providers check ghidra_remcp ghidra_mcpy` (real Ghidra) | exit 0; `ghidra_remcp` ready, 134 tools / 41 callable, all 9 binary operations available; `ghidra_mcpy` ready (one server per target) |
-| `reveng-nexus analyze nexus_fixture.elf --compare` (real Ghidra) | exit 0; 5 functions decompiled by ghidra_remcp; comparison of `_start`: decompilation `same_family_consistency` (ghidra ×2), disassembly `independent_agreement` (ghidra + capstone), overall `same_family_consistency`/medium |
+| `ruff check src tests` / `ruff format --check src tests` | all checks passed / all files formatted |
+| `python -m mypy src --ignore-missing-imports` | no issues in 35 source files |
+| `reveng-nexus --config config/providers.example.yaml --check-config` | valid; exit 0 |
+| `reveng-nexus --config %LOCALAPPDATA%\RevEngNexus\config\providers.yaml --check-config` | valid; 0 diagnostics; exit 0 |
+| Wheel built with `uv build` and installed into a fresh venv | `--version` 0.2.0; `--check-config` ok from outside the repo |
+| `providers check` (permanent config, real Ghidra) | exit 0; `builtin` ready; `ghidra_remcp` ready, 134 tools / 41 callable, 9 binary operations; `ghidra_mcpy` ready (per-target, no live session) |
+| `analyze <workspace>\nexus_fixture.elf --compare` (permanent config) | exit 0; 0 failed steps; 5 functions decompiled by `ghidra_remcp`; `_start` comparison: decompilation `same_family_consistency` (ghidra ×2), disassembly `independent_agreement` (ghidra + capstone), overall `same_family_consistency` / medium |
+| `report <case>` | Markdown/JSON written to the data dir; contains Ghidra's real pseudocode (`add_numbers(2,3)`, `0x1337`) |
+| Evidence retrieval | decompile evidence readable with provider, original tool, engine family and raw-output hash |
+| Sample integrity | SHA-256 and mtime of the workspace sample unchanged after analysis; workspace contains only the sample |
+| Processes after exit | no Ghidra, provider or gateway process left running |
+| `claude mcp get reveng-nexus` (user scope) | Status: ✔ Connected |
+| `claude -p … --allowedTools mcp__reveng-nexus__nexus_status mcp__reveng-nexus__nexus_list_targets` | both tools called through Claude Code; results contained the permanent config path and the five real case titles from the evidence DB |
 
 Defects found and fixed during live verification, each now covered by a test:
+
+0. (Claude Code run) The gateway started every provider before answering MCP `initialize`, so
+   Claude Code listed it as *pending* and the first tool search found nothing. Providers now start
+   in the background (`test_gateway_answers_handshake_while_slow_providers_start`).
+   The health label for server-reported versions was also made unambiguous.
 
 1. re-mcp `open_database` defaults to `run_auto_analysis=False`, which gave 1-byte function
    sizes and missed xrefs and strings. The adapter now always enables it, and the live test
@@ -88,6 +123,5 @@ Defects found and fixed during live verification, each now covered by a test:
 | Frida Mobile MCP | no authorised test device (dynamic analysis is disabled by design) |
 | LLM4Decompile with real weights | no GPU or served checkpoint; weights deliberately not downloaded |
 | GhidrAssist → Nexus over HTTP | no Ghidra GUI session; only Nexus' HTTP endpoint is tested |
-| `claude mcp add …` registration | not run: it changes the user's Claude Code configuration. The same stdio launch is tested with the MCP SDK client |
 | Linux/macOS | only Windows was available; POSIX branches (process groups) are unexercised |
 | Symlink refusal | needs Developer Mode/admin on this host (junction/symlink code path is skipped, not failed) |
