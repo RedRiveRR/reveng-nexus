@@ -10,13 +10,15 @@ engine stays a separate, pinned, optional process with its own licence; nothing 
 vendored.
 
 > **Status (0.2.0, 2026-10-13).** The gateway, policy engine, evidence store, comparison
-> and reporting are implemented and tested (158 tests pass; 2 are skipped by design: the
-> opt-in live Ghidra test, which **also passes when enabled** on this machine, and a symlink
-> test that needs Windows Developer Mode). The **Ghidra path is verified end to end with real Ghidra 12.1.4**
-> through two upstreams (re-mcp-ghidra 3.0.3 and MCPyGhidra 0.8.0). IDA, Binary Ninja, JADX
-> and Frida adapters are written against the pinned upstream source but **were not run**
-> here (no licence, GUI, Maven build or test device). LLM4Decompile is tested only against a
-> mock inference endpoint. See [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md).
+> and reporting are implemented and tested. Exact, observed test counts for each command
+> are in [docs/TESTING.md](docs/TESTING.md#test-accounting); two tests are
+> environment-gated (opt-in live Ghidra; a symlink test needing Windows Developer Mode).
+> The **Ghidra path is verified end to end with real Ghidra 12.1.4** through two upstreams
+> (re-mcp-ghidra 3.0.3 and MCPyGhidra 0.8.0), including a permanent Windows deployment and a
+> real Claude Code connection. IDA, Binary Ninja, JADX and Frida adapters are written from
+> the pinned upstream source but **were never executed** here (no licence, GUI, Maven build
+> or test device). LLM4Decompile is tested only against a mock inference endpoint. See
+> [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md) for each provider's verification state.
 
 ## What works today
 
@@ -38,24 +40,29 @@ Prerequisites: Python 3.11+ (3.12 tested), [uv](https://docs.astral.sh/uv/) (pro
 a JDK 21+, and [Ghidra 12.x](https://github.com/NationalSecurityAgency/ghidra/releases)
 extracted somewhere (12.1.4 was used for verification).
 
+The recommended layout keeps everything machine-specific outside the repository and
+outside OneDrive; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full table and how to
+change paths later.
+
 ```powershell
 cd reveng-nexus
-uv venv C:\venvs\reveng-nexus --python 3.12      # a venv outside OneDrive avoids sync churn
-$env:VIRTUAL_ENV = "C:\venvs\reveng-nexus"; uv pip install -e ".[disasm]"
+$base = "$env:LOCALAPPDATA\RevEngNexus"
+uv venv "$base\venv" --python 3.12
+$env:VIRTUAL_ENV = "$base\venv"; uv pip install -e ".[disasm]"
+$nx = "$base\venv\Scripts\reveng-nexus.exe"
 
-# Generate config/providers.yaml (git-ignored) for your machine:
-C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe config init `
-    --workspace C:\RE-Lab\samples `
+# Generate a validated config (never committed) and create the workspace/data folders:
+& $nx config init --workspace "$env:USERPROFILE\RevEngNexus\workspace" `
+    --data-dir "$base\data" --create-dirs `
     --enable ghidra_remcp --enable ghidra_mcpy `
-    --ghidra-dir C:\tools\ghidra_12.1.4_PUBLIC `
-    --data-dir C:\RE-Lab\nexus-data
+    --ghidra-dir "$env:LOCALAPPDATA\Programs\Ghidra\ghidra_12.1.4_PUBLIC" `
+    --output "$base\config\providers.yaml"
+$cfg = "$base\config\providers.yaml"
 
-# Start each enabled provider on its own and report health/tools (first run downloads the pinned packages):
-C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe --config config\providers.yaml providers check
-
-# Analyse an authorised sample from the workspace without an agent:
-C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe --config config\providers.yaml analyze C:\RE-Lab\samples\sample.elf --compare
-C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe --config config\providers.yaml report <case-id>
+& $nx --config $cfg --check-config        # static diagnostics: missing paths, tools, env vars
+& $nx --config $cfg providers check       # starts each provider on its own (first run downloads pinned packages)
+& $nx --config $cfg analyze "$env:USERPROFILE\RevEngNexus\workspace\sample.elf" --compare
+& $nx --config $cfg report <case-id>
 ```
 
 Linux/macOS: replace the paths, use `.venv/bin/reveng-nexus`, and for JADX use
@@ -67,30 +74,24 @@ Decompilation then reports `capability_unavailable` with the providers that coul
 
 ## Connect Claude Code
 
-Use absolute paths, because Claude Code may start the server from another working directory:
+Register at **user scope**, so machine-specific paths stay out of the repository. Use
+absolute paths, because Claude Code starts the server from arbitrary working directories:
 
 ```powershell
-claude mcp add reveng-nexus -- C:\venvs\reveng-nexus\Scripts\reveng-nexus.exe `
-    --config "C:\Users\you\...\reveng-nexus\config\providers.yaml" serve
+claude mcp add --scope user reveng-nexus -- "$env:LOCALAPPDATA\RevEngNexus\venv\Scripts\reveng-nexus.exe" `
+    --config "$env:LOCALAPPDATA\RevEngNexus\config\providers.yaml" serve
+claude mcp get reveng-nexus      # expect: Status ✔ Connected
 ```
 
-or, as a project-scoped `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "reveng-nexus": {
-      "command": "C:/venvs/reveng-nexus/Scripts/reveng-nexus.exe",
-      "args": ["--config", "C:/path/to/reveng-nexus/config/providers.yaml", "serve"]
-    }
-  }
-}
-```
+This was done and verified on the integration machine (2026-10-13). `claude mcp get`
+reported *Connected*, and a non-interactive Claude Code session called `nexus_status` and
+`nexus_list_targets` through the real connection (see [docs/TESTING.md](docs/TESTING.md)).
+The gateway answers the MCP handshake immediately and starts providers in the
+background, so tool calls made while Ghidra is still starting simply wait.
 
 The server speaks MCP on stdout, so nothing else is printed there; diagnostics go to stderr
-and to per-provider logs in `<data_dir>/logs/`. The stdio launch above is exercised by
-`tests/test_server.py::test_gateway_runs_as_stdio_subprocess` with the MCP SDK client. The
-`claude mcp add` command itself was not run as part of this work.
+and to per-provider logs in `<data_dir>/logs/`. Avoid a project-scoped `.mcp.json` with
+absolute paths (`.mcp.json` is git-ignored here for that reason).
 
 For MCP clients that only speak HTTP (for example GhidrAssist's MCP client):
 `reveng-nexus --config … serve --transport http --port 8765` serves
@@ -132,7 +133,9 @@ citing evidence ids → `nexus_review` → `nexus_export_report`.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, provider lifecycle, routing, evidence and comparison model
 - [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md): every upstream: pin, licence, launch command, verification level, limitations
 - [docs/SECURITY.md](docs/SECURITY.md): enforced controls (with tests), residual risks, deployment advice
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): permanent Windows layout, Claude Code registration, changing paths, isolation
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): environment, checks, how to add an adapter
+- [docs/OBSIDIAN_WORKFLOW.md](docs/OBSIDIAN_WORKFLOW.md): the private project-memory vault and token-saving session workflow
 - [docs/TESTING.md](docs/TESTING.md): what the tests cover, and the exact results from this machine
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): upstream and dependency licences
 - [config/providers.example.yaml](config/providers.example.yaml): annotated configuration

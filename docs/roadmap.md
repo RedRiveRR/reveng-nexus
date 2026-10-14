@@ -11,6 +11,8 @@ Items are ticked only when the behaviour **and** its tests exist (see `docs/TEST
 - [x] Policy engine: manifest/annotation/heuristic classification, unknown-tool blocking, code-exec and dynamic gating
 - [x] Metadata-only audit log, redaction
 - [x] Workspace guard, SHA-256 identity, hash-verified staged copies
+- [x] Permanent Windows deployment (`docs/DEPLOYMENT.md`), static `--check-config` diagnostics, `config init --create-dirs`
+- [x] Claude Code connection at user scope, verified with real tool calls; background provider start for a fast handshake
 
 ## Phase 1: verified provider adapters
 
