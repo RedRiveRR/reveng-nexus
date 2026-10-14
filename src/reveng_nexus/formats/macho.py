@@ -34,6 +34,16 @@ _LC_NAMES = {
     0x32: "LC_BUILD_VERSION",
 }
 _MAX_COMMANDS = 4096
+# Bytes each decoded load command must span (segment_command/_64, dylib_command, ...).
+_MIN_CMD_SIZE = {
+    "LC_SEGMENT": 56,
+    "LC_SEGMENT_64": 72,
+    "LC_LOAD_DYLIB": 24,
+    "LC_LOAD_WEAK_DYLIB": 24,
+    "LC_ENCRYPTION_INFO": 20,
+    "LC_ENCRYPTION_INFO_64": 24,
+    "LC_MAIN": 24,
+}
 
 
 def _parse_thin(blob: bytes, offset: int = 0) -> dict[str, Any]:
@@ -45,29 +55,50 @@ def _parse_thin(blob: bytes, offset: int = 0) -> dict[str, Any]:
     else:
         return {"error": "not a thin Mach-O header"}
     is64 = magic in (b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe")
+    header_size = 32 if is64 else 28
+    if offset + header_size > len(blob):
+        return {"error": "truncated Mach-O header", "truncated": True}
     cputype, _sub, filetype, ncmds, _sizeofcmds, flags = struct.unpack_from(endian + "iiIIII", blob, offset + 4)
     arch, bits = _CPU.get(cputype & 0xFFFFFFFF, (f"cpu_0x{cputype & 0xFFFFFFFF:x}", 64 if is64 else 32))
-    cursor = offset + (32 if is64 else 28)
+    cursor = offset + header_size
     commands: list[str] = []
     segments: list[dict[str, Any]] = []
     libraries: list[str] = []
     encrypted = False
+    truncated = False
     entry_offset = None
     for _ in range(min(ncmds, _MAX_COMMANDS)):
         if cursor + 8 > len(blob):
+            truncated = True
             break
         cmd, cmdsize = struct.unpack_from(endian + "II", blob, cursor)
         if cmdsize < 8:
             break
         name = _LC_NAMES.get(cmd, f"0x{cmd:x}")
+        if cursor + max(cmdsize, _MIN_CMD_SIZE.get(name, 8)) > len(blob):
+            # The command runs past the end of the file: keep what was decoded, flag the rest.
+            truncated = True
+            break
         commands.append(name)
+        if cmdsize < _MIN_CMD_SIZE.get(name, 8):
+            cursor += cmdsize  # malformed: too short for its own fields; do not decode it
+            continue
         if name in ("LC_SEGMENT", "LC_SEGMENT_64"):
             segname = blob[cursor + 8 : cursor + 24].rstrip(b"\x00").decode("latin-1")
             if name == "LC_SEGMENT_64":
-                vmaddr, vmsize = struct.unpack_from(endian + "QQ", blob, cursor + 24)
+                vmaddr, vmsize, fileoff, filesize = struct.unpack_from(endian + "QQQQ", blob, cursor + 24)
             else:
-                vmaddr, vmsize = struct.unpack_from(endian + "II", blob, cursor + 24)
-            segments.append({"name": segname, "vaddr": vmaddr, "size": vmsize})
+                vmaddr, vmsize, fileoff, filesize = struct.unpack_from(endian + "IIII", blob, cursor + 24)
+            # offset/file_size are needed to map addresses to file bytes (disassembly, strings).
+            segments.append(
+                {
+                    "name": segname,
+                    "vaddr": vmaddr,
+                    "size": vmsize,
+                    "offset": offset + fileoff,
+                    "file_size": filesize,
+                }
+            )
         elif name in ("LC_LOAD_DYLIB", "LC_LOAD_WEAK_DYLIB"):
             (str_off,) = struct.unpack_from(endian + "I", blob, cursor + 8)
             raw = blob[cursor + str_off : cursor + cmdsize]
@@ -94,17 +125,23 @@ def _parse_thin(blob: bytes, offset: int = 0) -> dict[str, Any]:
         "libraries": libraries,
         "load_commands": commands,
         "encrypted": encrypted,
+        "truncated": truncated,
     }
 
 
 def inspect_macho(path: Path, blob: bytes) -> dict[str, Any]:
     notes = ["Mach-O symbols are not decoded by the built-in parser; use a full engine."]
     if blob[:4] == b"\xca\xfe\xba\xbe":
+        if len(blob) < 8:
+            return {"format": "macho_universal", "slices": [], "truncated": True, "notes": notes}
         (nfat,) = struct.unpack_from(">I", blob, 4)
         if nfat > 64:
             # 0xCAFEBABE is shared with Java class files, which carry a small "count" here.
             return {"format": "java_class_or_unknown", "notes": ["0xCAFEBABE with implausible fat count"]}
         slices = []
+        if 8 + nfat * 20 > len(blob):
+            notes.append("fat_arch table runs past the end of the file (truncated input).")
+            return {"format": "macho_universal", "slices": [], "truncated": True, "notes": notes}
         for i in range(nfat):
             cputype, _sub, off, size, _align = struct.unpack_from(">iiIII", blob, 8 + i * 20)
             thin = _parse_thin(blob, off) if off + 32 <= len(blob) else {"error": "slice out of range"}
@@ -113,6 +150,8 @@ def inspect_macho(path: Path, blob: bytes) -> dict[str, Any]:
         return {"format": "macho_universal", "slices": slices, "notes": notes}
     info = _parse_thin(blob)
     info.update({"format": "macho", "notes": notes, "functions": [], "imports": [], "exports": []})
+    if info.get("truncated"):
+        notes.append("Load commands run past the end of the file: metadata is partial (truncated input).")
     if info.get("encrypted"):
         notes.append("LC_ENCRYPTION_INFO cryptid != 0: code is encrypted; static output will be unreliable.")
     return info
