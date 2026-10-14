@@ -517,7 +517,16 @@ class McpProvider(AnalysisProvider):
         self.last_error = None
         # The first listing belongs to startup and may be as slow as the handshake.
         await self.refresh_tools(client, budget=self._startup_budget())
-        self.adapter_state.pop("sessions", None)
+        self._reset_sessions()
+
+    def _reset_sessions(self) -> None:
+        """Forget engine sessions after a (re)connect, *in place*.
+
+        Adapters hold a reference to this dict across the call that opens a target; that call
+        may itself trigger the reconnect. Replacing the dict would drop the new server's session
+        record, so the old database was never closed on the next target switch.
+        """
+        self.adapter_state.setdefault("sessions", {}).clear()
 
     async def _client_for(self, target: TargetContext | None) -> Any:
         if not self.per_target:
@@ -692,7 +701,7 @@ class McpProvider(AnalysisProvider):
             raise
 
     async def _drop_connection(self) -> None:
-        self.adapter_state.pop("sessions", None)
+        self._reset_sessions()
         if self.per_target:
             sha = self._active_target
             owner = self._target_owners.pop(sha, None) if sha else None

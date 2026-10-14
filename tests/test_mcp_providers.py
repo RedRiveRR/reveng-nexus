@@ -393,3 +393,22 @@ async def test_connection_owner_close_abandons_a_task_that_swallows_cancellation
         release.set()
         await asyncio.wait({owner._task}, timeout=5)
     assert owner._task.done()
+
+
+async def test_reconnect_inside_open_keeps_the_new_session(config_factory, workspace, elf_sample, tmp_path):
+    """Regression (shared session reset): the reconnect triggered by open_database itself replaced
+    the session dict, so the new session was lost and every later call re-opened the database."""
+    log = tmp_path / "calls.log"
+    env = {"MOCK_CRASH_TOOL": "get_strings", "MOCK_CALL_LOG": str(log)}
+    mgr = await started(config_factory(workspace, [mock_engine("eng", env=env)]))
+    try:
+        target = await target_of(mgr, elf_sample)
+        await mgr.perform("binary.functions", target, {}, provider_id="eng")
+        with pytest.raises(CapabilityUnavailable):
+            await mgr.perform("binary.strings", target, {}, provider_id="eng", max_failover=0)
+        for _ in range(2):
+            await mgr.perform("binary.functions", target, {}, provider_id="eng")
+        tools = log.read_text(encoding="utf-8").splitlines()
+        assert tools.count("open_database") == 2, tools
+    finally:
+        await mgr.close()

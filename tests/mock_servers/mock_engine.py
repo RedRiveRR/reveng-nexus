@@ -9,6 +9,7 @@ Behaviour switches (environment variables):
   MOCK_ERROR_TOOL          return isError for one tool
   MOCK_PAGE_SIZE           tools/list page size (pagination tests)
   MOCK_SLOW_LIST_AFTER / MOCK_SLOW_LIST_SECONDS   after N complete listings, sleep before every page
+  MOCK_CALL_LOG            append one line per tool call (tool name) to this file
   MOCK_PID_FILE            write this process's pid here (process-cleanup tests)
 It only *reads* the file handed to open_database; nothing is executed.
 """
@@ -206,6 +207,9 @@ async def on_list_tools(ctx, params) -> ListToolsResult:
 
 async def on_call_tool(ctx, params) -> CallToolResult:
     name, args = params.name, params.arguments or {}
+    if os.environ.get("MOCK_CALL_LOG"):
+        with open(os.environ["MOCK_CALL_LOG"], "a", encoding="utf-8") as handle:
+            handle.write(name + "\n")
     if name == os.environ.get("MOCK_SLOW_TOOL"):
         await anyio.sleep(float(os.environ.get("MOCK_SLOW_SECONDS", "30")))
     if name == os.environ.get("MOCK_CRASH_TOOL"):
