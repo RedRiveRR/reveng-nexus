@@ -9,13 +9,16 @@ engine to confirm the live ``tools/list`` still matches.
 
 from __future__ import annotations
 
+import json
+import re
+from pathlib import PureWindowsPath
 from typing import Any
 
 from ..errors import CapabilityUnavailable, ProviderCallError
-from .base import McpAdapter, UpstreamPin, function_ref, parse_address, parse_listing_lines
+from .base import McpAdapter, UpstreamPin, fmt_address, function_ref, parse_address, parse_listing_lines
 
 
-def _items(payload: Any, *keys: str) -> list[Any]:
+def _find_list(payload: Any, *keys: str) -> list[Any] | None:
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
@@ -23,7 +26,31 @@ def _items(payload: Any, *keys: str) -> list[Any]:
             value = payload.get(key)
             if isinstance(value, list):
                 return value
-    return []
+    return None
+
+
+def _items(payload: Any, *keys: str) -> list[Any]:
+    return _find_list(payload, *keys) or []
+
+
+def _shape(payload: Any) -> str:
+    if payload is None:
+        return "plain text where JSON was expected"
+    if isinstance(payload, dict):
+        return f"keys {sorted(payload)[:8]}"
+    return type(payload).__name__
+
+
+def _shape_warning(tool: str, payload: Any) -> str:
+    return f"{tool} returned an unrecognised payload ({_shape(payload)}); the normalised result is empty, see the raw output"
+
+
+def _json_listing(payload: Any, tool: str, *keys: str) -> tuple[list[Any], list[str]]:
+    """Rows of a JSON list response, plus a warning when no recognised list is present."""
+    rows = _find_list(payload, *keys)
+    if rows is None:
+        return [], [_shape_warning(tool, payload)]
+    return rows, []
 
 
 def _addr_of(item: Any, *keys: str) -> int | None:
@@ -115,25 +142,51 @@ class IdaRsAdapter(McpAdapter):
             except Exception:  # noqa: BLE001 - best effort
                 pass
 
+    async def _address(self, provider, target, params) -> tuple[int, str | None]:
+        """decompile, xrefs_to/from and basic_blocks take numeric addresses only (pinned
+        server/mod.rs ``parse_address`` rejects symbols), so a name is resolved first, to exactly
+        one function, via list_functions."""
+        address, name, _ref = function_ref(params)
+        if address is not None:
+            return address, name
+        payload, _t, _raw = await self.call(
+            provider, target, "list_functions", {"filter": name, "limit": 50, "offset": 0}
+        )
+        rows, _w = _json_listing(payload, "list_functions", "functions")
+        matches = [_addr_of(r) for r in rows if isinstance(r, dict) and r.get("name") == name]
+        if len(matches) != 1 or matches[0] is None:
+            raise ProviderCallError(
+                f"{provider.id}: cannot resolve {name!r} to one function address ({len(matches)} exact matches)"
+            )
+        return matches[0], name
+
     async def op_binary_metadata(self, provider, target, session, params):
         payload, _t, raw = await self.call(provider, target, "idb_meta", {})
         meta = payload if isinstance(payload, dict) else {}
+        warnings = [] if isinstance(payload, dict) else [_shape_warning("idb_meta", payload)]
+        # Pinned keys (src/ida/handlers/globals.rs): processor, bits, image_base, main_address,
+        # min/max_address, ... There is no entry-point key, and main() is not the image entry
+        # point, so entry_point stays unknown rather than being relabelled from main_address.
         normalized = {
-            "processor": meta.get("processor") or meta.get("proc_name"),
-            "bits": meta.get("bits") or meta.get("bitness"),
-            "image_base": parse_address(meta.get("image_base") or meta.get("imagebase") or meta.get("base")),
-            "entry_point": parse_address(meta.get("entry_point") or meta.get("start_ea")),
+            "processor": meta.get("processor"),
+            "bits": meta.get("bits"),
+            "image_base": parse_address(meta.get("image_base")),
+            "entry_point": parse_address(meta.get("entry_point")),
+            "main_address": parse_address(meta.get("main_address")),
             "engine_info": meta,
         }
-        return self.result(provider, "binary.metadata", "idb_meta", normalized, raw, claim="IDA database metadata")
+        return self.result(
+            provider, "binary.metadata", "idb_meta", normalized, raw, warnings=warnings, claim="IDA database metadata"
+        )
 
     async def op_binary_functions(self, provider, target, session, params):
         args: dict[str, Any] = {"limit": int(params.get("limit", 500)), "offset": 0}
         if params.get("query"):
             args["filter"] = str(params["query"])
         payload, _t, raw = await self.call(provider, target, "list_functions", args)
+        rows, warnings = _json_listing(payload, "list_functions", "functions")
         functions = []
-        for item in _items(payload, "functions"):
+        for item in rows:
             start = _addr_of(item)
             end = _addr_of(item, "end", "end_ea")
             size = item.get("size") if isinstance(item, dict) else None
@@ -150,19 +203,33 @@ class IdaRsAdapter(McpAdapter):
             "list_functions",
             {"functions": functions, "total": len(functions)},
             raw,
+            warnings=warnings,
             claim=f"{len(functions)} functions",
         )
 
     async def op_binary_decompile(self, provider, target, session, params):
-        address, name, ref = function_ref(params)
+        address, name = await self._address(provider, target, params)
+        ref = fmt_address(address)
         payload, text, raw = await self.call(provider, target, "decompile", {"address": ref})
         info = payload if isinstance(payload, dict) else {}
         entry = (_items(payload, "results") or [info])[0] if isinstance(payload, (dict, list)) else {}
-        code = (
-            (entry.get("pseudocode") or entry.get("code") or entry.get("text") or text)
-            if isinstance(entry, dict)
-            else text
-        )
+        if payload is None:
+            code: Any = text
+        else:
+            code = next(
+                (
+                    entry[k]
+                    for k in ("pseudocode", "code", "text")
+                    if isinstance(entry, dict) and isinstance(entry.get(k), str)
+                ),
+                None,
+            )
+            if code is None:
+                # Never present an unexpected JSON document as Hex-Rays output.
+                raise ProviderCallError(
+                    f"{provider.id}/decompile returned no pseudocode field ({_shape(payload)})",
+                    details={"tool": "decompile"},
+                )
         resolved = _addr_of(entry) if isinstance(entry, dict) else None
         fname = entry.get("name") if isinstance(entry, dict) else None
         return self.result(
@@ -185,6 +252,8 @@ class IdaRsAdapter(McpAdapter):
         address, name, ref = function_ref(params)
         args: dict[str, Any] = {"address": ref} if address is not None else {"target_name": name}
         payload, text, raw = await self.call(provider, target, "disasm_function_at", args)
+        # A plain-text listing is parsed below; a JSON payload must carry an instruction list.
+        warnings = [] if payload is None else _json_listing(payload, "disasm_function_at", "instructions", "lines")[1]
         instructions = []
         for item in _items(payload, "instructions", "lines"):
             if isinstance(item, dict):
@@ -204,6 +273,7 @@ class IdaRsAdapter(McpAdapter):
             "disasm_function_at",
             {"function": {"name": name, "address": address}, "instructions": instructions},
             raw,
+            warnings=warnings,
             subject_type="function",
             subject_address=address,
             subject_name=name,
@@ -211,19 +281,21 @@ class IdaRsAdapter(McpAdapter):
         )
 
     async def op_binary_xrefs(self, provider, target, session, params):
-        address, name, ref = function_ref(params)
+        address, name = await self._address(provider, target, params)
+        ref = fmt_address(address)
         direction = params.get("direction", "to")
         tool = "xrefs_to" if direction == "to" else "xrefs_from"
         payload, _t, raw = await self.call(
             provider, target, tool, {"address": ref, "limit": int(params.get("limit", 200))}
         )
+        rows, warnings = _json_listing(payload, tool, "xrefs", "refs")
         refs = [
             {
                 "from": _addr_of(i, "from", "frm", "source"),
                 "to": _addr_of(i, "to", "target") or address,
                 "type": i.get("type") if isinstance(i, dict) else None,
             }
-            for i in _items(payload, "xrefs", "refs")
+            for i in rows
         ]
         return self.result(
             provider,
@@ -231,6 +303,7 @@ class IdaRsAdapter(McpAdapter):
             tool,
             {"subject": {"address": address, "name": name}, "direction": direction, "refs": refs},
             raw,
+            warnings=warnings,
             subject_type="address",
             subject_address=address,
             subject_name=name,
@@ -242,9 +315,12 @@ class IdaRsAdapter(McpAdapter):
         if params.get("query"):
             args["filter"] = str(params["query"])
         payload, _t, raw = await self.call(provider, target, "strings", args)
+        rows, warnings = _json_listing(payload, "strings", "strings")
+        # Pinned StringInfo is {address, content, length}: the text lives in "content".
         strings = [
-            {"address": _addr_of(i), "value": i.get("value", i.get("string")) if isinstance(i, dict) else i}
-            for i in _items(payload, "strings")
+            {"address": _addr_of(i), "value": i.get("content"), "length": i.get("length")}
+            for i in rows
+            if isinstance(i, dict)
         ]
         return self.result(
             provider,
@@ -252,14 +328,18 @@ class IdaRsAdapter(McpAdapter):
             "strings",
             {"strings": strings, "returned": len(strings)},
             raw,
+            warnings=warnings,
             claim=f"{len(strings)} strings",
         )
 
     async def op_binary_imports(self, provider, target, session, params):
         payload, _t, raw = await self.call(provider, target, "imports", {"limit": int(params.get("limit", 2000))})
+        rows, warnings = _json_listing(payload, "imports", "imports")
+        # Pinned ImportInfo is {address, name, ordinal}; it names no module, so the library is
+        # unknown (None) rather than guessed.
         imports = [
-            {"name": i.get("name"), "library": i.get("module"), "address": _addr_of(i)}
-            for i in _items(payload, "imports")
+            {"name": i.get("name"), "library": None, "address": _addr_of(i), "ordinal": i.get("ordinal")}
+            for i in rows
             if isinstance(i, dict)
         ]
         return self.result(
@@ -268,33 +348,35 @@ class IdaRsAdapter(McpAdapter):
             "imports",
             {"imports": imports, "total": len(imports)},
             raw,
+            warnings=warnings,
             claim=f"{len(imports)} imports",
         )
 
     async def op_binary_exports(self, provider, target, session, params):
         payload, _t, raw = await self.call(provider, target, "exports", {"limit": int(params.get("limit", 2000))})
-        exports = [
-            {"name": i.get("name"), "address": _addr_of(i)} for i in _items(payload, "exports") if isinstance(i, dict)
-        ]
+        rows, warnings = _json_listing(payload, "exports", "exports")
+        exports = [{"name": i.get("name"), "address": _addr_of(i)} for i in rows if isinstance(i, dict)]
         return self.result(
             provider,
             "binary.exports",
             "exports",
             {"exports": exports, "total": len(exports)},
             raw,
+            warnings=warnings,
             claim=f"{len(exports)} exports",
         )
 
     async def op_binary_cfg(self, provider, target, session, params):
-        address, name, ref = function_ref(params)
-        payload, _t, raw = await self.call(provider, target, "basic_blocks", {"address": ref})
+        address, name = await self._address(provider, target, params)
+        payload, _t, raw = await self.call(provider, target, "basic_blocks", {"address": fmt_address(address)})
+        rows, warnings = _json_listing(payload, "basic_blocks", "blocks")
         blocks = [
             {
                 "start": _addr_of(b, "start", "start_ea"),
                 "end": _addr_of(b, "end", "end_ea"),
                 "successors": [parse_address(s) for s in (b.get("succs") or b.get("successors") or [])],
             }
-            for b in _items(payload, "blocks")
+            for b in rows
             if isinstance(b, dict)
         ]
         return self.result(
@@ -303,6 +385,7 @@ class IdaRsAdapter(McpAdapter):
             "basic_blocks",
             {"function": {"address": address, "name": name}, "blocks": blocks},
             raw,
+            warnings=warnings,
             subject_type="function",
             subject_address=address,
             subject_name=name,
@@ -366,6 +449,81 @@ IDA_RS = IdaRsAdapter(
 )
 
 
+_BINJA_ERROR = re.compile(r"^(Error\b|Server returned \d{3}\b|No response from server\b|Request failed:)")
+
+
+def _basename(path: str) -> str:
+    return PureWindowsPath(path).name  # accepts both "/" and "\" separators
+
+
+def _binja_body(provider: Any, target: Any, tool: str, text: str) -> str:
+    """Unwrap one bridge answer (pinned ``bridge/src/tools.ts``).
+
+    Some tools prefix ``File: <active view path>``; that name must be the target, or the answer
+    belongs to another binary. The bridge never sets MCP ``isError``: HTTP and plugin failures
+    arrive as text (``Error: ...``, ``Error: GET <endpoint> failed: ...``), which is raised here
+    instead of being parsed as data.
+    """
+    body = text
+    if body.startswith("File: "):
+        first, _, rest = body.partition("\n")
+        shown = first[len("File: ") :].strip()
+        if not shown or shown == "(none)":
+            raise CapabilityUnavailable(f"{provider.id}/{tool}: Binary Ninja reports no open binary")
+        if _basename(shown) != target.display_name:
+            raise CapabilityUnavailable(
+                f"{provider.id}/{tool}: the answer is for {_basename(shown)!r}, not {target.display_name!r}",
+                details={"active_view": _basename(shown)},
+            )
+        body = rest[1:] if rest.startswith("\n") else rest
+    if _BINJA_ERROR.match(body.strip()):
+        raise ProviderCallError(
+            f"{provider.id}/{tool}: Binary Ninja bridge reported an error: {body.strip()[:300]}",
+            details={"tool": tool},
+        )
+    return body
+
+
+def _json_document(text: str) -> dict[str, Any] | list[Any] | None:
+    """Return ``text`` parsed when it is exactly one JSON object or array, else None."""
+    stripped = text.strip()
+    if not stripped.startswith(("{", "[")):
+        return None
+    try:
+        value = json.loads(stripped)
+    except ValueError:
+        return None
+    return value if isinstance(value, (dict, list)) else None
+
+
+def _binja_json(provider: Any, tool: str, body: str) -> Any:
+    """The plugin answers these endpoints with one compact JSON document (``_send_json_response``)."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise ProviderCallError(
+            f"{provider.id}/{tool}: expected the plugin's JSON document, got {len(body)} chars of text",
+            details={"tool": tool},
+        ) from None
+    if isinstance(data, dict) and data.get("error"):
+        raise ProviderCallError(f"{provider.id}/{tool}: {str(data['error'])[:300]}", details={"tool": tool})
+    return data
+
+
+def _binja_rows(provider: Any, tool: str, body: str, key: str) -> tuple[list[dict[str, Any]], list[str]]:
+    data = _binja_json(provider, tool, body)
+    rows = data.get(key) if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return [], [_shape_warning(tool, data)]
+    kept = [r for r in rows if isinstance(r, dict)]
+    warnings = (
+        [f"{tool}: {len(rows) - len(kept)} entr(y/ies) were not objects and were ignored"]
+        if len(kept) < len(rows)
+        else []
+    )
+    return kept, warnings
+
+
 # ---------------------------------------------------------------------------
 # fosdickio/binary_ninja_mcp (npm bridge "binary-ninja-mcp" → BN plugin HTTP :9009)
 # ---------------------------------------------------------------------------
@@ -373,72 +531,89 @@ class BinjaAdapter(McpAdapter):
     """The Binary Ninja plugin serves whatever the *user* opened in the BN GUI.
 
     Nexus cannot load a file into Binary Ninja through this bridge, so before every
-    operation it checks that the active view's filename matches the target and refuses
-    otherwise, rather than attributing another binary's analysis to this SHA-256.
+    operation it checks that the active view's file name equals the target's and refuses
+    otherwise, rather than attributing another binary's analysis to this SHA-256. Tools that
+    carry a ``File:`` preamble are checked again per answer.
     """
 
     async def prepare(self, provider, target) -> dict[str, Any]:
-        payload, text, _raw = await self.call(provider, target, "get_binary_status", {})
-        blob = (str(payload) if payload is not None else "") + text
-        if target.display_name not in blob:
+        _payload, text, _raw = await self.call(provider, target, "get_binary_status", {})
+        body = _binja_body(provider, target, "get_binary_status", text)
+        try:
+            status = json.loads(body.strip())  # first line of the plugin's /status JSON
+        except ValueError:
+            status = None
+        if not isinstance(status, dict):
+            raise CapabilityUnavailable(f"{provider.id}: unrecognised get_binary_status answer ({len(body)} chars)")
+        filename = status.get("filename")
+        if not status.get("loaded") or not filename:
             raise CapabilityUnavailable(
-                f"Binary Ninja's active view does not appear to be {target.display_name!r}",
+                f"{provider.id}: Binary Ninja has no binary open",
                 remediation="Open the target in Binary Ninja (or select it with select_binary) and retry.",
-                details={"binary_status": blob[:400]},
             )
-        return {"status": blob[:400]}
+        if _basename(str(filename)) != target.display_name:
+            raise CapabilityUnavailable(
+                f"Binary Ninja's active view is {_basename(str(filename))!r}, not {target.display_name!r}",
+                remediation="Open the target in Binary Ninja (or select it with select_binary) and retry.",
+                details={"active_view": _basename(str(filename))},
+            )
+        return {"active_view": _basename(str(filename))}
+
+    async def _function_name(self, provider, target, params) -> tuple[int | None, str]:
+        address, name, ref = function_ref(params)
+        if name is not None:
+            return address, name
+        _payload, text, _raw = await self.call(provider, target, "function_at", {"address": ref})
+        data = _binja_json(provider, "function_at", _binja_body(provider, target, "function_at", text))
+        names = [n for n in (data.get("functions") if isinstance(data, dict) else None) or [] if isinstance(n, str)]
+        if not names:
+            raise ProviderCallError(f"{provider.id}: no function contains {ref}")
+        if len(names) > 1:
+            raise ProviderCallError(
+                f"{provider.id}: {ref} lies in {len(names)} functions ({', '.join(names[:5])}); pass a name instead"
+            )
+        return address, names[0]
 
     async def op_binary_functions(self, provider, target, session, params):
         if params.get("query"):
-            tool, args = (
+            tool, key, args = (
                 "search_functions_by_name",
+                "matches",
                 {"query": str(params["query"]), "limit": int(params.get("limit", 500))},
             )
         else:
-            tool, args = "list_methods", {"limit": int(params.get("limit", 500)), "offset": 0}
-        payload, text, raw = await self.call(provider, target, tool, args)
-        rows = _items(payload, "functions", "methods") or [line for line in text.splitlines() if line.strip()]
-        functions = []
-        for row in rows:
-            if isinstance(row, dict):
-                functions.append({"name": row.get("name"), "address": _addr_of(row), "size": row.get("size")})
-            else:
-                parts = str(row).rsplit(" at ", 1)
-                functions.append(
-                    {
-                        "name": parts[0].strip(),
-                        "address": parse_address(parts[1]) if len(parts) == 2 else None,
-                        "size": None,
-                    }
-                )
+            tool, key, args = "list_methods", "functions", {"limit": int(params.get("limit", 500)), "offset": 0}
+        _payload, text, raw = await self.call(provider, target, tool, args)
+        rows, warnings = _binja_rows(provider, tool, _binja_body(provider, target, tool, text), key)
+        functions = [{"name": r.get("name"), "address": _addr_of(r), "size": None} for r in rows]
         return self.result(
             provider,
             "binary.functions",
             tool,
             {"functions": functions, "total": len(functions)},
             raw,
+            warnings=warnings,
             claim=f"{len(functions)} functions",
         )
 
     async def op_binary_decompile(self, provider, target, session, params):
-        address, name, ref = function_ref(params)
-        if name is None:
-            payload, text, _raw = await self.call(provider, target, "function_at", {"address": ref})
-            name = (
-                (payload or {}).get("name")
-                if isinstance(payload, dict)
-                else text.strip().splitlines()[0]
-                if text.strip()
-                else None
+        address, name = await self._function_name(provider, target, params)
+        _payload, text, raw = await self.call(provider, target, "decompile_function", {"name": name})
+        code = _binja_body(provider, target, "decompile_function", text)
+        if not code.strip():
+            raise ProviderCallError(f"{provider.id}/decompile_function returned no HLIL for {name!r}")
+        if _json_document(code) is not None:
+            # HLIL text is never a JSON object/array: do not label a stray document as code.
+            raise ProviderCallError(
+                f"{provider.id}/decompile_function returned a JSON document ({_shape(_json_document(code))}) "
+                "where HLIL text was expected",
+                details={"tool": "decompile_function"},
             )
-            if not name:
-                raise ProviderCallError(f"{provider.id}: no function at {ref}")
-        payload, text, raw = await self.call(provider, target, "decompile_function", {"name": name})
         return self.result(
             provider,
             "binary.decompile",
             "decompile_function",
-            {"function": {"name": name, "address": address}, "code": text, "language": "HLIL"},
+            {"function": {"name": name, "address": address}, "code": code, "language": "HLIL"},
             raw,
             subject_type="function",
             subject_address=address,
@@ -447,17 +622,22 @@ class BinjaAdapter(McpAdapter):
         )
 
     async def op_binary_disassemble(self, provider, target, session, params):
-        address, name, ref = function_ref(params)
-        if name is None:
-            payload, text, _raw = await self.call(provider, target, "function_at", {"address": ref})
-            name = text.strip().splitlines()[0] if text.strip() else None
-        payload, text, raw = await self.call(provider, target, "fetch_disassembly", {"name": name})
+        address, name = await self._function_name(provider, target, params)
+        _payload, text, raw = await self.call(provider, target, "fetch_disassembly", {"name": name})
+        listing = _binja_body(provider, target, "fetch_disassembly", text)
+        instructions = parse_listing_lines(listing)
+        warnings = (
+            [f"fetch_disassembly: no instruction lines recognised in {len(listing)} chars; see the raw output"]
+            if listing.strip() and not instructions
+            else []
+        )
         return self.result(
             provider,
             "binary.disassemble",
             "fetch_disassembly",
-            {"function": {"name": name, "address": address}, "instructions": parse_listing_lines(text)},
+            {"function": {"name": name, "address": address}, "instructions": instructions},
             raw,
+            warnings=warnings,
             subject_type="function",
             subject_address=address,
             subject_name=name,
@@ -468,21 +648,30 @@ class BinjaAdapter(McpAdapter):
         address, name, ref = function_ref(params)
         if params.get("direction", "to") != "to":
             raise CapabilityUnavailable("binary_ninja_mcp exposes xrefs *to* an address only (use get_callees)")
-        payload, text, raw = await self.call(provider, target, "get_xrefs_to", {"address": ref})
-        refs = [{"from": _addr_of(i, "from", "address"), "to": address} for i in _items(payload, "xrefs")]
-        if not refs:
-            refs = [
-                {"from": parse_address(tok), "to": address}
-                for line in text.splitlines()
-                for tok in line.split()[:1]
-                if parse_address(tok) is not None
-            ]
+        _payload, text, raw = await self.call(provider, target, "get_xrefs_to", {"address": ref})
+        data = _binja_json(provider, "get_xrefs_to", _binja_body(provider, target, "get_xrefs_to", text))
+        warnings: list[str] = []
+        refs: list[dict[str, Any]] = []
+        if not isinstance(data, dict) or not (
+            isinstance(data.get("code_references"), list) or isinstance(data.get("data_references"), list)
+        ):
+            warnings.append(_shape_warning("get_xrefs_to", data))
+        else:
+            for kind in ("code", "data"):
+                for entry in data.get(f"{kind}_references") or []:
+                    source = _addr_of(entry)
+                    if source is None:
+                        # The data_references record shape is not pinned down upstream; never guess.
+                        warnings.append(f"get_xrefs_to: a {kind} reference without an address was ignored")
+                        continue
+                    refs.append({"from": source, "to": address, "type": kind, "function": entry.get("function")})
         return self.result(
             provider,
             "binary.xrefs",
             "get_xrefs_to",
             {"subject": {"address": address, "name": name}, "direction": "to", "refs": refs},
             raw,
+            warnings=warnings,
             subject_type="address",
             subject_address=address,
             subject_name=name,
@@ -497,50 +686,40 @@ class BinjaAdapter(McpAdapter):
             )
         else:
             tool, args = "list_strings", {"count": int(params.get("limit", 200)), "offset": 0}
-        payload, text, raw = await self.call(provider, target, tool, args)
-        strings = [
-            {"address": _addr_of(i), "value": i.get("value", i.get("string"))}
-            for i in _items(payload, "strings")
-            if isinstance(i, dict)
-        ] or [{"value": line} for line in text.splitlines() if line.strip()]
+        _payload, text, raw = await self.call(provider, target, tool, args)
+        rows, warnings = _binja_rows(provider, tool, _binja_body(provider, target, tool, text), "strings")
+        strings = [{"address": _addr_of(r), "value": r.get("value"), "length": r.get("length")} for r in rows]
         return self.result(
             provider,
             "binary.strings",
             tool,
             {"strings": strings, "returned": len(strings)},
             raw,
+            warnings=warnings,
             claim=f"{len(strings)} strings",
         )
 
-    async def op_binary_imports(self, provider, target, session, params):
-        payload, text, raw = await self.call(
-            provider, target, "list_imports", {"offset": 0, "limit": int(params.get("limit", 2000))}
+    async def _symbols(self, provider, target, params, tool: str, key: str, operation: str):
+        _payload, text, raw = await self.call(
+            provider, target, tool, {"offset": 0, "limit": int(params.get("limit", 2000))}
         )
-        rows = _items(payload, "imports") or [line for line in text.splitlines() if line.strip()]
-        imports = [{"name": r.get("name") if isinstance(r, dict) else str(r)} for r in rows]
+        rows, warnings = _binja_rows(provider, tool, _binja_body(provider, target, tool, text), key)
+        symbols = [{"name": r.get("name"), "address": _addr_of(r)} for r in rows]
         return self.result(
             provider,
-            "binary.imports",
-            "list_imports",
-            {"imports": imports, "total": len(imports)},
+            operation,
+            tool,
+            {key: symbols, "total": len(symbols)},
             raw,
-            claim=f"{len(imports)} imports",
+            warnings=warnings,
+            claim=f"{len(symbols)} {key}",
         )
 
+    async def op_binary_imports(self, provider, target, session, params):
+        return await self._symbols(provider, target, params, "list_imports", "imports", "binary.imports")
+
     async def op_binary_exports(self, provider, target, session, params):
-        payload, text, raw = await self.call(
-            provider, target, "list_exports", {"offset": 0, "limit": int(params.get("limit", 2000))}
-        )
-        rows = _items(payload, "exports") or [line for line in text.splitlines() if line.strip()]
-        exports = [{"name": r.get("name") if isinstance(r, dict) else str(r)} for r in rows]
-        return self.result(
-            provider,
-            "binary.exports",
-            "list_exports",
-            {"exports": exports, "total": len(exports)},
-            raw,
-            claim=f"{len(exports)} exports",
-        )
+        return await self._symbols(provider, target, params, "list_exports", "exports", "binary.exports")
 
 
 _BINJA_READ = (
@@ -594,6 +773,48 @@ BINJA = BinjaAdapter(
 # ---------------------------------------------------------------------------
 # Qtty/jadx-mcp-server (Python MCP layer → local JADX JVM daemon)
 # ---------------------------------------------------------------------------
+_JADX_PARTIAL = re.compile(r"^@(outline|oversized|truncated|ambiguous)\b")
+
+
+def _jadx_decode(provider: Any, tool: str, text: str, expect: type) -> tuple[Any, list[str]]:
+    """Decode the pinned server's answer: exactly one text block holding ``json.dumps(value)``.
+
+    Decoded once, never again: a decoded string is returned as-is even if its contents look
+    like JSON. Plain text that is not JSON at all is accepted only where a string is expected
+    (an older/unpinned server), with a warning; anything else of the wrong type is an error.
+    """
+    try:
+        value = json.loads(text)
+    except ValueError:
+        if expect is str and text.strip():
+            return text, [f"{tool}: plain text instead of the pinned JSON-encoded string; used verbatim"]
+        raise ProviderCallError(
+            f"{provider.id}/{tool} returned {len(text)} chars that are not valid JSON", details={"tool": tool}
+        ) from None
+    if not isinstance(value, expect):
+        raise ProviderCallError(
+            f"{provider.id}/{tool} returned JSON {type(value).__name__} where {expect.__name__} was expected",
+            details={"tool": tool},
+        )
+    return value, []
+
+
+def _jadx_split(tool: str, items: list[Any]) -> tuple[list[Any], list[str]]:
+    """Separate bookkeeping entries from data: a string starting with '@', or a one-key object
+    whose key starts with '@' (``@truncated``, ``@oversized``, ``@rejected``, ...)."""
+    data: list[Any] = []
+    notes: list[str] = []
+    for item in items:
+        if isinstance(item, str) and item.startswith("@"):
+            notes.append(item)
+        elif isinstance(item, dict) and len(item) == 1 and str(next(iter(item))).startswith("@"):
+            key = next(iter(item))
+            notes.append(f"{key}: {item[key]}")
+        else:
+            data.append(item)
+    return data, [f"{tool}: {note[:300]}" for note in notes[:10]]
+
+
 class JadxAdapter(McpAdapter):
     async def prepare(self, provider, target) -> dict[str, Any]:
         if target.format != "apk":
@@ -603,55 +824,66 @@ class JadxAdapter(McpAdapter):
             return sessions[target.sha256]
         sessions.clear()  # the daemon keeps one APK warm by default (jadx.maxLoadedApks=1)
         staged = target.staged_path(provider.id)
-        payload, text, _raw = await self.call(
+        _payload, text, _raw = await self.call(
             provider,
             target,
             "load_apk",
             {"apkPath": str(staged)},
             timeout=float(provider.config.startup_timeout_seconds),
         )
-        sessions[target.sha256] = {"loaded": payload if payload is not None else text[:400]}
+        loaded, _w = _jadx_decode(provider, "load_apk", text, dict)
+        sessions[target.sha256] = {"loaded": loaded}
         return sessions[target.sha256]
 
     async def op_apk_manifest(self, provider, target, session, params):
-        _payload, text, raw = await self.call(provider, target, "get_android_manifest", {})
-        main_payload, main_text, _r = await self.call(provider, target, "get_main_activity_class", {})
+        _p, text, raw = await self.call(provider, target, "get_android_manifest", {})
+        manifest, warnings = _jadx_decode(provider, "get_android_manifest", text, str)
+        _p2, main_text, _r = await self.call(provider, target, "get_main_activity_class", {})
+        main_activity, main_warnings = _jadx_decode(provider, "get_main_activity_class", main_text, str)
         return self.result(
             provider,
             "apk.manifest",
             "get_android_manifest",
-            {"manifest_xml": text, "main_activity": main_text.strip() or main_payload},
+            {"manifest_xml": manifest, "main_activity": main_activity.strip() or None},
             raw,
+            warnings=warnings + main_warnings,
             claim="decoded AndroidManifest.xml (JADX)",
         )
 
     async def op_apk_components(self, provider, target, session, params):
-        payload, text, raw = await self.call(provider, target, "get_exported_components", {})
-        deep_payload, deep_text, _r = await self.call(provider, target, "get_deeplink_components", {})
+        _p, text, raw = await self.call(provider, target, "get_exported_components", {})
+        exported, warnings = _jadx_decode(provider, "get_exported_components", text, list)
+        exported, notes = _jadx_split("get_exported_components", exported)
+        _p2, deep_text, _r = await self.call(provider, target, "get_deeplink_components", {})
+        deeplinks, deep_warnings = _jadx_decode(provider, "get_deeplink_components", deep_text, list)
+        deeplinks, deep_notes = _jadx_split("get_deeplink_components", deeplinks)
         return self.result(
             provider,
             "apk.components",
             "get_exported_components",
-            {
-                "exported_components": payload if payload is not None else text,
-                "deeplink_components": deep_payload if deep_payload is not None else deep_text,
-            },
+            {"exported_components": exported, "deeplink_components": deeplinks},
             raw,
-            claim="exported components (JADX)",
+            warnings=warnings + notes + deep_warnings + deep_notes,
+            claim=f"{len(exported)} exported components (JADX)",
         )
 
     async def op_apk_classes(self, provider, target, session, params):
         args: dict[str, Any] = {"limit": int(params.get("limit", 1000))}
         if params.get("query"):
             args["packagePrefix"] = str(params["query"])
-        payload, text, raw = await self.call(provider, target, "get_all_classes", args)
-        classes = _items(payload, "classes") or [line.strip() for line in text.splitlines() if line.strip()]
+        _p, text, raw = await self.call(provider, target, "get_all_classes", args)
+        names, warnings = _jadx_decode(provider, "get_all_classes", text, list)
+        names, notes = _jadx_split("get_all_classes", names)
+        classes = [n for n in names if isinstance(n, str)]
+        if len(classes) < len(names):
+            notes.append(f"get_all_classes: {len(names) - len(classes)} non-string entr(y/ies) ignored")
         return self.result(
             provider,
             "apk.classes",
             "get_all_classes",
             {"classes": classes, "returned": len(classes)},
             raw,
+            warnings=warnings + notes,
             claim=f"{len(classes)} classes",
         )
 
@@ -662,35 +894,52 @@ class JadxAdapter(McpAdapter):
         args: dict[str, Any] = {"className": str(class_name)}
         if params.get("max_bytes") is not None:
             args["maxBytes"] = int(params["max_bytes"])
-        _payload, text, raw = await self.call(provider, target, "get_class_source", args)
+        _p, text, raw = await self.call(provider, target, "get_class_source", args)
+        source, warnings = _jadx_decode(provider, "get_class_source", text, str)
+        # Upstream leads a cut or outlined answer with "@outline: " / "@oversized: " /
+        # "@truncated: " lines. The text is kept exactly; it is flagged as partial.
+        markers = [line for line in source.splitlines()[:3] if _JADX_PARTIAL.match(line)]
+        warnings += [f"get_class_source: partial answer ({m[:200]})" for m in markers]
         return self.result(
             provider,
             "apk.class_source",
             "get_class_source",
-            {"class_name": class_name, "source": text, "language": "java (JADX decompilation)"},
+            {
+                "class_name": class_name,
+                "source": source,
+                "language": "java (JADX decompilation)",
+                "partial": bool(markers),
+            },
             raw,
+            warnings=warnings,
             subject_type="class",
             subject_name=str(class_name),
-            claim=f"JADX source of {class_name}",
+            claim=f"JADX source of {class_name}" + (" (partial)" if markers else ""),
         )
 
     async def op_apk_search(self, provider, target, session, params):
         query = str(params.get("query") or "")
         if not query:
             raise CapabilityUnavailable("query is required")
-        tool, args = (
-            ("search_method_by_name", {"methodName": query})
-            if params.get("kind") == "method"
-            else ("search_classes_by_keyword", {"keyword": query})
-        )
-        args["limit"] = int(params.get("limit", 100))
-        payload, text, raw = await self.call(provider, target, tool, args)
+        limit = int(params.get("limit", 100))
+        if params.get("kind") == "method":
+            tool = "search_method_by_name"
+            _p, text, raw = await self.call(provider, target, tool, {"methodName": query, "limit": limit})
+            found, warnings = _jadx_decode(provider, tool, text, dict)  # {class name: [methods]}
+            notes = [f"{tool}: {k}: {str(v)[:300]}" for k, v in found.items() if str(k).startswith("@")]
+            results: Any = {k: v for k, v in found.items() if not str(k).startswith("@")}
+        else:
+            tool = "search_classes_by_keyword"
+            _p, text, raw = await self.call(provider, target, tool, {"keyword": query, "limit": limit})
+            found, warnings = _jadx_decode(provider, tool, text, list)
+            results, notes = _jadx_split(tool, found)
         return self.result(
             provider,
             "apk.search",
             tool,
-            {"query": query, "results": payload if payload is not None else text.splitlines()},
+            {"query": query, "results": results},
             raw,
+            warnings=warnings + notes,
             claim=f"search {query!r}",
         )
 
