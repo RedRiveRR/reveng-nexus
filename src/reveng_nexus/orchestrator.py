@@ -224,6 +224,16 @@ class Orchestrator:
                 steps.append({"step": "ai reconstruction", "ok": False, **exc.to_dict()})
 
         missing = []
+        if engine is not None and selected and not decompiled:
+            failures = [s for s in steps if s["step"].startswith("decompile ") and not s["ok"]]
+            missing.append(
+                {
+                    "capability": "binary.decompile",
+                    "detail": f"{engine.id} was selected but all {len(selected)} decompile attempts failed; "
+                    "no pseudocode was produced (built-in metadata/strings remain valid)",
+                    "last_error": failures[-1].get("message") if failures else None,
+                }
+            )
         if engine is None:
             missing.append(
                 {

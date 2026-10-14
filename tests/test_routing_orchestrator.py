@@ -218,3 +218,16 @@ async def test_target_must_belong_to_requested_case(make_manager, elf_sample):
     intake = await mgr.intake(str(elf_sample), case_title="Case A")
     with pytest.raises(ArgumentError, match="not part of case"):
         mgr.target_context(intake["target"]["sha256"], "default")
+
+
+async def test_all_failed_decompiles_are_reported_as_missing(make_manager, elf_sample):
+    mgr = await make_manager([mock_engine("flaky", env={"MOCK_ERROR_TOOL": "decompile_function"})])
+    target = await target_of(mgr, elf_sample)
+    out = await Orchestrator(mgr).analyze_binary(target, max_functions=2)
+    assert out["primary_engine"] == "flaky" and out["decompiled"] == []
+    missing = out["missing_capabilities"]
+    assert (
+        missing
+        and missing[0]["capability"] == "binary.decompile"
+        and "all 2 decompile attempts failed" in missing[0]["detail"]
+    )
