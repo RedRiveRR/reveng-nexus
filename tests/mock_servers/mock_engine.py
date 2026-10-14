@@ -313,6 +313,8 @@ async def on_call_tool(ctx, params) -> CallToolResult:
 
 
 async def main() -> None:
+    # MOCK_STARTUP_DELAY simulates a slow engine start (uvx install + JVM) before the MCP handshake.
+    await anyio.sleep(float(os.environ.get("MOCK_STARTUP_DELAY", "0")))
     server = Server("mock-engine", version=f"mock-{FLAVOR}", on_list_tools=on_list_tools, on_call_tool=on_call_tool)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())

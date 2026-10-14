@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -312,15 +313,27 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
         return 2
 
-    async def run(manager):
+    async def run() -> None:
+        from .registry import ProviderManager
         from .server import serve_http, serve_stdio
 
-        if transport == "http":
-            await serve_http(manager, args.host, args.port)
-        else:
-            await serve_stdio(manager)
+        manager = ProviderManager(config)
+        # Answer the MCP handshake immediately; providers (JVMs, uvx installs) start in the
+        # background and tool calls wait for startup to finish.
+        startup = asyncio.create_task(manager.start())
+        try:
+            if transport == "http":
+                await serve_http(manager, args.host, args.port, background_start=True)
+            else:
+                await serve_stdio(manager, background_start=True)
+        finally:
+            if not startup.done():
+                startup.cancel()
+            with contextlib.suppress(BaseException):
+                await startup
+            await manager.close()
 
-    asyncio.run(_with_manager(config, run))
+    asyncio.run(run())
     return 0
 
 

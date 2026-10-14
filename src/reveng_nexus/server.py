@@ -467,7 +467,7 @@ def _dump(value: Any) -> str:
 
 
 class NexusServer:
-    def __init__(self, manager: ProviderManager):
+    def __init__(self, manager: ProviderManager, *, background_start: bool = False):
         try:
             from mcp.server import Server
             from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool, ToolAnnotations
@@ -481,6 +481,7 @@ class NexusServer:
             ToolAnnotations,
         )
         self.manager = manager
+        self._background_start = background_start
         self.orchestrator = Orchestrator(manager)
         self._validators = {name: jsonschema.Draft202012Validator(spec["schema"]) for name, spec in TOOL_SPECS.items()}
         self._handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
@@ -516,6 +517,8 @@ class NexusServer:
     async def list_tools(self, ctx: Any = None, params: Any = None) -> Any:
         tools = self.builtin_tools()
         if self.manager.config.tool_mode == "namespaced":
+            if self._background_start:
+                await self.manager.wait_until_started()
             for provider in self.manager.providers.values():
                 if not provider.config.expose_tools:
                     continue
@@ -544,6 +547,8 @@ class NexusServer:
     async def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
         if not isinstance(arguments, dict):
             raise ArgumentError("arguments must be an object")
+        if self._background_start:
+            await self.manager.wait_until_started()
         handler = self._handlers.get(name)
         if handler is not None:
             errors = sorted(self._validators[name].iter_errors(arguments), key=lambda e: list(e.path))
@@ -977,15 +982,15 @@ class NexusServer:
         )
 
 
-async def serve_stdio(manager: ProviderManager) -> None:
+async def serve_stdio(manager: ProviderManager, *, background_start: bool = False) -> None:
     from mcp.server.stdio import stdio_server
 
-    app = NexusServer(manager)
+    app = NexusServer(manager, background_start=background_start)
     async with stdio_server() as (read_stream, write_stream):
         await app.server.run(read_stream, write_stream, app.server.create_initialization_options())
 
 
-def build_http_server(manager: ProviderManager, host: str, port: int) -> Any:
+def build_http_server(manager: ProviderManager, host: str, port: int, *, background_start: bool = False) -> Any:
     """Streamable HTTP on loopback only (for MCP clients such as GhidrAssist's MCP client).
 
     There is no authentication layer, so non-loopback binds are refused. The SDK enables
@@ -995,11 +1000,11 @@ def build_http_server(manager: ProviderManager, host: str, port: int) -> Any:
 
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise CapabilityUnavailable("RevEng Nexus only serves HTTP on loopback; it has no authentication layer")
-    app = NexusServer(manager)
+    app = NexusServer(manager, background_start=background_start)
     asgi = app.server.streamable_http_app(host=host)
     config = uvicorn.Config(asgi, host=host, port=port, log_level="warning", lifespan="on")
     return uvicorn.Server(config)
 
 
-async def serve_http(manager: ProviderManager, host: str, port: int) -> None:
-    await build_http_server(manager, host, port).serve()
+async def serve_http(manager: ProviderManager, host: str, port: int, *, background_start: bool = False) -> None:
+    await build_http_server(manager, host, port, background_start=background_start).serve()

@@ -317,3 +317,37 @@ async def test_http_rejects_foreign_host_header(config_factory, workspace):
             server.should_exit = True
     finally:
         await mgr.close()
+
+
+def test_gateway_answers_handshake_while_slow_providers_start(tmp_path, workspace):
+    """Regression: Claude Code saw the server as 'pending' because providers started before initialize."""
+    import time
+
+    import anyio
+
+    config = tmp_path / "config" / "providers.yaml"
+    config.parent.mkdir()
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "workspace": {"allowed_roots": [str(workspace)], "data_dir": str(tmp_path / "data")},
+                "providers": [mock_engine("slow_engine", env={"MOCK_STARTUP_DELAY": "8"})],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def run():
+        params = StdioServerParameters(
+            command=sys.executable, args=["-m", "reveng_nexus", "--config", str(config), "serve"]
+        )
+        t0 = time.monotonic()
+        async with Client(params, read_timeout_seconds=60) as client:
+            names = {t.name for t in (await client.list_tools()).tools}
+            handshake = time.monotonic() - t0
+            assert REQUIRED <= names
+            assert handshake < 6, f"handshake took {handshake:.1f}s; providers must start in the background"
+            status = payload(await client.call_tool("nexus_status", {}))
+            assert status["providers"]["slow_engine"]["status"] == "ready", "tool calls wait for startup"
+
+    anyio.run(run)

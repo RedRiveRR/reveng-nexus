@@ -84,6 +84,9 @@ class ProviderManager:
         self._global_sem = asyncio.Semaphore(config.analysis.max_concurrent_provider_calls)
         self._started = False
         self._start_lock = asyncio.Lock()
+        # Set once start() has finished (successfully or not) so the MCP server can answer
+        # initialize/tools/list immediately while slow engines (JVMs, uvx installs) come up.
+        self._startup_done = asyncio.Event()
 
     # -- compatibility helpers for the 0.1 API ---------------------------------
     @property
@@ -162,8 +165,19 @@ class ProviderManager:
                     except Exception:  # noqa: BLE001
                         pass
 
-            await asyncio.gather(*(init(p) for p in pending))
-            self._started = True
+            try:
+                await asyncio.gather(*(init(p) for p in pending))
+            finally:
+                self._started = True
+                self._startup_done.set()
+
+    @property
+    def startup_complete(self) -> bool:
+        return self._startup_done.is_set()
+
+    async def wait_until_started(self) -> None:
+        """Wait for provider startup when it runs in the background (see ``cli serve``)."""
+        await self._startup_done.wait()
 
     async def close(self) -> None:
         for provider in list(self.providers.values()):
