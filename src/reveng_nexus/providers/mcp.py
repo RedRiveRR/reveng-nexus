@@ -553,7 +553,8 @@ class McpProvider(AnalysisProvider):
     async def health_check(self) -> ProviderHealth:
         version = self.server_info.get("version")
         name = self.server_info.get("name")
-        label = f"{name} {version}".strip() if name or version else None
+        # serverInfo names the MCP server, not the engine (re-mcp says "Ghidra 3.4.8": FastMCP's version).
+        label = f"MCP server {name or '?'} {version or '?'} (server-reported)" if name or version else None
         if self.per_target:
             live = [sha[:12] for sha, o in self._target_owners.items() if o.alive]
             return ProviderHealth(

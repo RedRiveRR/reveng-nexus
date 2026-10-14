@@ -40,7 +40,7 @@ async def test_stdio_lifecycle_discovery_and_health(config_factory, workspace):
         assert tools["call"].classification.tool_class == "blocked"
         health = await mgr.health()
         assert health["eng"]["status"] == "ready"
-        assert health["eng"]["version"] == "mock-engine mock-a"
+        assert health["eng"]["version"] == "MCP server mock-engine mock-a (server-reported)"
     finally:
         await mgr.close()
     assert not mgr.providers["eng"].started
