@@ -293,6 +293,16 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             ["target", "class_name"],
         ),
     },
+    "nexus_analyze_javascript_app": {
+        "read": False,
+        "description": "Static analysis of a JavaScript/Electron application packed as an ASAR archive (modules, Electron IPC/preload surface, coverage, unknowns). The code is parsed as inert text and never run. Records evidence.",
+        "schema": _obj({"target": _SHA, "case_id": _CASE, "provider_id": _PROVIDER}, ["target"]),
+    },
+    "nexus_get_electron_fuses": {
+        "read": True,
+        "description": "Electron fuse states (RunAsNode, inspector arguments, ASAR integrity, ...) read from an executable's bytes, with their runtime implications. Never runs the executable.",
+        "schema": _obj({"target": _SHA, "case_id": _CASE, "provider_id": _PROVIDER}, ["target"]),
+    },
     "nexus_dynamic_analysis_status": {
         "read": True,
         "description": "Whether an authorised dynamic-analysis environment is configured and reachable. Does not instrument anything.",
@@ -819,6 +829,12 @@ class NexusServer:
         if args.get("max_bytes") is not None:
             params["max_bytes"] = args["max_bytes"]
         return await self._operation("apk.class_source", args, params)
+
+    async def _t_analyze_javascript_app(self, args: dict[str, Any]) -> Any:
+        return await self._operation("js.application", args)
+
+    async def _t_get_electron_fuses(self, args: dict[str, Any]) -> Any:
+        return await self._operation("electron.fuses", args)
 
     async def _t_dynamic_analysis_status(self, args: dict[str, Any]) -> Any:
         cfg = self.manager.config

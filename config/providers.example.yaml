@@ -8,7 +8,8 @@
 # to its URL) when the gateway starts. ${VAR} / ${VAR:-default} are expanded from your
 # environment in command, args, env and cwd. Never put API keys or tokens in this file.
 # Launch commands were verified against the upstream revisions listed in
-# docs/PROVIDER_MATRIX.md on 2026-10-13; "runtime" rows were actually executed.
+# docs/PROVIDER_MATRIX.md on 2026-10-13 (REA on 2026-10-15); "runtime" rows were actually
+# executed, and only for the operations PROVIDER_MATRIX.md lists as live_analysis_verified.
 
 workspace:
   # Nexus only reads files under these folders. Empty = target intake disabled.
@@ -204,6 +205,33 @@ providers:
     protocol_mode: legacy
     priority: 50
     timeout_seconds: 120
+
+  # morluto/rea (npm rea-agents 6.5.0) — static JavaScript/Electron analysis only. Runs on a
+  # dedicated Node 22.19+/24.11+ (the system Node may be outside REA's engine range) from a pinned
+  # local install, never via npx. Nexus allows exactly two tools (analyze_javascript_application,
+  # inspect_electron_fuses); REA's other 205 tools are blocked and raw passthrough is refused.
+  # HOME/TEMP point into a Nexus-owned directory so REA never reads or writes the user profile.
+  # Remove the provider by deleting this block; Claude Code settings are never involved.
+  - id: rea
+    name: REA (static JavaScript/Electron)
+    enabled: false
+    type: mcp_stdio
+    adapter: rea
+    command: '${LOCALAPPDATA}\Programs\RevEngNexus\node-v24.21.0-win-x64\node.exe'
+    args:
+      - '${LOCALAPPDATA}\Programs\RevEngNexus\rea-agents-6.5.0\node_modules\rea-agents\scripts\rea.mjs'
+      - "mcp"                     # exactly this; any other argument reaches REA's CLI (setup edits agent configs)
+    env:
+      PATH: '${LOCALAPPDATA}\Programs\RevEngNexus\node-v24.21.0-win-x64;${SystemRoot}\System32'
+      USERPROFILE: '${LOCALAPPDATA}\RevEngNexus\data\rea-home'
+      HOME: '${LOCALAPPDATA}\RevEngNexus\data\rea-home'
+      TEMP: '${LOCALAPPDATA}\RevEngNexus\data\rea-tmp'
+      TMP: '${LOCALAPPDATA}\RevEngNexus\data\rea-tmp'
+      REA_LOG_LEVEL: warn
+    capabilities: [js.application, electron.fuses]
+    priority: 50
+    timeout_seconds: 300
+    startup_timeout_seconds: 120
 
   # --- AI-assisted decompilation (optional) -----------------------------------------
   # LLM4Decompile served by YOU behind an OpenAI-compatible /v1/completions endpoint, e.g.

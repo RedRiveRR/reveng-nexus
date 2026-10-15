@@ -35,6 +35,8 @@ OPERATIONS: dict[str, str] = {
     "apk.class_source": "decompiled Java source of one class",
     "apk.search": "class/method search",
     "dynamic.status": "dynamic-analysis environment status (read-only)",
+    "js.application": "static JavaScript/Electron application analysis of an ASAR archive (parsed as inert text)",
+    "electron.fuses": "Electron fuse configuration read from an executable's bytes",
     "ai.decompile": "model-generated source reconstruction (always unverified)",
 }
 

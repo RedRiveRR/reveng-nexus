@@ -6,9 +6,10 @@ from .base import McpAdapter, UpstreamPin, parse_address
 from .mcpyghidra import MCPYGHIDRA
 from .others import BINJA, FRIDA, IDA_OFFICIAL, IDA_RS, JADX
 from .re_mcp import RE_MCP
+from .rea import REA
 
 ADAPTERS: dict[str, McpAdapter] = {
-    adapter.name: adapter for adapter in (RE_MCP, MCPYGHIDRA, IDA_OFFICIAL, IDA_RS, BINJA, JADX, FRIDA)
+    adapter.name: adapter for adapter in (RE_MCP, MCPYGHIDRA, IDA_OFFICIAL, IDA_RS, BINJA, JADX, FRIDA, REA)
 }
 
 
