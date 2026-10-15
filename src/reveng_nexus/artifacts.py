@@ -66,6 +66,12 @@ class WorkspaceGuard:
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             raise ArgumentError("path must be absolute (relative paths depend on the server's cwd)")
+        if os.name == "nt" and candidate.drive.startswith("\\\\"):
+            # UNC (\\server\share) and device (\\?\UNC\..., \\.\...) paths: resolve() below would
+            # contact the named server over SMB (and offer the user's NTLM credentials) before the
+            # allowed_roots check runs. Accept them only on a share that is itself an allowed root.
+            if not any(os.path.normcase(r.drive) == os.path.normcase(candidate.drive) for r in self.roots):
+                raise WorkspaceViolation("UNC and device paths are accepted only below a UNC allowed root")
         # Reject NTFS alternate data streams such as C:\x\file.exe:payload
         if os.name == "nt" and ":" in candidate.as_posix()[2:]:
             raise WorkspaceViolation("alternate data stream paths are not accepted")

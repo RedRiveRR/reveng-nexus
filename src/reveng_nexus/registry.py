@@ -564,12 +564,16 @@ class ProviderManager:
         if provider is None or not provider.started:
             reason = self.skipped.get(provider_id) or self.provider_errors.get(provider_id, "not configured")
             raise ProviderUnavailable(f"Provider {provider_id!r} is unavailable: {reason}")
+        target = None
         if getattr(provider, "per_target", False):
             if not target_sha256:
                 raise ArgumentError(f"{provider_id} runs one server per target; pass target (sha256)")
             target = self.target_context(target_sha256)
-            await provider._client_for(target)  # type: ignore[attr-defined]
         async with self._provider_sems.setdefault(provider_id, asyncio.Semaphore(1)):
+            # Open the per-target server under the provider semaphore: opening it outside let a
+            # concurrent operation switch (or, with max_sessions=1, close) the session in between.
+            if target is not None:
+                await provider._client_for(target)  # type: ignore[attr-defined]
             return await provider.call_tool(tool_name, arguments, internal=False, target_sha256=target_sha256)
 
     # 0.1 compatibility: ``manager.call(provider, tool, args)``

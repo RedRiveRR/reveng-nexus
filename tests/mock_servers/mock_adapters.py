@@ -25,6 +25,7 @@ MOCK_PROFILE=ida_rs|binja|jadx. Switches (environment):
   MOCK_BINJA_PREAMBLE_VIEW             path reported in the "File:" preamble instead
   MOCK_BINJA_OVERLAP                   function_at reports two functions at an address
   MOCK_JADX_PARTIAL                    get_class_source / get_all_classes answer a capped result
+  MOCK_JADX_LOADED_PATH                apkPath load_apk reports (another client switched the daemon)
   MOCK_CALL_LOG                        append one JSON line per call: tool name + argument keys
                                        (+ the path handed to open_idb/load_apk)
 The file handed to open_idb/load_apk is only checked to exist, never read or run.
@@ -211,8 +212,27 @@ def _ida(name: str, args: dict[str, Any]) -> CallToolResult:
         if not Path(args.get("path", "")).is_file():
             return _error(f"Failed to open database: {Path(args.get('path', '')).name}")
         STATE["open"] = Path(args["path"]).name
-        # The success body is not modelled field by field (unresolved; the adapter ignores it).
-        return _rust_pretty({"path": args["path"], "idb_out": args.get("idb_out")})
+        # DbInfo (src/ida/types.rs:87-97, built in handlers/database.rs:76-90) as pretty JSON text;
+        # without auto_analyse (requests.rs:55-60, default false) analysis is left incomplete.
+        auto = bool(args.get("auto_analyse"))
+        return _rust_pretty(
+            {
+                "path": args.get("idb_out") or args["path"],
+                "file_type": "ELF",
+                "loader": "ELF64 for x86-64 (Executable)",
+                "processor": "metapc",
+                "bits": 64,
+                "function_count": len(FUNCS),
+                "debug_info": None,
+                "analysis_status": {
+                    "auto_enabled": True,
+                    "auto_is_ok": auto,
+                    "auto_state": "AU_NONE" if auto else "AU_USED",
+                    "auto_state_id": 0 if auto else 1,
+                    "analysis_running": False,
+                },
+            }
+        )
     if name == "close_idb":
         STATE["open"] = None
         return _rust_pretty({"closed": True})
@@ -419,7 +439,16 @@ def _jadx_tool(name: str, args: dict[str, Any]) -> CallToolResult:
         if path.suffix.lower() != ".apk" or not path.is_file():
             return _error(f"Error executing tool load_apk: not an APK: {path.name}")
         STATE["open"] = path.name
-        return _jadx({"status": "loaded", "apk": path.name, "classes": len(JADX_CLASSES)})
+        # JadxAnalyzerCore.getApkInfo (core/JadxAnalyzerCore.java:509-519): apkPath is echoed verbatim.
+        return _jadx(
+            {
+                "apkPath": os.environ.get("MOCK_JADX_LOADED_PATH") or args.get("apkPath"),
+                "packageName": "com.example.nexus",
+                "totalClasses": len(JADX_CLASSES),
+                "exportedComponents": 1,
+                "mainActivity": "com.example.nexus.MainActivity",
+            }
+        )
     if name in {"rename_class", "frobnicate_apk"}:
         return _jadx(f"{name}: side effect performed")
     if STATE["open"] is None:

@@ -212,7 +212,9 @@ class AnalysisProvider(ABC):
     async def perform(self, operation: str, target: TargetContext, params: dict[str, Any]) -> OperationResult: ...
 
     # -- raw tool calls (policy + timeout + audit) --------------------------
-    async def _raw_call(self, name: str, arguments: dict[str, Any], timeout: float) -> Any:
+    async def _raw_call(
+        self, name: str, arguments: dict[str, Any], timeout: float, *, target_sha256: str | None = None
+    ) -> Any:
         raise ProviderCallError(f"provider {self.id!r} has no raw tool interface")
 
     def tool_info(self, name: str) -> ToolInfo | None:
@@ -273,7 +275,7 @@ class AnalysisProvider(ABC):
         outcome, error_code, error = "ok", None, None
         try:
             with anyio.fail_after(budget):
-                result = await self._raw_call(name, arguments, budget)
+                result = await self._raw_call(name, arguments, budget, target_sha256=target_sha256)
             if getattr(result, "is_error", False):
                 outcome = "provider_error"
             return result

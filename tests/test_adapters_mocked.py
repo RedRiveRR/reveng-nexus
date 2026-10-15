@@ -26,10 +26,26 @@ MOCK_ADAPTERS = str(TESTS / "mock_servers" / "mock_adapters.py")
 PROFILE = {"ida_rs": "ida_rs", "binary_ninja": "binja", "jadx": "jadx"}
 
 
+BINJA_VIEW: dict[str, str] = {}
+
+
+@pytest.fixture(autouse=True)
+def _binja_staged_view(tmp_path, elf_sample):
+    """Binary Ninja must show the target's staged copy: <data>/work/<sha16>/<provider>/<name>."""
+    import hashlib
+
+    sha = hashlib.sha256(elf_sample.read_bytes()).hexdigest()
+    BINJA_VIEW["bn"] = str((tmp_path / "data").resolve() / "work" / sha[:16] / "bn" / elf_sample.name)
+    yield
+    BINJA_VIEW.clear()
+
+
 def adapter_mock(
     provider_id: str, adapter: str, *, call_log: Path | None = None, env: dict[str, str] | None = None, **extra: Any
 ) -> dict[str, Any]:
     child_env = {"MOCK_PROFILE": PROFILE[adapter], **(env or {})}
+    if adapter == "binary_ninja" and "MOCK_BINJA_VIEW" not in child_env and provider_id in BINJA_VIEW:
+        child_env["MOCK_BINJA_VIEW"] = BINJA_VIEW[provider_id]
     if call_log is not None:
         child_env["MOCK_CALL_LOG"] = str(call_log)
     return {
@@ -239,7 +255,7 @@ async def test_ida_rs_operations_normalise_and_keep_provenance(config_factory, w
 
         # one database per target: opened once on the staged copy, never on the original
         opens = [c for c in calls(log) if c["tool"] == "open_idb"]
-        assert len(opens) == 1 and opens[0]["arg_keys"] == ["idb_out", "path"]
+        assert len(opens) == 1 and opens[0]["arg_keys"] == ["auto_analyse", "idb_out", "path"]
         assert Path(opens[0]["path"]) == target.staged_path("ida") and Path(opens[0]["path"]) != elf_sample
         audit = mgr.audit.path.read_text(encoding="utf-8")
         assert "__fastcall check_key" not in audit and str(elf_sample) not in audit
@@ -282,7 +298,7 @@ async def test_binary_ninja_operations_normalise_and_keep_provenance(config_fact
         assert "int64_t check_key" in record["raw"]["content"]
         # the active view is checked before every operation
         tools = [c["tool"] for c in calls(log)]
-        assert tools.count("get_binary_status") == 8
+        assert tools.count("get_binary_status") == 16
     finally:
         await mgr.close()
 
@@ -386,7 +402,7 @@ async def test_binary_ninja_refuses_when_another_binary_is_open(config_factory, 
             with pytest.raises(CapabilityUnavailable) as info:
                 await mgr.perform(op, target, params, provider_id="bn")
             attempt = last_attempt(info)
-            assert "active view is 'someone_else.bin', not 'nexus_fixture.elf'" in attempt["message"]
+            assert "active view is 'someone_else.bin', which is not this target's staged copy" in attempt["message"]
             assert attempt["details"]["active_view"] == "someone_else.bin", "basename only, no full path"
         assert {c["tool"] for c in calls(log)} == {"get_binary_status"}, "no analysis of the wrong binary"
         assert mgr.evidence.query_evidence(target_id=target.sha256) == []
@@ -817,7 +833,10 @@ async def test_binary_ninja_textual_errors_are_errors(config_factory, workspace,
     ("env", "match"),
     [
         ({"MOCK_BINJA_VIEW": ""}, "Binary Ninja has no binary open"),
-        ({"MOCK_BINJA_PREAMBLE_VIEW": "/tmp/other.elf"}, "the answer is for 'other.elf', not 'nexus_fixture.elf'"),
+        (
+            {"MOCK_BINJA_PREAMBLE_VIEW": "/tmp/other.elf"},
+            "active view is 'other.elf', which is not this target's staged copy",
+        ),
     ],
 )
 async def test_binary_ninja_answers_for_another_view_are_refused(config_factory, workspace, elf_sample, env, match):
@@ -881,5 +900,53 @@ async def test_jadx_reconnect_inside_load_keeps_the_new_session(config_factory, 
             await mgr.perform("apk.classes", target, {}, provider_id="jadx")
         tools = [c["tool"] for c in calls(log)]
         assert tools.count("load_apk") == 2, tools
+    finally:
+        await mgr.close()
+
+
+@pytest.mark.parametrize(
+    "view",
+    [r"D:\unrelated\nexus_fixture.elf", "/home/someone/nexus_fixture.elf", "ORIGINAL"],
+)
+async def test_binary_ninja_same_basename_elsewhere_is_refused(config_factory, workspace, elf_sample, tmp_path, view):
+    """Regression (audit C, 2026-10-15): a different file with the target's basename was accepted and
+    its analysis stored under the target's SHA-256. Even the operator's original path is refused:
+    only the hash-verified, read-only staged copy is the target."""
+    log = tmp_path / "calls.jsonl"
+    view = str(elf_sample) if view == "ORIGINAL" else view
+    mgr = await started(
+        config_factory(workspace, [adapter_mock("bn", "binary_ninja", call_log=log, env={"MOCK_BINJA_VIEW": view})])
+    )
+    try:
+        target = await target_of(mgr, elf_sample)
+        with pytest.raises(CapabilityUnavailable) as info:
+            await mgr.perform("binary.functions", target, {}, provider_id="bn")
+        attempt = last_attempt(info)
+        assert "not this target's staged copy" in attempt["message"]
+        assert attempt["details"]["active_view"] == "nexus_fixture.elf"
+        assert {c["tool"] for c in calls(log)} == {"get_binary_status"}
+        assert mgr.evidence.query_evidence(target_id=target.sha256) == []
+    finally:
+        await mgr.close()
+
+
+@pytest.mark.parametrize(
+    ("adapter", "tool", "arguments"),
+    [
+        ("ida_rs", "open_idb", {"path": r"C:\Windows\win.ini", "idb_out": r"C:\Windows\Temp\x.i64"}),
+        ("jadx", "load_apk", {"apkPath": r"C:\Windows\win.ini"}),
+    ],
+)
+async def test_lifecycle_tools_never_reach_server_even_with_overrides(
+    config_factory, workspace, tmp_path, adapter, tool, arguments
+):
+    log = tmp_path / "calls.jsonl"
+    provider = adapter_mock("lc", adapter, call_log=log, tool_overrides={tool: "read"})
+    mgr = await started(config_factory(workspace, [provider], policy={"read_only": False}))
+    try:
+        assert mgr.providers["lc"].tool_info(tool).classification.tool_class == "lifecycle"
+        with pytest.raises(PolicyViolation, match="never forwarded"):
+            await mgr.call_provider_tool("lc", tool, arguments)
+        assert tool not in {c["tool"] for c in calls(log)}
     finally:
         await mgr.close()

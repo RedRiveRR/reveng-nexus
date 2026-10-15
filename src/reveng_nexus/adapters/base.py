@@ -8,6 +8,7 @@ explicit "tool missing" reason instead of a confusing call failure.
 
 from __future__ import annotations
 
+import contextvars
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -28,6 +29,20 @@ class UpstreamPin:
     verified: str  # "runtime" | "source" | "snapshot"
     verified_on: str
     notes: str = ""
+
+
+# Warnings raised *inside* one operation (a partial upstream answer, an unexpected page shape).
+# Task-local, so concurrent operations on one provider never see each other's notes.
+_PENDING_WARNINGS: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "nexus_adapter_pending_warnings", default=None
+)
+
+
+def note_warning(message: str) -> None:
+    """Attach ``message`` to the result of the operation running in this task."""
+    pending = _PENDING_WARNINGS.get()
+    if pending is not None:
+        pending.append(message)
 
 
 _HEX = re.compile(r"^(?:0x)?([0-9a-fA-F]+)h?$")
@@ -136,8 +151,15 @@ class McpAdapter:
         handler = getattr(self, "op_" + operation.replace(".", "_"), None)
         if handler is None:
             raise CapabilityUnavailable(f"{self.name} adapter has no handler for {operation}")
-        session = await self.prepare(provider, target)
-        return await handler(provider, target, session, params)
+        token = _PENDING_WARNINGS.set([])
+        try:
+            session = await self.prepare(provider, target)
+            result = await handler(provider, target, session, params)
+            pending = _PENDING_WARNINGS.get() or []
+            result.warnings.extend(w for w in pending if w not in result.warnings)
+            return result
+        finally:
+            _PENDING_WARNINGS.reset(token)
 
     # -- helpers -----------------------------------------------------------------
     async def call(
@@ -154,8 +176,11 @@ class McpAdapter:
                 f"{provider.id}/{tool} reported an error: {message[:600]}",
                 details={"tool": tool, "provider_error": (payload if isinstance(payload, dict) else None)},
             )
-        if isinstance(payload, dict) and payload.get("error") and not payload.get("items"):
-            raise ProviderCallError(f"{provider.id}/{tool} reported an error: {str(payload['error'])[:600]}")
+        if isinstance(payload, dict) and payload.get("error"):
+            if not payload.get("items"):
+                raise ProviderCallError(f"{provider.id}/{tool} reported an error: {str(payload['error'])[:600]}")
+            # Error *and* items: a partial answer. Keep the items, never as a clean success.
+            note_warning(f"{tool}: partial result; upstream also reported an error: {str(payload['error'])[:300]}")
         return payload, text, result_to_jsonable(result)
 
     def result(

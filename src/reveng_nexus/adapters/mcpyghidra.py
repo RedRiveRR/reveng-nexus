@@ -42,9 +42,10 @@ class McPyGhidraAdapter(McpAdapter):
     async def op_binary_metadata(self, provider, target, session, params):
         payload, _t, raw = await self.call(provider, target, "context", {})
         ctx = payload if isinstance(payload, dict) else {}
-        arch = ctx.get("architecture", {})
-        memory = ctx.get("memory", {})
-        app = ctx.get("application", {})
+        # A section the server reports as null (or not a mapping) is unknown, never a crash.
+        arch, memory, app = (
+            ctx.get(k) if isinstance(ctx.get(k), dict) else {} for k in ("architecture", "memory", "application")
+        )
         normalized = {
             "processor": arch.get("processor"),
             "bits": arch.get("bitness"),
@@ -127,25 +128,34 @@ class McPyGhidraAdapter(McpAdapter):
             provider, target, "xrefs", {"target": ref, "direction": direction, "limit": int(params.get("limit", 200))}
         )
         refs = []
+        warnings: list[str] = []
+        resolved = parse_address((payload or {}).get("addr")) if isinstance(payload, dict) else None
+        subject = resolved if resolved is not None else address
         for item in (payload or {}).get("items", []) if isinstance(payload, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            # Pinned analysis.py: "to" rows carry only "from", "from" rows only "to"; the other end
+            # is the queried address (the flat answer's "addr").
             src = item.get("from", {}) if isinstance(item.get("from"), dict) else {}
             dst = item.get("to", {}) if isinstance(item.get("to"), dict) else {}
             refs.append(
                 {
-                    "from": parse_address(src.get("addr")),
-                    "to": parse_address(dst.get("addr")) if dst else address,
+                    "from": parse_address(src.get("addr")) if src else subject,
+                    "to": parse_address(dst.get("addr")) if dst else subject,
                     "from_function": src.get("function"),
                     "type": item.get("xref-type"),
                     "is_call": "CALL" in str(item.get("xref-type", "")).upper(),
                 }
             )
-        resolved = parse_address((payload or {}).get("addr")) if isinstance(payload, dict) else None
+        if isinstance(payload, dict) and (payload.get("page_info") or {}).get("has_more"):
+            warnings.append(f"xrefs: more than {len(refs)} references exist; the result is truncated")
         return self.result(
             provider,
             "binary.xrefs",
             "xrefs",
             {"subject": {"address": resolved or address, "name": name}, "direction": direction, "refs": refs},
             raw,
+            warnings=warnings,
             subject_type="address" if (resolved or address) is not None else "function",
             subject_address=resolved or address,
             subject_name=name,
@@ -156,9 +166,23 @@ class McPyGhidraAdapter(McpAdapter):
         address, name, ref = function_ref(params)
         payload, _t, raw = await self.call(provider, target, "cfg", {"address": ref})
         blocks = []
-        raw_blocks = (payload or {}).get("blocks", {}) if isinstance(payload, dict) else {}
-        for key, block in raw_blocks.items() if isinstance(raw_blocks, dict) else enumerate(raw_blocks):
+        warnings: list[str] = []
+        raw_blocks = (payload or {}).get("blocks") if isinstance(payload, dict) else None
+        if not isinstance(raw_blocks, dict):
+            # Pinned 0.8.0 (tools/cfg.py, models.CFGResult) returns {hex address: BasicBlock}. Anything
+            # else is not that contract; a list index must never become a block address.
+            warnings.append(
+                f"cfg: blocks is {type(raw_blocks).__name__}, not the pinned {{address: block}} map; see the raw output"
+            )
+            raw_blocks = {}
+        for key, block in raw_blocks.items():
+            if not isinstance(block, dict):
+                warnings.append(f"cfg: block {str(key)[:40]!r} is not an object and was ignored")
+                continue
             start = parse_address(block.get("address", key))
+            if start is None:
+                warnings.append(f"cfg: block {str(key)[:40]!r} has no parseable address and was ignored")
+                continue
             size = block.get("size")
             blocks.append(
                 {
@@ -175,6 +199,7 @@ class McPyGhidraAdapter(McpAdapter):
             "cfg",
             {"function": {"address": entry or address, "name": name}, "blocks": blocks},
             raw,
+            warnings=warnings,
             subject_type="function",
             subject_address=entry or address,
             subject_name=name,

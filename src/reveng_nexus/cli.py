@@ -236,7 +236,10 @@ def cmd_providers_check(args: argparse.Namespace) -> int:
         report[pid] = result
         status = (result.get("health") or {}).get("status")
         caps = result.get("capabilities") or {}
-        no_usable_ops = bool(caps) and not any(c.get("available") for c in caps.values())
+        health = result.get("health") or {}
+        no_usable_ops = (bool(caps) and not any(c.get("available") for c in caps.values())) or (
+            "usable_operations" in health and not health["usable_operations"]
+        )
         if pid != "builtin" and not result.get("skipped") and (status not in {"ready", "degraded"} or no_usable_ops):
             # A provider that answers but can perform none of its operations is a failed check.
             failed = True

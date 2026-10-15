@@ -17,7 +17,15 @@ from __future__ import annotations
 from typing import Any
 
 from ..errors import ProviderCallError
-from .base import McpAdapter, UpstreamPin, fmt_address, function_ref, parse_address, parse_listing_lines
+from .base import (
+    McpAdapter,
+    UpstreamPin,
+    fmt_address,
+    function_ref,
+    note_warning,
+    parse_address,
+    parse_listing_lines,
+)
 
 _LIFECYCLE = {"open_database": "lifecycle", "close_database": "lifecycle", "wait_for_analysis": "lifecycle"}
 # Meta-tools proxy to *any* tool (including hidden mutating ones) by name, bypassing
@@ -96,7 +104,11 @@ class ReMcpAdapter(McpAdapter):
         except Exception:  # noqa: BLE001 - best effort; the worker dies with the provider anyway
             pass
 
-    async def _paged(self, provider, target, tool: str, args: dict[str, Any], limit: int) -> tuple[list[dict], list]:
+    async def _paged(
+        self, provider, target, tool: str, args: dict[str, Any], limit: int, meta: dict[str, Any] | None = None
+    ) -> tuple[list[dict], list]:
+        """Page through a PaginatedResult (re-mcp-core models.py:12-21). ``meta`` receives the
+        first page's non-item keys (re-mcp-ida echoes the resolved ``address``)."""
         items: list[dict[str, Any]] = []
         raws = []
         offset = 0
@@ -104,11 +116,19 @@ class ReMcpAdapter(McpAdapter):
             page_args = {**args, "offset": offset, "limit": min(500, limit - len(items))}
             payload, _text, raw = await self.call(provider, target, tool, page_args)
             raws.append(raw)
-            page = (payload or {}).get("items", []) if isinstance(payload, dict) else []
-            items.extend(page)
+            page = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(page, list):
+                shape = f"keys {sorted(payload)[:8]}" if isinstance(payload, dict) else type(payload).__name__
+                note_warning(f"{tool} returned an unrecognised page ({shape}); the result is empty, see the raw output")
+                break
+            if meta is not None and offset == 0:
+                meta.update({k: v for k, v in payload.items() if k != "items"})
+            items.extend(row for row in page if isinstance(row, dict))
             if not page or not payload.get("has_more"):
                 break
             offset += len(page)
+        else:
+            note_warning(f"{tool}: stopped at the requested limit of {limit}; more entries exist")
         return items, raws
 
     # -- operations ----------------------------------------------------------------
@@ -122,7 +142,11 @@ class ReMcpAdapter(McpAdapter):
             "bits": info.get("bitness", ready.get("bitness")),
             "file_type": info.get("file_type", ready.get("file_type")),
             "function_count": info.get("function_count", ready.get("function_count")),
-            "image_base": parse_address(info.get("image_base") or info.get("min_address")),
+            # re-mcp-ghidra reports image_base (tools/database.py:32-46); re-mcp-ida has none
+            # (re_mcp_ida tools/database.py:67-80), and min_address is not an image base.
+            "image_base": parse_address(info.get("image_base")),
+            "min_address": parse_address(info.get("min_address")),
+            "entry_point": parse_address(info.get("entry_point")),
             "engine_info": {k: v for k, v in info.items() if k not in {"database", "file_path"}},
         }
         return self.result(
@@ -168,9 +192,20 @@ class ReMcpAdapter(McpAdapter):
             provider, target, "decompile_function", {"address": ref, "database": session["database"]}
         )
         info = payload if isinstance(payload, dict) else {}
-        code = info.get("decompiled_code") or info.get("code") or text
+        # Ghidra: {function_name, address, decompiled_code} (tools/functions.py:42-45);
+        # IDA: {address, name, pseudocode} (re_mcp_ida tools/functions.py:99-104).
+        code = next((info[k] for k in ("decompiled_code", "pseudocode") if isinstance(info.get(k), str)), None)
+        if code is None:
+            if isinstance(payload, (dict, list)):
+                # Never present the JSON document itself as pseudocode.
+                raise ProviderCallError(
+                    f"{provider.id}/decompile_function returned no pseudocode field "
+                    f"({sorted(info)[:8] if info else type(payload).__name__})",
+                    details={"tool": "decompile_function"},
+                )
+            code = text
         resolved = parse_address(info.get("address")) or address
-        fname = info.get("function_name") or name
+        fname = info.get("function_name") or info.get("name") or name
         return self.result(
             provider,
             "binary.decompile",
@@ -195,19 +230,25 @@ class ReMcpAdapter(McpAdapter):
         info = payload if isinstance(payload, dict) else {}
         instructions = []
         for item in info.get("instructions", []) or info.get("items", []) or []:
-            if isinstance(item, dict):
-                instructions.append(
-                    {
-                        "address": parse_address(item.get("address")),
-                        "bytes": (item.get("bytes") or "").replace(" ", "").lower() or None,
-                        "mnemonic": str(item.get("mnemonic", "")).lower(),
-                        "op_str": item.get("operands", item.get("op_str", "")),
-                    }
-                )
+            if not isinstance(item, dict):
+                continue
+            mnemonic, op_str = item.get("mnemonic"), item.get("operands", item.get("op_str"))
+            if mnemonic is None and isinstance(item.get("disasm"), str):
+                # re-mcp-ida DisassemblyInstruction is {address, disasm} (tools/functions.py:107-111)
+                mnemonic, _, op_str = item["disasm"].strip().partition(" ")
+            instructions.append(
+                {
+                    "address": parse_address(item.get("address")),
+                    "bytes": (item.get("bytes") or "").replace(" ", "").lower() or None,
+                    "mnemonic": str(mnemonic or "").lower(),
+                    "op_str": str(op_str or "").strip(),
+                }
+            )
         if not instructions:
             listing = info.get("disassembly") or info.get("listing") or text
             instructions = parse_listing_lines(str(listing))
-        resolved = parse_address(info.get("address")) or address
+        # Ghidra DisassemblyResult has start/end (tools/functions.py:55-60); IDA has address.
+        resolved = parse_address(info.get("address") or info.get("start")) or address
         fname = info.get("function_name") or info.get("name") or name
         return self.result(
             provider,
@@ -225,18 +266,42 @@ class ReMcpAdapter(McpAdapter):
         address, name, ref = function_ref(params)
         direction = params.get("direction", "to")
         tool = "get_xrefs_to" if direction == "to" else "get_xrefs_from"
+        meta: dict[str, Any] = {}
         items, raws = await self._paged(
-            provider, target, tool, {"address": ref, "database": session["database"]}, int(params.get("limit", 200))
+            provider,
+            target,
+            tool,
+            {"address": ref, "database": session["database"]},
+            int(params.get("limit", 200)),
+            meta,
         )
+        # Ghidra rows: XrefTo {from_address, from_function, ref_type, is_call} / XrefFrom {to_address,
+        # to_function, ref_type, is_call} (tools/xrefs.py:24-35). IDA rows: {from, from_name, type,
+        # is_code} / {to, to_name, type, is_code} (re_mcp_ida tools/xrefs.py:38-69). A row carries
+        # only the far end; the near end is the queried address (IDA echoes it, resolved).
+        subject = parse_address(meta.get("address"))
+        if subject is None:
+            subject = address
+        near, far_key = ("to", "from") if direction == "to" else ("from", "to")
         refs = []
         for item in items:
+            far = parse_address(item.get(f"{far_key}_address", item.get(far_key)))
+            if far is None:
+                note_warning(f"{tool}: a reference without a parseable '{far_key}' end was ignored")
+                continue
             refs.append(
                 {
-                    "from": parse_address(item.get("from_address")),
-                    "to": parse_address(item.get("to_address")) if item.get("to_address") else address,
-                    "from_function": item.get("from_function") or None,
-                    "type": item.get("ref_type"),
+                    near: subject,
+                    far_key: far,
+                    "from_function": (item.get("from_function") or item.get("from_name") or None)
+                    if direction == "to"
+                    else None,
+                    "to_function": (item.get("to_function") or item.get("to_name") or None)
+                    if direction != "to"
+                    else None,
+                    "type": item.get("ref_type", item.get("type")),
                     "is_call": item.get("is_call"),
+                    "is_code": item.get("is_code"),
                 }
             )
         return self.result(

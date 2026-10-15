@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 from pathlib import PureWindowsPath
 from typing import Any
@@ -114,6 +115,26 @@ IDA_OFFICIAL = IdaOfficialAdapter(
 # ---------------------------------------------------------------------------
 # blacktop/ida-mcp-rs
 # ---------------------------------------------------------------------------
+def _ida_analysis_gap(payload: Any) -> str | None:
+    """open_idb's DbInfo (src/ida/types.rs:87-97) carries AnalysisStatus (types.rs:132-139); large
+    inputs may route analysis to a background task (server/mod.rs open_idb ``analysis_background``)."""
+    if not isinstance(payload, dict):
+        return "open_idb did not return DbInfo; IDA auto-analysis state is unknown, results may be partial"
+    status = payload.get("analysis_status")
+    if payload.get("analysis_background") or not isinstance(status, dict) or status.get("auto_is_ok") is not True:
+        state = status.get("auto_state") if isinstance(status, dict) else None
+        return f"IDA auto-analysis was not complete when the database opened (auto_state={state!r}); results may be partial"
+    return None
+
+
+def _ida_more(tool: str, payload: Any) -> list[str]:
+    """Pagination markers (types.rs:201-206 next_offset, 390-396 truncated) mean a partial answer."""
+    if isinstance(payload, dict) and (payload.get("truncated") or payload.get("next_offset") is not None):
+        total = payload.get("total")
+        return [f"{tool}: result truncated upstream" + (f" ({total} in total)" if total is not None else "")]
+    return []
+
+
 class IdaRsAdapter(McpAdapter):
     async def prepare(self, provider, target) -> dict[str, Any]:
         sessions = provider.adapter_state.setdefault("sessions", {})
@@ -124,16 +145,25 @@ class IdaRsAdapter(McpAdapter):
             await self.release(provider, sha)
         staged = target.staged_path(provider.id)
         idb_out = target.provider_dir(provider.id) / (staged.stem + ".i64")
+        # auto_analyse defaults to false upstream (src/server/requests.rs:55-60): a raw binary is then
+        # opened "fast with analysis incomplete", and function lists/xrefs/strings would be partial.
         payload, _t, raw = await self.call(
             provider,
             target,
             "open_idb",
-            {"path": str(staged), "idb_out": str(idb_out)},
+            {"path": str(staged), "idb_out": str(idb_out), "auto_analyse": True},
             timeout=float(provider.config.startup_timeout_seconds),
         )
-        session = {"open": payload, "idb_out": str(idb_out)}
+        session = {"open": payload, "idb_out": str(idb_out), "incomplete": _ida_analysis_gap(payload)}
         sessions[target.sha256] = session
         return session
+
+    async def perform(self, provider, operation, target, params):
+        result = await super().perform(provider, operation, target, params)
+        gap = provider.adapter_state.get("sessions", {}).get(target.sha256, {}).get("incomplete")
+        if gap and gap not in result.warnings:
+            result.warnings.append(gap)  # until the session is reopened: Nexus cannot see it finish
+        return result
 
     async def release(self, provider, sha256: str) -> None:
         session = provider.adapter_state.setdefault("sessions", {}).pop(sha256, None)
@@ -186,6 +216,7 @@ class IdaRsAdapter(McpAdapter):
             args["filter"] = str(params["query"])
         payload, _t, raw = await self.call(provider, target, "list_functions", args)
         rows, warnings = _json_listing(payload, "list_functions", "functions")
+        warnings += _ida_more("list_functions", payload)
         functions = []
         for item in rows:
             start = _addr_of(item)
@@ -290,6 +321,7 @@ class IdaRsAdapter(McpAdapter):
             provider, target, tool, {"address": ref, "limit": int(params.get("limit", 200))}
         )
         rows, warnings = _json_listing(payload, tool, "xrefs", "refs")
+        warnings += _ida_more(tool, payload)
         refs = [
             {
                 "from": _addr_of(i, "from", "frm", "source"),
@@ -317,6 +349,7 @@ class IdaRsAdapter(McpAdapter):
             args["filter"] = str(params["query"])
         payload, _t, raw = await self.call(provider, target, "strings", args)
         rows, warnings = _json_listing(payload, "strings", "strings")
+        warnings += _ida_more("strings", payload)
         # Pinned StringInfo is {address, content, length}: the text lives in "content".
         strings = [
             {"address": _addr_of(i), "value": i.get("content"), "length": i.get("length")}
@@ -457,6 +490,29 @@ def _basename(path: str) -> str:
     return PureWindowsPath(path).name  # accepts both "/" and "\" separators
 
 
+def _norm_path(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _binja_check_view(provider: Any, target: Any, tool: str, shown: str) -> None:
+    """The active view must be *this target's staged copy*, compared by full path.
+
+    The pinned plugin exposes only ``FileMetadata.filename`` (no hash, no view identity
+    beyond the path). A basename match is not identity: any same-named file would be
+    attributed to this SHA-256. ``staged_path`` re-verifies the staged copy's hash on every
+    call and the copy is read-only, so the full staged path is the strongest identity the
+    upstream allows. A ``.bndb`` path (database) is refused for the same reason.
+    """
+    staged = target.staged_path(provider.id)
+    if _norm_path(shown) != _norm_path(str(staged)):
+        raise CapabilityUnavailable(
+            f"{provider.id}/{tool}: Binary Ninja's active view is {_basename(shown)!r}, "
+            f"which is not this target's staged copy",
+            remediation=f"Open {staged} in Binary Ninja (File > Open) and retry.",
+            details={"active_view": _basename(shown)},
+        )
+
+
 def _binja_body(provider: Any, target: Any, tool: str, text: str) -> str:
     """Unwrap one bridge answer (pinned ``bridge/src/tools.ts``).
 
@@ -471,11 +527,7 @@ def _binja_body(provider: Any, target: Any, tool: str, text: str) -> str:
         shown = first[len("File: ") :].strip()
         if not shown or shown == "(none)":
             raise CapabilityUnavailable(f"{provider.id}/{tool}: Binary Ninja reports no open binary")
-        if _basename(shown) != target.display_name:
-            raise CapabilityUnavailable(
-                f"{provider.id}/{tool}: the answer is for {_basename(shown)!r}, not {target.display_name!r}",
-                details={"active_view": _basename(shown)},
-            )
+        _binja_check_view(provider, target, tool, shown)
         body = rest[1:] if rest.startswith("\n") else rest
     if _BINJA_ERROR.match(body.strip()):
         raise ProviderCallError(
@@ -552,13 +604,15 @@ class BinjaAdapter(McpAdapter):
                 f"{provider.id}: Binary Ninja has no binary open",
                 remediation="Open the target in Binary Ninja (or select it with select_binary) and retry.",
             )
-        if _basename(str(filename)) != target.display_name:
-            raise CapabilityUnavailable(
-                f"Binary Ninja's active view is {_basename(str(filename))!r}, not {target.display_name!r}",
-                remediation="Open the target in Binary Ninja (or select it with select_binary) and retry.",
-                details={"active_view": _basename(str(filename))},
-            )
+        _binja_check_view(provider, target, "get_binary_status", str(filename))
         return {"active_view": _basename(str(filename))}
+
+    async def perform(self, provider, operation, target, params):
+        result = await super().perform(provider, operation, target, params)
+        # Most bridge answers carry no "File:" preamble: confirm the view did not change while the
+        # operation ran (GUI switch or another client's select_binary) before it becomes evidence.
+        await self.prepare(provider, target)
+        return result
 
     async def _function_name(self, provider, target, params) -> tuple[int | None, str]:
         address, name, ref = function_ref(params)
@@ -833,6 +887,20 @@ class JadxAdapter(McpAdapter):
             timeout=float(provider.config.startup_timeout_seconds),
         )
         loaded, _w = _jadx_decode(provider, "load_apk", text, dict)
+        # The daemon answers every later request against its most recently loaded APK
+        # (core/AnalyzerRegistry.java:188-199); getApkInfo echoes that path verbatim
+        # (core/JadxAnalyzerCore.java:461,509-519). Without a matching path, attribution is unsafe.
+        shown = loaded.get("apkPath")
+        if not isinstance(shown, str) or not shown.strip():
+            raise CapabilityUnavailable(
+                f"{provider.id}/load_apk did not report the loaded APK path; target identity cannot be confirmed"
+            )
+        if _norm_path(shown) != _norm_path(str(staged)):
+            raise CapabilityUnavailable(
+                f"{provider.id}/load_apk reports {_basename(shown)!r}, not this target's staged copy",
+                remediation="Run one JADX daemon per concurrent analysis (JADX_URL / server.port).",
+                details={"loaded_apk": _basename(shown)},
+            )
         sessions[target.sha256] = {"loaded": loaded}
         return sessions[target.sha256]
 

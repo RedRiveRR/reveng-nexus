@@ -638,6 +638,19 @@ class McpProvider(AnalysisProvider):
         label = f"MCP server {name or '?'} {version or '?'} (server-reported)" if name or version else None
         if self.per_target:
             live = [sha[:12] for sha, o in self._target_owners.items() if o.alive]
+            if self.started and self.adapter is not None:
+                # Before the first session the pin is trusted; once a server has listed its tools,
+                # zero usable operations (or an adapter with no bindings) is not "ready".
+                caps = self.adapter.capabilities(self)
+                usable = sorted(op for op, status in caps.items() if status.get("available"))
+                if not usable:
+                    return ProviderHealth(
+                        "degraded",
+                        f"launches one server per target, but none of the adapter's {len(caps)} operations "
+                        f"are usable ({len(self._tools)} tools listed); see {self.log_path}",
+                        version=label,
+                        extra={"usable_operations": []},
+                    )
             return ProviderHealth(
                 "ready" if self.started else "unavailable",
                 "launches one server per target" + (f"; live sessions: {live}" if live else "; no live session"),
@@ -654,7 +667,25 @@ class McpProvider(AnalysisProvider):
                 await client.list_tools(cache_mode="refresh")
         except Exception as exc:  # noqa: BLE001
             return ProviderHealth("degraded", f"liveness probe failed: {_describe(exc)}", version=label)
-        if self.adapter is not None and self.adapter.bindings:
+        callable_tools = sorted(name for name, info in self._tools.items() if info.callable)
+        if self.adapter is not None and not self.adapter.bindings:
+            # e.g. ida_official: analysis exists only behind execute_python. Under the current
+            # policy no Nexus operation can reach a target, so this is not "ready".
+            return ProviderHealth(
+                "degraded",
+                f"connected ({len(self._tools)} tools listed), but adapter {self.adapter.name!r} binds no "
+                f"normalised operations; raw tools callable under policy: {callable_tools or 'none'}",
+                version=label,
+                extra={"usable_operations": [], "callable_tools": callable_tools},
+            )
+        if self.adapter is None and not callable_tools:
+            return ProviderHealth(
+                "degraded",
+                f"connected, but none of its {len(self._tools)} tools is callable under the current policy",
+                version=label,
+                extra={"usable_operations": [], "callable_tools": []},
+            )
+        if self.adapter is not None:
             caps = self.adapter.capabilities(self)
             usable = [op for op, status in caps.items() if status.get("available")]
             if not usable:
@@ -751,14 +782,14 @@ class McpProvider(AnalysisProvider):
                 # The child died (or closed its pipes). Tear the connection down so the next call
                 # reconnects within the restart budget; per-target sessions are dropped entirely.
                 self.last_error = {"message": _describe(exc), "at": time.time()}
-                await self._drop_connection()
+                await self._drop_connection(target_sha256)
                 raise ProviderUnavailable(f"{self.id}: connection lost during {name}: {_describe(exc)}") from exc
             raise
 
-    async def _drop_connection(self) -> None:
+    async def _drop_connection(self, target_sha256: str | None = None) -> None:
         self._reset_sessions()
         if self.per_target:
-            sha = self._active_target
+            sha = target_sha256 or self._active_target
             owner = self._target_owners.pop(sha, None) if sha else None
             if owner is not None:
                 await owner.close(timeout=5)
