@@ -84,6 +84,21 @@ def test_read_only_hint_cannot_whitelist_execution_shaped_names():
     assert cls.tool_class == "execute"
 
 
+@pytest.mark.parametrize("tool", ["patch_bytes", "write_memory", "delete_function", "rename_function", "open_database"])
+def test_read_only_hint_cannot_whitelist_mutation_shaped_unlisted_tools(tool):
+    """re_mcp/mcpyghidra/ida_rs trust annotations: an unlisted tool's readOnlyHint must not make it callable."""
+    engine = _engine()
+    provider = _provider()
+    cls = engine.classify(provider, tool, annotations={"readOnlyHint": True}, trust_annotations_default=True)
+    assert cls.tool_class != "read"
+    assert not engine.decide(provider, tool, cls, arguments={}).allowed
+    # an observation-shaped or neutral name may still be promoted by a trusted hint
+    assert (
+        engine.classify(provider, "frob", annotations={"readOnlyHint": True}, trust_annotations_default=True).tool_class
+        == "read"
+    )
+
+
 def test_unknown_tools_are_blocked_and_explain_why():
     engine = _engine()
     provider = _provider()
@@ -147,7 +162,11 @@ def test_dynamic_tools_require_policy_and_authorised_targets():
         allowed_tools=("hook_method",),
     )
     on = _engine(dynamic=dyn)
-    assert on.decide(provider, "hook_method", cls, arguments={"target": "com.example.test"}).allowed
+    # the pinned hook_method schema (tools/hook.ts:19-33) declares target, method and device
+    schema = {"type": "object", "properties": {"target": {}, "method": {}, "device": {}}}
+    ok_args = {"target": "com.example.test", "device": "emulator-5554"}
+    assert on.decide(provider, "hook_method", cls, arguments=ok_args, input_schema=schema).allowed
+    assert not on.decide(provider, "hook_method", cls, arguments=ok_args).allowed, "no enumerated schema"
     assert not on.decide(provider, "hook_method", cls, arguments={"target": "com.other.app"}).allowed
     assert not on.decide(
         provider, "hook_method", cls, arguments={"target": "com.example.test", "device": "usb-1"}
@@ -177,3 +196,110 @@ def test_global_patterns_always_win():
     engine = PolicyEngine(config)
     cls = engine.classify(_provider(), "decompile_function", manifest={"decompile_function": "read"})
     assert cls.tool_class == "blocked"
+
+
+def test_tool_overrides_cannot_unblock_adapter_hard_blocks():
+    engine = _engine()
+    manifest = ADAPTERS["frida_mobile"].manifest
+    hard = next(name for name, cls in manifest.items() if cls == "blocked")
+    provider = _provider(tool_overrides={hard: "read"})
+    cls = engine.classify(provider, hard, manifest=manifest)
+    assert (cls.tool_class, cls.source) == ("blocked", "manifest")
+    assert not engine.decide(provider, hard, cls).allowed
+
+
+def test_tool_overrides_cannot_downgrade_execute_or_dynamic():
+    engine = _engine()
+    manifest = ADAPTERS["ida_official"].manifest
+    provider = _provider(id="ida_official", tool_overrides={"execute_python": "read", "run_script": "read"})
+    assert engine.classify(provider, "execute_python", manifest=manifest).tool_class == "execute"
+    # the same holds for an unlisted tool whose name is execution-shaped
+    assert engine.classify(provider, "run_script").tool_class == "execute"
+    # tightening is still allowed, and ordinary overrides keep working
+    tight = _provider(tool_overrides={"execute_python": "blocked", "frob": "read"})
+    assert engine.classify(tight, "execute_python", manifest=manifest).tool_class == "blocked"
+    assert engine.classify(tight, "frob").source == "override"
+
+
+def test_lifecycle_never_forwarded_for_callers():
+    for engine in (_engine(), _engine(read_only=False)):
+        provider = _provider()
+        cls = engine.classify(provider, "open_idb", manifest={"open_idb": "lifecycle"})
+        outside = {"path": r"C:\Windows\win.ini"}
+        assert not engine.decide(provider, "open_idb", cls, internal=False, arguments=outside).allowed
+        assert engine.decide(provider, "open_idb", cls, internal=True).allowed
+
+
+@pytest.mark.parametrize("override", ["read", "mutate", "unknown"])
+def test_override_cannot_relax_lifecycle(override):
+    engine = _engine(read_only=False)
+    provider = _provider(tool_overrides={"open_idb": override})
+    cls = engine.classify(provider, "open_idb", manifest={"open_idb": "lifecycle"})
+    assert cls.tool_class == "lifecycle"
+    assert not engine.decide(provider, "open_idb", cls).allowed
+    tight = _provider(tool_overrides={"open_idb": "blocked"})
+    assert engine.classify(tight, "open_idb", manifest={"open_idb": "lifecycle"}).tool_class == "blocked"
+
+
+def test_mcpyghidra_open_program_is_lifecycle():
+    assert ADAPTERS["mcpyghidra"].manifest["open_program"] == "lifecycle"
+
+
+@pytest.mark.parametrize("tool", ["frobnicate_exec_shell", "evaluate_script_now", "spawn_anything"])
+def test_override_cannot_relax_unlisted_execute_named_tool(tool):
+    engine = _engine(read_only=False)
+    frida = ADAPTERS["frida_mobile"]
+    provider = _provider(id="frida", kind="dynamic", tool_overrides={tool: "read"})
+    cls = engine.classify(provider, tool, manifest=frida.manifest, unlisted_class=frida.unlisted_tool_class)
+    assert cls.tool_class != "read"
+    assert not engine.decide(provider, tool, cls, arguments={}, input_schema={"properties": {}}).allowed
+
+
+def test_override_cannot_relax_a_dynamic_manifest_class():
+    frida = ADAPTERS["frida_mobile"]
+    provider = _provider(id="frida", kind="dynamic", tool_overrides={"trace_method": "read"})
+    assert _engine().classify(provider, "trace_method", manifest=frida.manifest).tool_class == "dynamic"
+
+
+def test_dynamic_tool_without_enumerated_schema_is_refused():
+    dyn = DynamicPolicy(
+        enabled=True, authorized_devices=("d1",), authorized_targets=("com.example.test",), allowed_tools=("x",)
+    )
+    engine = _engine(dynamic=dyn)
+    provider = _provider(id="dyn", kind="dynamic", tool_overrides={"x": "dynamic"})
+    cls = engine.classify(provider, "x")
+    args = {"target": "com.example.test", "decoy": 1}
+    for schema in ({}, {"type": "object"}, {"properties": {}, "additionalProperties": True}):
+        decision = engine.decide(provider, "x", cls, arguments=args, input_schema=schema)
+        assert not decision.allowed and "enumerates" in decision.reason
+
+
+def test_numeric_dynamic_target_is_refused():
+    dyn = DynamicPolicy(
+        enabled=True,
+        authorized_devices=("d1",),
+        authorized_targets=("com.example.test",),
+        allowed_tools=("attach_process",),
+    )
+    engine = _engine(dynamic=dyn)
+    provider = _provider(id="frida", kind="dynamic")
+    cls = engine.classify(provider, "attach_process", manifest=ADAPTERS["frida_mobile"].manifest)
+    schema = {"properties": {"target": {}, "device": {}}}
+    decision = engine.decide(
+        provider, "attach_process", cls, arguments={"target": 4242, "device": "d1"}, input_schema=schema
+    )
+    assert not decision.allowed and "identifier string" in decision.reason
+
+
+def test_static_tool_with_undeclared_arguments_is_refused_for_callers():
+    engine = _engine()
+    provider = _provider()
+    cls = engine.classify(provider, "list_functions", manifest={"list_functions": "read"})
+    schema = {"type": "object", "properties": {"limit": {"type": "integer"}}}
+    assert engine.decide(provider, "list_functions", cls, arguments={"limit": 5}, input_schema=schema).allowed
+    refused = engine.decide(provider, "list_functions", cls, arguments={"limit": 5, "path": "x"}, input_schema=schema)
+    assert not refused.allowed and "not declared" in refused.reason
+    # adapter-internal calls are built from the pinned schema and are not re-checked
+    assert engine.decide(
+        provider, "list_functions", cls, internal=True, arguments={"limit": 5, "path": "x"}, input_schema=schema
+    ).allowed

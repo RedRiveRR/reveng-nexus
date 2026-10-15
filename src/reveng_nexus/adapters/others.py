@@ -9,6 +9,7 @@ engine to confirm the live ``tools/list`` still matches.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from pathlib import PureWindowsPath
@@ -978,18 +979,85 @@ JADX = JadxAdapter(
 # ---------------------------------------------------------------------------
 # monkeywave/frida-mobile-mcp (dynamic; disabled unless policy.dynamic_analysis.enabled)
 # ---------------------------------------------------------------------------
+def _opt_str(value: Any) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _int_like(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _frida_envelope(payload: Any) -> bool:
+    """True only for the pinned ToolResult shape (types.ts:61-85, result-builder.ts:11-21, :51)."""
+    if not isinstance(payload, dict) or set(payload) != {"result", "session_context", "suggested_next"}:
+        return False
+    ctx, nxt = payload["session_context"], payload["suggested_next"]
+    if not isinstance(payload["result"], dict) or not isinstance(ctx, dict) or not isinstance(nxt, list):
+        return False
+    sessions = ctx.get("active_sessions")
+    if not (
+        _opt_str(ctx.get("device"))
+        and _opt_str(ctx.get("platform"))
+        and isinstance(sessions, list)
+        and all(
+            isinstance(s, dict)
+            and isinstance(s.get("id"), str)
+            and isinstance(s.get("target"), str)
+            and _int_like(s.get("pid"))
+            for s in sessions
+        )
+        and _int_like(ctx.get("active_hooks"))
+        and _int_like(ctx.get("active_scripts"))
+    ):
+        return False
+    return all(
+        isinstance(a, dict)
+        and isinstance(a.get("tool"), str)
+        and isinstance(a.get("reason", ""), str)
+        and isinstance(a.get("args", {}), dict)
+        for a in nxt
+    )
+
+
 class FridaAdapter(McpAdapter):
     async def op_dynamic_status(self, provider, target, session, params):
         payload, text, raw = await self.call(provider, target, "get_status", {})
+        warnings: list[str] = []
+        # Pinned envelope (helpers/result-builder.ts:27-53): structuredContent
+        # {result, session_context, suggested_next}; the text block is TOON, not JSON.
+        if _frida_envelope(payload):
+            status: Any = payload
+            if isinstance(payload["result"].get("error"), str):  # in-band error without isError
+                message = payload["result"]["error"][:600]
+                raise ProviderCallError(f"{provider.id}/get_status reported an error: {message}")
+        else:
+            status = None
+            warnings.append(
+                "get_status did not return the pinned {result, session_context, suggested_next} envelope; "
+                "the status is left empty and the raw output is kept"
+            )
         return self.result(
             provider,
             "dynamic.status",
             "get_status",
-            {"status": payload if payload is not None else text},
+            {"status": status},
             raw,
             evidence_kind="engine_derived",
             claim="Frida environment status",
+            warnings=warnings,
         )
+
+    async def shutdown(self, provider) -> None:
+        # Upstream detaches sessions only on SIGINT/SIGTERM (index.ts:68-79), which a Windows
+        # child never receives; ask it to stop all instrumentation before the pipes close.
+        # Only on a live connection: call_tool -> _client_for would otherwise relaunch a dead child
+        # (spending the restart budget) just to clean up a process that holds no sessions.
+        owner = getattr(provider, "_owner", None)
+        live = provider.started and owner is not None and owner.alive
+        if live and provider.tool_info("stop_instrumentation") is not None:
+            with contextlib.suppress(Exception):
+                await provider.call_tool("stop_instrumentation", {"all": True}, internal=True, timeout=5.0)
+        await super().shutdown(provider)
 
 
 _FRIDA_READ = ("get_status", "frida_help", "list_devices", "get_device_info", "list_sessions")
@@ -1002,7 +1070,6 @@ _FRIDA_DYNAMIC = (
     "read_memory",
     "scan_memory",
     "get_messages",
-    "stop_instrumentation",
     "list_processes",
     "list_applications",
     "get_frontmost_application",
@@ -1013,12 +1080,15 @@ _FRIDA_DYNAMIC = (
     "resume_process",
     "detach_session",
     "select_device",
-    "mobile_action",
 )
 # Hard-blocked through Nexus: protection bypass, memory writes, custom/prebuilt JS payloads,
 # process termination and custom hook bodies. Use Frida directly if an authorised test needs them.
+# mobile_action proxies arbitrary mobile-mcp actions (install/uninstall/launch apps, taps, URLs;
+# tools/mobile.ts:10-32) to a second server launched as `npx -y @mobilenext/mobile-mcp@latest`
+# (config.ts:14-18, mobile-mcp/client.ts:32-42); it takes no device or target to authorise.
 _FRIDA_BLOCKED = (
     "bypass_ssl_pinning",
+    "mobile_action",
     "run_prebuilt_script",
     "execute_script",
     "write_memory",
@@ -1044,10 +1114,16 @@ FRIDA = FridaAdapter(
         **{t: "read" for t in _FRIDA_READ},
         **{t: "dynamic" for t in _FRIDA_DYNAMIC},
         **{t: "blocked" for t in _FRIDA_BLOCKED},
+        # Gateway-internal cleanup only (see FridaAdapter.shutdown); not forwarded to callers.
+        "stop_instrumentation": "lifecycle",
     },
     bindings={"dynamic.status": ("get_status",)},
     trust_annotations=False,
     protocol_mode="legacy",
+    # A tool outside the pinned 32 means upstream drift on a dynamic provider: re-pin and review it.
+    # "blocked" (not "unknown") so a tool_overrides entry cannot relax it to "read".
+    unlisted_tool_class="blocked",
+    provider_kind="dynamic",
     limitations=(
         "Started only when policy.dynamic_analysis.enabled with authorised devices and app identifiers.",
         "Protection-bypass, memory-write and custom-script tools are never forwarded by Nexus.",

@@ -177,3 +177,51 @@ def test_env_expansion_reports_missing():
     )
     assert value == "/opt/x:${NEXUS_TEST_UNSET}:fallback"
     assert missing == ["NEXUS_TEST_UNSET"]
+
+
+def test_allow_lifecycle_passthrough_true_is_rejected(config_factory, workspace):
+    from reveng_nexus.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="allow_lifecycle_passthrough"):
+        config_factory(workspace, [], policy={"allow_lifecycle_passthrough": True})
+    assert config_factory(workspace, [], policy={"allow_lifecycle_passthrough": False})
+
+
+def test_contradicting_kind_for_a_pinned_dynamic_adapter_is_a_config_error(config_factory, workspace):
+    from reveng_nexus.errors import ConfigError
+
+    frida = {"id": "fr", "type": "mcp_stdio", "adapter": "frida_mobile", "command": "x", "kind": "static"}
+    with pytest.raises(ConfigError, match="kind must be 'dynamic'"):
+        config_factory(workspace, [frida])
+    del frida["kind"]
+    assert config_factory(workspace, [frida]).providers[0].kind == "dynamic"
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "needed"),
+    [
+        ("npx", ["-y", "frida-mobile-mcp@0.2.3"], "frida_mobile"),
+        ("node.exe", ["C:/x/rea-agents-6.5.0/node_modules/rea-agents/scripts/rea.mjs", "mcp"], "rea"),
+        ("npx", ["-y", "rea-agents@6.5.0", "mcp"], "rea"),
+    ],
+)
+def test_servers_with_adapter_gates_cannot_run_without_their_adapter(command, args, needed):
+    """Adapter-less, Frida would be a static provider (verb heuristic, no device check) and REA raw."""
+    raw = {"id": "srv", "type": "mcp_stdio", "command": command, "args": args}
+    for adapter in (None, "re_mcp"):
+        with pytest.raises(ConfigError, match=f"needs adapter: {needed}"):
+            ProviderConfig.from_dict({**raw, **({"adapter": adapter} if adapter else {})})
+    assert ProviderConfig.from_dict({**raw, "adapter": needed}).adapter == needed
+    # an unrelated name that merely contains the letters is not matched
+    assert ProviderConfig.from_dict({**raw, "args": ["area.mjs", "frida_notes.txt"]}).adapter is None
+
+
+def test_re_mcp_engine_label_is_restricted_and_inferred_from_the_package():
+    """One adapter serves both re-mcp backends; the engine label decides the engine family."""
+    base = {"id": "re", "type": "mcp_stdio", "adapter": "re_mcp", "command": "uvx"}
+    assert ProviderConfig.from_dict({**base, "args": ["re-mcp-ida==3.0.3"]}).engine == "ida"
+    assert ProviderConfig.from_dict({**base, "args": ["re-mcp-ghidra==3.0.3"]}).engine == "ghidra"
+    with pytest.raises(ConfigError, match="contradicts"):
+        ProviderConfig.from_dict({**base, "args": ["re-mcp-ida==3.0.3"], "engine": "ghidra"})
+    with pytest.raises(ConfigError, match="engine: ghidra or engine: ida"):
+        ProviderConfig.from_dict({**base, "args": ["re-mcp-ghidra==3.0.3"], "engine": "ghidra12"})

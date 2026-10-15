@@ -98,7 +98,7 @@ class ProviderManager:
         out = {}
         for provider in self.providers.values():
             for info in provider._tools.values():
-                if info.decision.allowed:
+                if info.callable:
                     out[info.public_name] = info
         return out
 
@@ -331,7 +331,7 @@ class ProviderManager:
             if provider_id and provider.id != provider_id:
                 continue
             for info in await provider.list_tools():
-                if not include_blocked and not info.decision.allowed:
+                if not include_blocked and not info.callable:
                     continue
                 hay = f"{info.name} {info.description}".casefold()
                 if all(t in hay for t in terms):

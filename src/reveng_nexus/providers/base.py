@@ -72,6 +72,12 @@ class ToolInfo:
     annotations: dict[str, Any]
     classification: ToolClassification
     decision: PolicyDecision
+    adapter_only: bool = False  # usable by the adapter's nexus_* operations, never by callers
+
+    @property
+    def callable(self) -> bool:
+        """Whether a caller may invoke this raw tool (nexus_call_provider_tool / namespaced tools)."""
+        return self.decision.allowed and not self.adapter_only
 
     @property
     def public_name(self) -> str:
@@ -89,8 +95,12 @@ class ToolInfo:
             "description": self.description[:1200],
             "tool_class": self.classification.tool_class,
             "classification_source": self.classification.source,
-            "callable": self.decision.allowed,
-            "policy_reason": self.decision.reason,
+            "callable": self.callable,
+            "policy_reason": (
+                "adapter-only provider: used by nexus_* operations, not callable directly"
+                if self.adapter_only and self.decision.allowed
+                else self.decision.reason
+            ),
         }
         if self.annotations:
             out["annotations"] = self.annotations
@@ -225,9 +235,25 @@ class AnalysisProvider(ABC):
                 remediation="Use nexus_list_tools to see the tools this provider exposes.",
             )
         # Re-decide with the actual arguments (dynamic tools check device/target allowlists).
-        decision = self.runtime.policy.decide(
-            self.config, name, info.classification, internal=internal, arguments=arguments
-        )
+        adapter = getattr(self, "adapter", None)
+        if not internal and adapter is not None and adapter.adapter_only:
+            from ..policy import PolicyDecision
+
+            decision = PolicyDecision(
+                False,
+                info.classification.tool_class,
+                info.classification.source,
+                f"{adapter.name} is reachable only through nexus_* operations (adapter-only provider)",
+            )
+        else:
+            decision = self.runtime.policy.decide(
+                self.config,
+                name,
+                info.classification,
+                internal=internal,
+                arguments=arguments,
+                input_schema=info.input_schema,
+            )
         audit = self.runtime.audit
         if not decision.allowed:
             audit.write(
@@ -303,7 +329,7 @@ class AnalysisProvider(ABC):
             "max_concurrency": cfg.max_concurrency,
             "timeout_seconds": cfg.timeout_seconds,
             "tool_count": len(self._tools),
-            "callable_tool_count": sum(1 for t in self._tools.values() if t.decision.allowed),
+            "callable_tool_count": sum(1 for t in self._tools.values() if t.callable),
             "stats": dict(self.stats),
             "last_error": self.last_error,
         }

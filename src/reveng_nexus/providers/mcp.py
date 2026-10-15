@@ -22,7 +22,8 @@ import anyio
 
 from ..adapters import get_adapter
 from ..config import expand_env
-from ..errors import ConfigError, ProviderCallError, ProviderUnavailable
+from ..errors import ConfigError, PolicyViolation, ProviderCallError, ProviderUnavailable
+from ..netguard import format_host, is_loopback_host, parse_http_url
 from ..redaction import redact_text
 from .base import AnalysisProvider, OperationResult, ProviderHealth, TargetContext, ToolInfo
 
@@ -364,21 +365,56 @@ class McpProvider(AnalysisProvider):
 
         return connect
 
-    def _http_connect(self, url: str):
+    def _check_http_url(self, url: str, *, launched: bool) -> bool:
+        """Refuse non-loopback endpoints unless explicitly allowed; return whether it is loopback."""
+        try:
+            host = parse_http_url(url).host
+        except ValueError as exc:
+            raise ProviderUnavailable(f"{self.id}: invalid endpoint URL: {exc}") from None
+        if is_loopback_host(host):
+            return True
+        if launched:
+            raise ProviderUnavailable(f"{self.id}: launched server URL points at non-loopback host {host!r}")
+        if not (self.config.allow_remote and self.runtime.config.policy.allow_remote_providers):
+            raise PolicyViolation(
+                f"{self.id}: endpoint host {host!r} is not loopback. Sending targets and tool calls to a "
+                "remote MCP server needs allow_remote: true on the provider AND policy.allow_remote_providers: true.",
+            )
+        return False
+
+    def _open_client(self, url: str, *, loopback: bool):
+        """MCP client over a Nexus-owned HTTP client: no proxy env for loopback, SDK redirect rules."""
+        import httpx2
         from mcp import Client
+        from mcp.client.streamable_http import streamable_http_client
 
         provider = self
 
         @contextlib.asynccontextmanager
+        async def opened():
+            # trust_env=False: HTTP(S)_PROXY or the Windows proxy registry must not route loopback
+            # traffic (target bytes, decompiled code) through a proxy.
+            async with httpx2.AsyncClient(
+                timeout=httpx2.Timeout(30.0, read=300.0), trust_env=not loopback, follow_redirects=False
+            ) as http:
+                transport = streamable_http_client(url, http_client=http)
+                async with Client(transport, **provider._client_kwargs()) as client:
+                    yield client
+
+        return opened()
+
+    def _http_connect(self, url: str):
+        provider = self
+
+        @contextlib.asynccontextmanager
         async def connect(owner: _ConnectionOwner):
-            async with Client(url, **provider._client_kwargs()) as client:
+            loopback = provider._check_http_url(url, launched=False)
+            async with provider._open_client(url, loopback=loopback) as client:
                 yield client
 
         return connect
 
     def _launched_connect(self, target: TargetContext | None):
-        from mcp import Client
-
         provider = self
         cfg = self.config
 
@@ -408,9 +444,12 @@ class McpProvider(AnalysisProvider):
             drain: asyncio.Task[None] | None = None
             try:
                 ready = await provider._await_ready(proc, errlog)
-                url = cfg.launch.url_template.format(host=ready["host"], port=int(ready["port"]))
-                if ready["host"] not in {"127.0.0.1", "localhost", "::1"}:
+                if not is_loopback_host(ready["host"]):
                     raise ProviderUnavailable(f"{provider.id}: launched server bound to non-loopback {ready['host']!r}")
+                url = cfg.launch.url_template.format(host=format_host(ready["host"]), port=int(ready["port"]))
+                # The template is operator text: check the URL actually connected to, not only the
+                # announced host (http://example.com:{port}/mcp would otherwise bypass the check).
+                provider._check_http_url(url, launched=True)
 
                 async def drain_stdout() -> None:
                     assert proc.stdout is not None
@@ -419,7 +458,7 @@ class McpProvider(AnalysisProvider):
                         errlog.flush()
 
                 drain = asyncio.create_task(drain_stdout())
-                async with Client(url, **provider._client_kwargs()) as client:
+                async with provider._open_client(url, loopback=True) as client:
                     provider.adapter_state["launched"] = {"pid": proc.pid, "port": ready["port"]}
                     yield client
             finally:
@@ -475,7 +514,10 @@ class McpProvider(AnalysisProvider):
             except ValueError:
                 continue
             if message.get("status") == "ready" and "port" in message:
-                return {"host": str(message.get("host", "127.0.0.1")), "port": int(message["port"])}
+                port = message["port"]
+                if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                    raise ProviderUnavailable(f"{self.id}: readiness line has an invalid port")
+                return {"host": str(message.get("host", "127.0.0.1")), "port": port}
             if message.get("status") == "error":
                 raise ProviderUnavailable(
                     f"{self.id}: server reported startup error {message.get('reason')!r}: "
@@ -673,22 +715,35 @@ class McpProvider(AnalysisProvider):
                 annotations=annotations,
                 manifest=manifest,
                 trust_annotations_default=trust_default,
+                unlisted_class=self.adapter.unlisted_tool_class if self.adapter else None,
             )
-            decision = policy.decide(self.config, tool.name, classification)
+            input_schema = dict(tool.input_schema or {"type": "object", "properties": {}})
+            decision = policy.decide(self.config, tool.name, classification, input_schema=input_schema)
             catalogue[tool.name] = ToolInfo(
                 provider_id=self.id,
                 name=tool.name,
                 description=redact_text(tool.description or "")[:1200],
-                input_schema=dict(tool.input_schema or {"type": "object", "properties": {}}),
+                input_schema=input_schema,
                 annotations=annotations,
                 classification=classification,
                 decision=decision,
+                adapter_only=bool(self.adapter and self.adapter.adapter_only),
             )
         self._tools = catalogue
         return list(catalogue.values())
 
-    async def _raw_call(self, name: str, arguments: dict[str, Any], timeout: float) -> Any:
-        client = await self._client_for(None)
+    async def _raw_call(
+        self, name: str, arguments: dict[str, Any], timeout: float, *, target_sha256: str | None = None
+    ) -> Any:
+        if self.per_target and target_sha256:
+            # Route by the call's own target, never by "whichever target was opened last": another
+            # coroutine may have switched _active_target between opening this target and calling.
+            owner = self._target_owners.get(target_sha256)
+            if owner is None or not owner.alive:
+                raise ProviderUnavailable(f"{self.id}: no live session for target {target_sha256[:12]}; retry")
+            client = owner.client
+        else:
+            client = await self._client_for(None)
         try:
             return await client.call_tool(name, arguments, read_timeout_seconds=timeout)
         except Exception as exc:

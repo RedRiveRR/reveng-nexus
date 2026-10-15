@@ -17,6 +17,10 @@ import yaml
 
 from .errors import ConfigError
 
+# Launch commands that identify a server whose adapter carries its safety gates.
+_FRIDA_LAUNCH = re.compile(r"frida-mobile-mcp", re.IGNORECASE)
+_REA_LAUNCH = re.compile(r"(?:^|[\\/@\s])rea-agents\b|(?:^|[\\/])rea\.mjs$", re.IGNORECASE)
+
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,47}$")
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
@@ -119,6 +123,7 @@ class ProviderConfig:
     command: str | None = None
     args: tuple[str, ...] = ()
     url: str | None = None
+    allow_remote: bool = False  # mcp_http only; also needs policy.allow_remote_providers
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
     capabilities: tuple[str, ...] = ()
@@ -166,8 +171,20 @@ class ProviderConfig:
         url = raw.get("url")
         if ptype in {"mcp_stdio", "mcp_launched_http"} and not (isinstance(command, str) and command.strip()):
             raise _err(provider_id, f"{ptype} requires a command.")
-        if ptype == "mcp_http" and not (isinstance(url, str) and url.startswith("http")):
-            raise _err(provider_id, "streamable_http transport requires an HTTP(S) url.")
+        if ptype == "mcp_http":
+            if not isinstance(url, str):
+                raise _err(provider_id, "streamable_http transport requires an HTTP(S) url.")
+            from .netguard import parse_http_url
+
+            try:
+                parse_http_url(url.strip())
+            except ValueError as exc:
+                raise _err(provider_id, f"url: {exc}.") from None
+        allow_remote = raw.get("allow_remote", False)
+        if not isinstance(allow_remote, bool):
+            raise _err(provider_id, "allow_remote must be true or false.")
+        if allow_remote and ptype != "mcp_http":
+            raise _err(provider_id, "allow_remote applies only to mcp_http providers.")
 
         args = _str_list(raw.get("args", []), "args", provider_id)
         env_raw = raw.get("env", {}) or {}
@@ -193,6 +210,20 @@ class ProviderConfig:
         kind = str(raw.get("kind", "ai" if ptype == "llm4decompile" else "static")).lower()
         if kind not in PROVIDER_KINDS:
             raise _err(provider_id, f"kind must be one of {sorted(PROVIDER_KINDS)}.")
+        if raw.get("adapter"):
+            from .adapters import ADAPTERS
+
+            # An unknown adapter name is reported when that provider starts, not here, so one
+            # bad entry never blocks the others.
+            pinned_adapter = ADAPTERS.get(str(raw["adapter"]).strip())
+            required_kind = pinned_adapter.provider_kind if pinned_adapter else None
+            if required_kind and "kind" not in raw:
+                kind = required_kind
+            elif required_kind and kind != required_kind:
+                raise _err(
+                    provider_id,
+                    f"adapter {raw['adapter']!r} is a {required_kind} provider; kind must be {required_kind!r}.",
+                )
 
         overrides_raw = raw.get("tool_overrides", {}) or {}
         if not isinstance(overrides_raw, dict) or not all(
@@ -278,17 +309,37 @@ class ProviderConfig:
         if cwd is not None and not isinstance(cwd, str):
             raise _err(provider_id, "cwd must be a string path.")
 
+        adapter_name = str(raw["adapter"]).strip() if raw.get("adapter") else None
+        launch_words = [str(command or "")] + [str(a) for a in args]
+        # Servers whose gates live in their adapter must never run without it: an adapter-less Frida
+        # Mobile MCP is a static provider (verb heuristic, no device check) and an adapter-less REA
+        # offers raw passthrough to its whole catalogue.
+        for pattern, needed in ((_FRIDA_LAUNCH, "frida_mobile"), (_REA_LAUNCH, "rea")):
+            if adapter_name != needed and any(pattern.search(word) for word in launch_words):
+                raise _err(provider_id, f"this command launches a server that needs adapter: {needed}.")
+        engine = str(raw.get("engine", "")).strip().lower()
+        if adapter_name == "re_mcp":
+            # One adapter serves both re-mcp backends; the engine label decides the engine family,
+            # so free text (or a Ghidra default on re-mcp-ida) would make one engine look independent.
+            backend = next((b for b in ("ida", "ghidra") if any(f"re-mcp-{b}" in w for w in launch_words)), None)
+            if engine and engine not in {"ghidra", "ida"}:
+                raise _err(provider_id, "adapter re_mcp needs engine: ghidra or engine: ida.")
+            if backend and engine and engine != backend:
+                raise _err(provider_id, f"engine {engine!r} contradicts the re-mcp-{backend} package.")
+            engine = engine or backend or ""
+
         return cls(
             id=provider_id,
             name=str(raw.get("name", provider_id)).strip(),
             enabled=bool(raw.get("enabled", False)),
             type=ptype,
-            adapter=(str(raw["adapter"]).strip() if raw.get("adapter") else None),
-            engine=str(raw.get("engine", "")).strip().lower(),
+            adapter=adapter_name,
+            engine=engine,
             kind=kind,
             command=str(command).strip() if command else None,
             args=args,
             url=str(url).strip() if url else None,
+            allow_remote=allow_remote,
             env={str(k): str(v).lower() if isinstance(v, bool) else str(v) for k, v in env_raw.items()},
             cwd=cwd,
             capabilities=capabilities,
@@ -324,6 +375,7 @@ class PolicyConfig:
     code_execution_providers: tuple[str, ...] = ()
     allow_lifecycle_passthrough: bool = False
     allow_remote_ai: bool = False
+    allow_remote_providers: bool = False
     dynamic: DynamicPolicy = field(default_factory=DynamicPolicy)
     global_blocked_tool_patterns: tuple[str, ...] = ()
 
@@ -452,14 +504,18 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> NexusC
             "policy.dynamic_analysis.enabled requires non-empty authorized_devices and "
             "authorized_targets (the device ids and app identifiers you are authorised to test)."
         )
+    if _bool(policy_raw.get("allow_lifecycle_passthrough", False), "policy.allow_lifecycle_passthrough"):
+        raise ConfigError(
+            "policy.allow_lifecycle_passthrough was removed: lifecycle tools take filesystem paths that bypass "
+            "workspace.allowed_roots. Admit targets with nexus_inspect_target instead."
+        )
     policy = PolicyConfig(
         read_only=read_only_value,
         allow_code_execution=_bool(policy_raw.get("allow_code_execution", False), "policy.allow_code_execution"),
         code_execution_providers=_str_list(policy_raw.get("code_execution_providers", []), "code_execution_providers"),
-        allow_lifecycle_passthrough=_bool(
-            policy_raw.get("allow_lifecycle_passthrough", False), "policy.allow_lifecycle_passthrough"
-        ),
+        allow_lifecycle_passthrough=False,
         allow_remote_ai=_bool(policy_raw.get("allow_remote_ai", False), "policy.allow_remote_ai"),
+        allow_remote_providers=_bool(policy_raw.get("allow_remote_providers", False), "policy.allow_remote_providers"),
         dynamic=dynamic,
         global_blocked_tool_patterns=blocked,
     )

@@ -33,6 +33,10 @@ TOOL_CLASS_DESCRIPTIONS = {
 # Argument names that identify a device or an analysed app/process in dynamic tools.
 _DEVICE_ARGS = ("device", "device_id", "deviceId", "serial")
 _TARGET_ARGS = ("target", "package", "package_name", "bundle_id", "identifier", "app", "app_id")
+# Classes an operator `tool_overrides` entry may tighten (to "blocked") but never relax.
+# "lifecycle" tools take filesystem paths (open_idb path/idb_out, open_database file_path,
+# load_apk apkPath) that the workspace guard never sees, so they cannot become "read" either.
+_UNRELAXABLE = frozenset({"blocked", "execute", "dynamic", "lifecycle"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +61,22 @@ class PolicyDecision:
         }
 
 
+def _declared_arguments(schema: dict[str, Any] | None) -> frozenset[str] | None:
+    """Argument names a tool's input schema declares; None when the schema does not enumerate them."""
+    if not isinstance(schema, dict):
+        return None
+    props = schema.get("properties")
+    if not isinstance(props, dict) or (not props and schema.get("additionalProperties") is not False):
+        return None
+    return frozenset(props)
+
+
+def _undeclared(arguments: dict[str, Any] | None, declared: frozenset[str] | None) -> list[str]:
+    if not arguments or declared is None:
+        return []
+    return sorted(k for k in arguments if k not in declared)[:8]
+
+
 class PolicyEngine:
     def __init__(self, config: NexusConfig) -> None:
         self.config = config
@@ -71,25 +91,39 @@ class PolicyEngine:
         annotations: dict[str, Any] | None = None,
         manifest: dict[str, str] | None = None,
         trust_annotations_default: bool = False,
+        unlisted_class: str | None = None,
     ) -> ToolClassification:
         patterns = (*self.policy.global_blocked_tool_patterns, *provider.blocked_tool_patterns)
         if patterns and matches_patterns(tool_name, patterns):
             return ToolClassification("blocked", "pattern")
 
-        if tool_name in provider.tool_overrides:
-            return ToolClassification(provider.tool_overrides[tool_name], "override")
-        if manifest and tool_name in manifest:
-            return ToolClassification(manifest[tool_name], "manifest")
-
         heuristic = heuristic_tool_class(tool_name)
+        pinned = manifest.get(tool_name) if manifest else None
+        if pinned is None and unlisted_class is not None:
+            pinned = unlisted_class
+        if tool_name in provider.tool_overrides:
+            override = provider.tool_overrides[tool_name]
+            # An override may tighten but never relax a hard block, a lifecycle tool or an
+            # execution/instrumentation class, whether it comes from the pinned manifest or from the
+            # tool's name (an unlisted "frobnicate_exec_shell" keeps its execute-shaped heuristic).
+            protected = {c for c in (pinned, heuristic) if c in _UNRELAXABLE}
+            if not protected or override == "blocked" or protected == {override}:
+                return ToolClassification(override, "override")
+        if pinned is not None:
+            return ToolClassification(pinned, "manifest")
+
         trust = provider.trust_annotations
         if trust is None:
             trust = trust_annotations_default
         if trust and annotations:
             if annotations.get("readOnlyHint") is True:
-                # A read-only hint never overrides an execution/instrumentation-shaped name.
-                if heuristic in {"execute", "dynamic"}:
+                # A read-only hint is the upstream's own claim: it never overrides an execution,
+                # instrumentation or mutation-shaped name (an unlisted "patch_bytes" or
+                # "open_database" flagged readOnlyHint stays blocked under read-only policy).
+                if heuristic in {"execute", "dynamic", "mutate"}:
                     return ToolClassification(heuristic, "heuristic")
+                if matches_patterns(tool_name, DEFAULT_BLOCKED_TOOL_PATTERNS):
+                    return ToolClassification("mutate", "pattern")
                 return ToolClassification("read", "annotations")
             if annotations.get("destructiveHint") is True or annotations.get("readOnlyHint") is False:
                 if heuristic in {"execute", "dynamic"}:
@@ -109,8 +143,10 @@ class PolicyEngine:
         *,
         internal: bool = False,
         arguments: dict[str, Any] | None = None,
+        input_schema: dict[str, Any] | None = None,
     ) -> PolicyDecision:
         cls, src = classification.tool_class, classification.source
+        declared = _declared_arguments(input_schema)
 
         def deny(reason: str) -> PolicyDecision:
             return PolicyDecision(False, cls, src, reason)
@@ -121,15 +157,18 @@ class PolicyEngine:
         if cls == "blocked":
             return deny("tool is on a deny-list or hard-blocked by the adapter")
         if provider.kind == "dynamic" or cls == "dynamic":
-            return self._decide_dynamic(provider, tool_name, cls, src, arguments or {})
+            return self._decide_dynamic(provider, tool_name, cls, src, arguments, declared, internal)
+        extra = _undeclared(arguments, declared)
+        if extra and not internal and cls != "unknown":
+            return deny(f"arguments not declared by the tool's input schema: {extra}")
         if cls == "read":
             return allow("read-only observation")
         if cls == "lifecycle":
-            if internal or self.policy.allow_lifecycle_passthrough:
+            if internal:
                 return allow("session lifecycle tool used by the gateway adapter")
             return deny(
-                "session lifecycle tools are managed by the gateway; use nexus_* tools or set "
-                "policy.allow_lifecycle_passthrough"
+                "session lifecycle tools are managed by the gateway and take filesystem paths outside the "
+                "workspace guard; they are never forwarded for a caller (use nexus_inspect_target and nexus_* tools)"
             )
         if cls == "mutate":
             if self.policy.read_only:
@@ -148,11 +187,26 @@ class PolicyEngine:
         return deny("tool is unclassified; classify it explicitly with tool_overrides after reviewing it")
 
     def _decide_dynamic(
-        self, provider: ProviderConfig, tool_name: str, cls: str, src: str, arguments: dict[str, Any]
+        self,
+        provider: ProviderConfig,
+        tool_name: str,
+        cls: str,
+        src: str,
+        arguments: dict[str, Any] | None,
+        declared: frozenset[str] | None = None,
+        internal: bool = False,
     ) -> PolicyDecision:
+        # arguments=None: a catalogue (listing) decision; the per-call schema and device checks
+        # below run only when a call's actual arguments are known.
+        listing = arguments is None
+        arguments = arguments or {}
         dyn = self.policy.dynamic
         if not dyn.enabled:
             return PolicyDecision(False, cls, src, "dynamic analysis is disabled (policy.dynamic_analysis.enabled)")
+        if cls == "lifecycle" and internal:
+            return PolicyDecision(True, cls, src, "gateway-internal cleanup on a dynamic provider")
+        if cls == "lifecycle":
+            return PolicyDecision(False, cls, src, "lifecycle tools are gateway-internal; never forwarded for a caller")
         if cls in {"execute", "mutate", "blocked", "unknown"}:
             return PolicyDecision(False, cls, src, f"{cls} tools stay blocked on dynamic providers")
         if cls != "read" and tool_name not in dyn.allowed_tools:
@@ -170,6 +224,28 @@ class PolicyEngine:
             value = arguments.get(key)
             if isinstance(value, str) and value and value not in dyn.authorized_targets:
                 return PolicyDecision(False, cls, src, f"target {value!r} is not authorised")
+        if declared is None and not internal and not listing:
+            # Without an enumerated schema the decoy and explicit-device checks cannot work: fail closed.
+            return PolicyDecision(False, cls, src, "dynamic tools need an input schema that enumerates its arguments")
+        extra = _undeclared(arguments, declared)
+        if extra:
+            # Upstream schemas silently drop unknown keys, so an undeclared argument could only
+            # serve to satisfy a Nexus check (e.g. a decoy "target") without reaching the tool.
+            return PolicyDecision(False, cls, src, f"arguments not declared by the tool's input schema: {extra}")
+        for key in _TARGET_ARGS:
+            value = arguments.get(key)
+            if value is not None and not isinstance(value, str):
+                # e.g. a numeric attach_process target is a pid (session.ts:81), not an authorised app id
+                return PolicyDecision(False, cls, src, f"{key!r} must be an authorised app identifier string")
+        device_keys = [k for k in _DEVICE_ARGS if declared and k in declared]
+        if (
+            not listing
+            and device_keys
+            and not any(isinstance(arguments.get(k), str) and arguments.get(k) for k in device_keys)
+        ):
+            # Without an explicit device, upstreams fall back to an environment default, the first
+            # USB device or the local host (frida-mobile-mcp device/resolver.ts:42-61).
+            return PolicyDecision(False, cls, src, "dynamic calls must name an authorised device explicitly")
         if cls != "read" and not any(isinstance(arguments.get(k), str) and arguments.get(k) for k in _TARGET_ARGS):
             return PolicyDecision(False, cls, src, "instrumentation calls must name an authorised target explicitly")
         return PolicyDecision(True, cls, src, "authorised dynamic-analysis call")

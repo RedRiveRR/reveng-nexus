@@ -249,7 +249,7 @@ MCPYGHIDRA = McPyGhidraAdapter(
         "end_trans": "mutate",
         "create_struct": "mutate",
         "add_field": "mutate",
-        "open_program": "mutate",
+        "open_program": "lifecycle",  # GUI-only upstream; imports an arbitrary path_or_name (tools/open_program.py)
         "pyghidra": "execute",
     },
     bindings={

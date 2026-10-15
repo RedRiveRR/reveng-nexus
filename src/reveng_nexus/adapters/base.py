@@ -66,6 +66,17 @@ class McpAdapter:
     trust_annotations: bool = False
     protocol_mode: str = "legacy"
     limitations: tuple[str, ...] = ()
+    # Class of a tool missing from the pinned manifest. None: fall back to the verb heuristic.
+    # "unknown" (blocked until an operator classifies it) or "blocked" (never forwarded, not even
+    # through tool_overrides) for upstreams whose catalogue was reviewed tool by tool.
+    unlisted_tool_class: str | None = None
+    # True: the upstream is reachable only through this adapter's normalised operations; raw
+    # passthrough (nexus_call_provider_tool, namespaced tools) is refused. For upstreams whose
+    # tools take arbitrary filesystem paths that Nexus cannot confine.
+    adapter_only: bool = False
+    # Set when the upstream is inherently of one kind (Frida: "dynamic"); the provider config
+    # must then declare the same kind, so gating can never be skipped by omitting it.
+    provider_kind: str | None = None
 
     # -- capability checks ---------------------------------------------------
     def capabilities(self, provider: McpProvider) -> dict[str, dict[str, Any]]:

@@ -520,10 +520,11 @@ class NexusServer:
             if self._background_start:
                 await self.manager.wait_until_started()
             for provider in self.manager.providers.values():
-                if not provider.config.expose_tools:
+                adapter = getattr(provider, "adapter", None)
+                if not provider.config.expose_tools or (adapter is not None and adapter.adapter_only):
                     continue
                 for info in await provider.list_tools():
-                    if not info.decision.allowed:
+                    if not info.callable:
                         continue
                     tools.append(
                         self._Tool(

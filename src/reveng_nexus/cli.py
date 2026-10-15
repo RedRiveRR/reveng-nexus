@@ -220,7 +220,7 @@ def cmd_providers_check(args: argparse.Namespace) -> int:
                 "error": manager.provider_errors.get(pid),
                 "skipped": manager.skipped.get(pid),
                 "tools_total": len(tools),
-                "tools_callable": sorted(t.name for t in tools if t.decision.allowed),
+                "tools_callable": sorted(t.name for t in tools if t.callable),
                 "tools_blocked": {t.name: t.decision.reason for t in tools if not t.decision.allowed},
                 "capabilities": caps,
             }

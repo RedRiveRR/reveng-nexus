@@ -23,16 +23,15 @@ compliance.
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import time
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx2 as httpx
 
 from ..errors import ArgumentError, CapabilityUnavailable, PolicyViolation, ProviderCallError, ProviderUnavailable
+from ..netguard import is_loopback_host, parse_http_url
 from ..redaction import redact_text
 from .base import AnalysisProvider, OperationResult, ProviderHealth, TargetContext
 
@@ -55,12 +54,7 @@ def render_assembly(function_name: str, instructions: list[dict[str, Any]]) -> s
 
 
 def _is_loopback(host: str) -> bool:
-    if host in {"localhost"}:
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+    return is_loopback_host(host)
 
 
 class Llm4DecompileProvider(AnalysisProvider):
@@ -70,8 +64,11 @@ class Llm4DecompileProvider(AnalysisProvider):
     def __init__(self, config, runtime) -> None:
         super().__init__(config, runtime)
         self.model_cfg = config.model
-        parsed = urlparse(self.model_cfg.endpoint)
-        self.host = parsed.hostname or ""
+        try:
+            # The HTTP client's own parser, so the checked host is the host connected to.
+            self.host = parse_http_url(self.model_cfg.endpoint).host
+        except ValueError:
+            self.host = ""  # not loopback: refused unless both remote opt-ins are set
         self.base_url = self.model_cfg.endpoint.rstrip("/")
         if self.base_url.endswith("/v1"):
             self.base_url = self.base_url[:-3]
@@ -98,7 +95,11 @@ class Llm4DecompileProvider(AnalysisProvider):
 
     async def initialize(self) -> None:
         self._check_remote_policy()
-        self._client = httpx.AsyncClient(timeout=self.config.timeout_seconds, follow_redirects=False)
+        self._client = httpx.AsyncClient(
+            timeout=self.config.timeout_seconds,
+            follow_redirects=False,
+            trust_env=not _is_loopback(self.host),  # never route loopback inference through a proxy
+        )
         await self._discover_models()
         self.started = True
 

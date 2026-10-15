@@ -22,8 +22,8 @@ policy:
   read_only: true               # block tools that modify analysis databases
   allow_code_execution: false   # tools that run arbitrary code (execute_python, pyghidra, run_script)
   code_execution_providers: []  # must list provider ids explicitly if the above is enabled
-  allow_lifecycle_passthrough: false
   allow_remote_ai: false        # required (with model.allow_remote) for non-loopback model endpoints
+  allow_remote_providers: false # required (with the provider's allow_remote) for a non-loopback mcp_http URL
   dynamic_analysis:
     enabled: false              # Frida etc. stay stopped unless this is true
     authorized_devices: []      # e.g. ["emulator-5554"] — a disposable test device you control
@@ -195,8 +195,10 @@ providers:
     kind: dynamic
     command: npx
     args: ["-y", "frida-mobile-mcp@0.2.3", "--no-mobile-mcp"]
+    # Upstream only honours the value "1" for its FRIDA_MCP_* switches, so these are not a
+    # protection by themselves; Nexus' own hard blocks are. Dynamic calls to tools that take a
+    # device must name an authorised device (no fallback to FRIDA_DEVICE_ID, USB or the host).
     env:
-      FRIDA_DEVICE_ID: "${FRIDA_DEVICE_ID:-}"
       FRIDA_MCP_ALLOW_CUSTOM_SCRIPTS: "0"
       FRIDA_MCP_MEMORY_WRITE: "0"
     protocol_mode: legacy
