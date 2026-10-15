@@ -563,14 +563,17 @@ async def test_timeout_is_bounded_and_provider_stays_usable(
 
 
 async def test_target_open_uses_startup_timeout(config_factory, workspace, apk_sample, tmp_path):
+    # startup_timeout_seconds also bounds the child's MCP handshake, which took up to 2.5 s on an
+    # idle host, so the budget must leave headroom; load_apk sleeps far past both budgets.
+    startup, call = 8, 60
     log = tmp_path / "calls.jsonl"
     provider = adapter_mock(
         "jadx",
         "jadx",
         call_log=log,
-        env={"MOCK_SLOW_TOOL": "load_apk", "MOCK_SLOW_SECONDS": "30"},
-        timeout_seconds=20,
-        startup_timeout_seconds=2,
+        env={"MOCK_SLOW_TOOL": "load_apk", "MOCK_SLOW_SECONDS": "120"},
+        timeout_seconds=call,
+        startup_timeout_seconds=startup,
     )
     mgr = await started(config_factory(workspace, [provider]))
     try:
@@ -578,7 +581,9 @@ async def test_target_open_uses_startup_timeout(config_factory, workspace, apk_s
         t0 = time.monotonic()
         with pytest.raises(CapabilityUnavailable) as info:
             await mgr.perform("apk.manifest", target, {}, provider_id="jadx")
-        assert time.monotonic() - t0 < 15
+        elapsed = time.monotonic() - t0
+        # cut off by the startup budget: not earlier, and long before the ordinary call timeout
+        assert startup - 0.5 <= elapsed < call / 2, elapsed
         assert last_attempt(info)["error"] == "provider_timeout"
         assert mgr.providers["jadx"].adapter_state.get("sessions") == {}
     finally:

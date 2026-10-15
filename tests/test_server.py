@@ -351,3 +351,41 @@ def test_gateway_answers_handshake_while_slow_providers_start(tmp_path, workspac
             assert status["providers"]["slow_engine"]["status"] == "ready", "tool calls wait for startup"
 
     anyio.run(run)
+
+
+@pytest.mark.parametrize("override", [None, "read"])
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("open_database", {"file_path": r"C:\Windows\System32\notepad.exe"}),
+        ("close_database", {"database": "victim", "force": True}),
+    ],
+)
+async def test_lifecycle_tools_are_refused_over_mcp_before_any_provider_call(
+    gateway, elf_sample, tmp_path, tool, arguments, override
+):
+    """nexus_call_provider_tool answers policy_violation for a lifecycle tool and the server never sees it,
+    with or without a target and even when an operator override tries to relax it to read."""
+    log = tmp_path / "calls.log"
+    extra = {"tool_overrides": {tool: override}} if override else {}
+    app = await gateway(
+        [mock_engine("eng", env={"MOCK_CALL_LOG": str(log)}, **extra)],
+        policy={"read_only": override is None},
+    )
+    async with Client(app.server) as client:
+        sha = payload(await client.call_tool("nexus_inspect_target", {"path": str(elf_sample)}))["target"]["sha256"]
+        for scope in ({}, {"target": sha}):
+            result = await client.call_tool(
+                "nexus_call_provider_tool", {"provider_id": "eng", "tool_name": tool, "arguments": arguments, **scope}
+            )
+            body = payload(result)
+            assert result.is_error and body["error"] == "policy_violation", body
+            assert body["details"]["tool_class"] == "lifecycle"
+            assert "never forwarded" in body["message"]
+    assert not log.exists() or log.read_text(encoding="utf-8").splitlines() == [], "the mock server was called"
+    blocked = [
+        json.loads(line)
+        for line in app.manager.audit.path.read_text(encoding="utf-8").splitlines()
+        if '"tool_call_blocked"' in line
+    ]
+    assert [b["tool_name"] for b in blocked] == [tool, tool]
