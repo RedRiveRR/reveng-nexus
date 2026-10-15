@@ -29,7 +29,8 @@
  (formats, + adapter per upstream:    (OpenAI-compatible completions,
  capstone) re_mcp, mcpyghidra,         operator-served model)
            ida_official, ida_rs,
-           binary_ninja, jadx, frida_mobile
+           binary_ninja, jadx, frida_mobile,
+           rea (adapter-only)
 ```
 
 ## Package layout (`src/reveng_nexus/`)
@@ -37,14 +38,14 @@
 | Module | Responsibility |
 |---|---|
 | `config.py` | YAML schema, validation, `${VAR}` expansion, 0.1 key compatibility |
-| `policy.py`, `security.py` | Tool classification (override → adapter manifest → trusted annotations → verb heuristic) and enforcement; deny patterns |
+| `policy.py`, `security.py` | Tool classification (deny patterns → override → adapter manifest or the adapter's unlisted-tool class → trusted annotations → verb heuristic; an override may tighten but never relax `blocked`, `execute`, `dynamic` or `lifecycle`; lifecycle tools are never forwarded for a caller) and enforcement, including refusal of arguments the tool's schema does not declare |
 | `artifacts.py` | `WorkspaceGuard` (allowed roots, traversal, symlink/junction, NTFS ADS, size), hashing, identification, per-provider staged copies |
 | `formats/` | ELF (pyelftools), PE (pefile), Mach-O headers, DEX header, APK + binary AndroidManifest parser, string extraction |
 | `providers/base.py` | `AnalysisProvider` lifecycle, `ToolInfo`, `OperationResult`, policy/timeout/audit wrapper around every raw tool call |
 | `providers/builtin.py` | Always-on static engine |
 | `providers/mcp.py` | Child MCP servers: stdio, Streamable HTTP, launch-then-connect; owner tasks, restart budget, process-tree containment |
 | `providers/llm4decompile.py` | Optional AI decompilation adapter |
-| `adapters/` | Per-upstream bindings of Nexus operations to real tool names, manifests and normalisers, with pinned revisions |
+| `adapters/` | Per-upstream bindings of Nexus operations to real tool names, manifests and normalisers, with pinned revisions. An adapter may also fix the provider kind (`provider_kind`, Frida: `dynamic`), the class of tools missing from its manifest (`unlisted_tool_class`: Frida `unknown`, REA `blocked`) and refuse all raw passthrough (`adapter_only`, REA) |
 | `registry.py` | `ProviderManager`: start/stop with failure isolation, capability registry and duplicate detection, routing, failover, semaphores, conflict-group locks, evidence recording |
 | `compare.py` | Feature-based cross-engine comparison with rebasing and per-group independence |
 | `orchestrator.py` | Workflows and function prioritisation |
@@ -58,6 +59,8 @@
 1. **Configure.** `ProviderConfig` is validated at load time: id, type, command or URL,
    timeouts, priority, `max_concurrency`, `conflict_group`, adapter, `tool_overrides`,
    environment. Unset `${VAR}` references are reported per provider; they never crash the gateway.
+   If the adapter declares a provider kind, an entry without `kind` gets it and a different
+   `kind` is a config error, so dynamic gating cannot be skipped by omission.
 2. **Start.** `ProviderManager.start()` initialises every enabled provider concurrently
    with a startup timeout. A failure is recorded in `provider_errors` and the others
    continue. Dynamic providers are skipped unless dynamic analysis is enabled.
@@ -67,7 +70,10 @@
    Stdio children run under the SDK's Windows Job Object; launched HTTP servers get Nexus's
    own Job Object or POSIX process group.
 4. **Discover.** `tools/list` is paginated to completion; each tool is classified and given
-   a policy decision, which is re-checked on every call with the actual arguments.
+   a policy decision, which is re-checked on every call with the actual arguments and the
+   tool's input schema. For an adapter-only provider (REA) every caller-initiated raw call is
+   refused before policy, and its tools are not exposed in namespaced mode; only the adapter's
+   internal calls reach it.
 5. **Operate.** `perform(operation, target, params)` goes through the adapter. Adapters
    check that their bound tools still exist, prepare a per-target session (open database,
    load APK) using a **staged copy**, call tools, and normalise results while keeping the raw output.
@@ -75,7 +81,8 @@
    owner down. The next call reconnects, up to two restarts with backoff. Timeouts use
    `anyio.fail_after` per tool call, plus a per-operation budget.
 7. **Shut down.** Adapters close their sessions (re-mcp saves only Nexus's private engine
-   database), owners exit, and process trees are terminated.
+   database; the Frida adapter first asks the server to stop all instrumentation, bounded to
+   5 s), owners exit, and process trees are terminated.
 
 ### Timeouts and their bounds (since 2026-10-14)
 
@@ -140,7 +147,8 @@ flagged) and never raises confidence.
 
 ## Why adapters instead of one merged codebase
 
-The engines have different runtimes (JVM, idalib, the Binary Ninja GUI, Node, devices), MCP
+The engines have different runtimes (JVM, idalib, the Binary Ninja GUI, Node, including a
+dedicated Node 24 for REA, devices), MCP
 SDK generations (all current upstreams pin `mcp<2`; the gateway uses 2.3), licences (GPL-3.0,
 no licence at all, DeepSeek model terms) and release cadences. Process boundaries keep each
 one isolated, replaceable and optional. A missing proprietary engine never disables the

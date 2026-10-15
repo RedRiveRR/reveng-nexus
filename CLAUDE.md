@@ -15,14 +15,15 @@ Rules: `docs/OBSIDIAN_WORKFLOW.md`. If the vault is absent, skip this section.
 ## Orientation
 
 - Before changing the design, read the relevant one of `docs/ARCHITECTURE.md`, `docs/PROVIDER_MATRIX.md` or `docs/SECURITY.md`. `docs/TESTING.md` holds the observed test counts; `docs/DEPLOYMENT.md` the permanent Windows layout.
-- Code map: `config.py` (schema) · `policy.py`/`security.py` (tool classification) · `artifacts.py` (workspace guard, hashing, staging) · `formats/` (parsers) · `providers/` (built-in, MCP child, LLM4Decompile) · `adapters/` (one per upstream, pinned) · `registry.py` (lifecycle/routing/locks) · `compare.py` · `orchestrator.py` · `evidence.py` · `report.py` · `server.py` · `cli.py`.
-- Provider status as of 2026-10-14 (states defined in `docs/PROVIDER_MATRIX.md`):
-  - Ghidra (`re_mcp`, `mcpyghidra` adapters) and the built-in engine: `live_analysis_verified`.
+- Code map: `config.py` (schema) · `policy.py`/`security.py` (tool classification; `tool_overrides` can tighten but never relax `blocked`/`execute`/`dynamic`/`lifecycle`; lifecycle tools are never forwarded for a caller) · `netguard.py` (loopback-only HTTP providers unless two opt-ins) · `artifacts.py` (workspace guard, hashing, staging) · `formats/` (parsers) · `providers/` (built-in, MCP child, LLM4Decompile) · `adapters/` (one per upstream, pinned) · `registry.py` (lifecycle/routing/locks) · `compare.py` · `orchestrator.py` · `evidence.py` · `report.py` · `server.py` · `cli.py`.
+- Provider status as of 2026-10-15 (states defined in `docs/PROVIDER_MATRIX.md`):
+  - Ghidra and the built-in engine: `live_analysis_verified`, scoped per operation in `docs/PROVIDER_MATRIX.md` (re-mcp-ghidra: functions/decompile/xrefs-to; MCPyGhidra: decompile only).
   - IDA, Binary Ninja, JADX, Frida: blocked on missing licences, software or devices.
   - `ida_rs`, `binary_ninja`, `jadx` adapters: `mock_tested`, with mock fixtures built from the pinned upstream source (`docs/ADAPTER_CONTRACTS.md`). That is a reading of code, not a live run. Change a mock only to match the pinned source, never to make an adapter test pass.
-  - Frida: `unit_tested` (gating only); it has no mock contract tests.
+  - `re_mcp_ida`: `mock_tested` call path (the shared re_mcp mock imitates Ghidra) plus unit tests of the pinned IDA response shapes; `ida_official`: `unit_tested` (code-execution gate).
+  - Frida: `mock_tested` against a mock built from the pinned source (`tests/test_frida_mocked.py`); live use blocked (no authorised device, dynamic analysis off).
   - LLM4Decompile: `mock_tested` only.
-  - REA: evaluation paused, not integrated. Do not resume without an explicit instruction.
+  - REA (`rea` adapter, npm `rea-agents` 6.5.0 on a dedicated Node 24.21.0): `live_analysis_verified` for exactly two static operations (`js.application`, `electron.fuses`). It is adapter-only: every other REA tool is blocked and raw passthrough is refused. Never launch it through `npx` or register it in Claude Code; widen the allowlist only after reviewing each tool's implementation at the pin.
 
 ## Development rules
 
@@ -57,7 +58,7 @@ Opt-in live Ghidra test: `$env:REVENG_NEXUS_LIVE_GHIDRA="1"; $env:GHIDRA_INSTALL
 ## Remaining integration work (in order)
 
 1. Run `providers check` and a live analysis for the official Hex-Rays `ida-mcp` on a licensed IDA 9.4+. Decide whether reviewed, parameterised IDAPython templates are acceptable; until then it stays code-execution-gated.
-2. Run `ida_rs` / `re_mcp_ida` against a licensed IDA, confirm result shapes, and promote them to runtime-verified.
+2. Run `ida_rs` / `re_mcp_ida` against a licensed IDA, confirm result shapes, and promote them to `live_analysis_verified`.
 3. Build Qtty/jadx-mcp-server with Maven, verify it on an APK created for this project, and compare its exported components with the built-in parser.
 4. Verify Frida Mobile MCP only with an authorised test app/device; keep custom scripts and memory writes disabled.
 5. Verify Binary Ninja MCP's bridge with a valid Binary Ninja installation.

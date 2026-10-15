@@ -6,10 +6,11 @@ project, engine or model listed here.
 
 **Nothing from the upstream projects below is vendored, copied or bundled in this
 repository.** Nexus talks to them as separate processes or services over MCP or HTTP,
-installed by the operator (usually by `uvx`/`npx` resolving a pinned package at run time).
+installed by the operator (usually by `uvx`/`npx` resolving a pinned package at run time; JADX
+MCP from the operator's own checkout, REA from a pinned local npm install).
 Their licences apply to those installations.
 
-Licences were checked at the pinned revisions on 2026-10-13. This is an integration record,
+Licences were checked at the pinned revisions on 2026-10-13 (REA and Node.js on 2026-10-15). This is an integration record,
 not legal advice; re-check the exact versions you deploy.
 
 ## Integration targets
@@ -23,6 +24,8 @@ not legal advice; re-check the exact versions you deploy.
 | [fosdickio/binary_ninja_mcp](https://github.com/fosdickio/binary_ninja_mcp) | `8c5134ee46e2bf44f9a4d846bd971c3e39b3e306`, npm `binary-ninja-mcp` 1.0.0 | **GPL-3.0**. Requires a Binary Ninja licence. | optional separate process over MCP (no linking or copying) |
 | [Qtty/jadx-mcp-server](https://github.com/Qtty/jadx-mcp-server) | `4e6d890d1d3753d2bb47d492a9523ef98874df85` | **No licence file found**, so no redistribution or modification rights are granted. It builds on JADX (Apache-2.0). | optional child process from the operator's own checkout |
 | [monkeywave/frida-mobile-mcp](https://github.com/monkeywave/frida-mobile-mcp) | `b2da55d6429438ed36e829e7478de42430cb4ef9`, npm `frida-mobile-mcp` 0.2.3 | MIT (© 2026 Daniel Baier). Depends on Frida (wxWindows Library Licence). | optional dynamic child process (off by default) |
+| [morluto/rea](https://github.com/morluto/rea) | `3b79af28e80785afce9f5998d8f03289402a1847` (tag `rea-agents-6.5.0`), npm `rea-agents` 6.5.0 (checked 2026-10-15) | MIT (© 2026 morluto). Its runtime dependencies are mostly MIT/ISC/Apache-2.0/BSD-3-Clause/BlueOak-1.0.0; the optional `frida` dependency (LGPL-2.0 WITH WxWindows-exception-3.1) is not installed; its prebuilt Windows addon statically links the MinGW-w64/GCC runtime under the GCC Runtime Library Exception 3.1. The npm package ships its own `THIRD_PARTY_NOTICES.md` and `licenses/` (including the MIT notices for its derived NativeAOT parser and `evmole`); they stay with the operator's install and must be kept by anyone who redistributes REA. | optional child process from the operator's pinned local install (static tools only) |
+| [Node.js](https://nodejs.org/) | 24.21.0 (official win-x64 ZIP, SHA-256 checked against the signed `SHASUMS256.txt`) | MIT (plus the bundled third-party licences in its `LICENSE`) | dedicated runtime for REA, installed by the operator; not distributed |
 | [symgraph/GhidrAssist](https://github.com/symgraph/GhidrAssist) | `db0bb3da678adb453a499a13feea8ed659102bcb` | MIT (© 2025 Jason Tang) | not integrated as a provider; may be pointed at Nexus' loopback HTTP endpoint |
 | [albertan017/LLM4Decompile](https://github.com/albertan017/LLM4Decompile) | `85b364bf093eb2ee4f3687cfe38a203fca89f23e` | Code: MIT (© 2024 albertan017). **Model weights: DeepSeek License Agreement v1.0** (`LICENSE-MODEL`), including the use restrictions in Attachment A. | prompt template only; weights served by the operator; Nexus never downloads them |
 | [ram-elgov/awesome-llm-reverse-engineering](https://github.com/ram-elgov/awesome-llm-reverse-engineering) | `55366aa3d44526ed0a9d3cb7fa01d4d8227d4631` | README states MIT | reading list only |

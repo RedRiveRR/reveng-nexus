@@ -1,6 +1,6 @@
 ---
 type: provider
-state: S3   # S1 real-tested | S2 mock-tested | S3 reviewed only | S4 unavailable | S5 not implemented
+state: reviewed_not_tested   # live_analysis_verified | connection_verified | mock_tested | unit_tested | reviewed_not_tested | blocked | not_integrated
 last_verified: {{date}}
 tags: [provider]
 ---
@@ -13,7 +13,7 @@ tags: [provider]
 | Licence | <as found; note if absent> |
 | Integration method | <stdio / launched HTTP / HTTP / model endpoint / none> |
 | Adapter | `src/reveng_nexus/adapters/<file>.py` |
-| Verification state | <S1–S5 with date and command> |
+| Verification state | <state from docs/PROVIDER_MATRIX.md, with date and command> |
 | Blocked by | <licence / GUI / build tool / device / weights> |
 
 **Observed contract:** <tools, required arguments, quirks — verified facts only>

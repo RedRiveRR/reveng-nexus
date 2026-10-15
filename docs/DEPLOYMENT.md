@@ -13,6 +13,9 @@ machine-specific and lives **outside** the repository. Only this description is 
 | Backups made during migrations | `%LOCALAPPDATA%\RevEngNexus\backups` | old configs, fixture hashes |
 | Ghidra | `%LOCALAPPDATA%\Programs\Ghidra\ghidra_12.1.4_PUBLIC` | official release zip; SHA-256 checked against GitHub's published digest |
 | uvx package caches (re-mcp-ghidra, mcpyghidra) | `%LOCALAPPDATA%\uv\cache` | managed by uv |
+| Node.js for REA (optional, since 2026-10-15) | `%LOCALAPPDATA%\Programs\RevEngNexus\node-v24.21.0-win-x64` | official win-x64 ZIP, signature and SHA-256 verified; used only by REA, not on `PATH` |
+| REA (optional, since 2026-10-15) | `%LOCALAPPDATA%\Programs\RevEngNexus\rea-agents-6.5.0` | own `package.json`, npm cache and empty user config; see [below](#rea-optional-dedicated-node-runtime) |
+| REA home / temp sandbox dirs | `%LOCALAPPDATA%\RevEngNexus\data\rea-home`, `…\data\rea-tmp` | `HOME`/`USERPROFILE`/`TEMP`/`TMP` of the REA child in the example config |
 | Claude Code registration | `%USERPROFILE%\.claude.json` (user scope) | written by `claude mcp add --scope user` |
 
 ## Set up from scratch
@@ -60,16 +63,71 @@ pointing nowhere, and data directories inside OneDrive or Dropbox are reported a
 - **Moving the venv.** Recreate it, then `claude mcp remove reveng-nexus -s user` and
   `claude mcp add …` with the new executable path.
 
+## REA (optional): dedicated Node runtime
+
+REA (npm `rea-agents` 6.5.0) needs Node `^22.19.0 || ^24.11.0 || >=26.0.0`. Rather than change
+the system Node (25.9.0 on the integration machine, outside that range), a separate official
+Node.js 24.21.0 is used for REA only. The system Node, `PATH`, the global npm config and Claude
+Code settings stay untouched. This was set up on 2026-10-15 with the commands below (step 2 is
+the command that was run; steps 1 and 3 summarise the checks).
+
+```powershell
+$p    = "$env:LOCALAPPDATA\Programs\RevEngNexus"
+$node = "$p\node-v24.21.0-win-x64"
+$rea  = "$p\rea-agents-6.5.0"
+
+# 1. Node 24.21.0: from https://nodejs.org/dist/v24.21.0/ fetch node-v24.21.0-win-x64.zip,
+#    SHASUMS256.txt and SHASUMS256.txt.asc. Verify the .asc with the nodejs/release-keys keyring
+#    (gpgv with a throwaway keyring), then the ZIP's SHA-256 against SHASUMS256.txt
+#    (158f7685b44de51f6c0df1d153526cbcd3e1bc739a8dfc607721cef75de9e541), then extract it to $node.
+
+# 2. REA into its own directory, no lifecycle scripts, no optional (frida) or dev dependencies.
+#    The directory holds a private package.json that pins exactly one dependency.
+New-Item -ItemType Directory -Force $rea | Out-Null
+Set-Content -Path "$rea\empty.npmrc" -Value "" -Encoding ascii
+Set-Content -Path "$rea\package.json" -Encoding ascii -Value `
+    '{ "name": "reveng-nexus-rea-runtime", "private": true, "dependencies": { "rea-agents": "6.5.0" } }'
+$env:PATH = "$node;$env:SystemRoot\System32"          # this shell only
+Push-Location $rea
+& "$node\node.exe" "$node\node_modules\npm\bin\npm-cli.js" install `
+    --userconfig "$rea\empty.npmrc" --cache "$rea\npm-cache" --registry https://registry.npmjs.org/ `
+    --ignore-scripts --omit=optional --omit=dev --no-audit --no-fund --save-exact
+Pop-Location
+#    Result on 2026-10-15: 178 locked packages; node_modules\rea-agents byte-identical to the
+#    separately downloaded and hash-checked 6.5.0 tarball; frida not installed.
+
+# 3. Check the installed package against the pin before first use: npm integrity
+#    sha512-C6BG7LyrAdR74mSjertM6PrxJkcNZ2bfQNOJornPo9erDEp2tyPRVYPnV5Yodr+1RqewCQla68WulXlVnveD+A==
+#    and SLSA provenance to tag rea-agents-6.5.0 (commit 3b79af28e80785afce9f5998d8f03289402a1847).
+
+# 4. Sandbox dirs for the REA child.
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\RevEngNexus\data\rea-home", "$env:LOCALAPPDATA\RevEngNexus\data\rea-tmp" | Out-Null
+```
+
+Never run `rea setup` (it edits agent configurations) and never start REA through `npx` or
+register it with Claude Code: Nexus launches it as `node.exe …\rea.mjs mcp` from the `rea` block
+in `config/providers.example.yaml`.
+
+- **Enable:** copy that block into `%LOCALAPPDATA%\RevEngNexus\config\providers.yaml`, set
+  `enabled: true`, then run `--check-config` and `providers check rea`. On the integration machine
+  REA was enabled this way on 2026-10-15, after the final review, with absolute paths and a
+  timestamped backup of the previous file; only the `rea` block was added. Through that config
+  both operations ran, raw calls were refused, and builtin and both Ghidra providers stayed ready.
+- **Remove:** delete the block from `providers.yaml`; optionally delete `$node`, `$rea` and the
+  two sandbox dirs. Nothing else references them.
+- **Residual risk:** the package ships a prebuilt Windows addon whose integrity is checked only
+  against a manifest in the same tarball. See [SECURITY.md](SECURITY.md#residual-risks-and-limitations).
+
 ## Migration performed on 2026-10-13
 
-The first verification used temporary paths under `C:\tmp`. They were replaced as follows:
+The first verification used temporary scratch paths outside the repository. They were replaced as follows:
 
-1. Ghidra moved (not re-downloaded) from `C:\tmp\rnx-tools` to `%LOCALAPPDATA%\Programs\Ghidra`.
+1. Ghidra moved (not re-downloaded) from the scratch directory to `%LOCALAPPDATA%\Programs\Ghidra`.
 2. The evidence DB was copied with `sqlite3.Connection.backup` to the new data dir.
    `PRAGMA integrity_check` returned `ok`, and all data is preserved: 4 cases, 1 target,
    47 evidence records, 3 comparisons. The audit log and reports were copied too.
 3. The old config was moved to `backups\providers.yaml.tmp-paths-2026-10-13`. The original
-   `C:\tmp\rnx-lab` data was left in place as a fallback and can be deleted.
+   scratch data was left in place as a fallback and can be deleted.
 4. The benign fixture was regenerated deterministically (`tests/fixtures/elf_builder.py`)
    into the workspace. Its SHA-256 `59bb6fa4…eef9f` matches the target already in the DB.
 

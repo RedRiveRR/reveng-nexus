@@ -9,6 +9,7 @@ Items are ticked only when the behaviour **and** its tests exist (see `docs/TEST
 - [x] MCP SDK 2.3 server and client integration, tested over a real stdio subprocess and loopback HTTP
 - [x] Stable `nexus_*` catalogue with JSON-schema validation; optional namespaced exposure
 - [x] Policy engine: manifest/annotation/heuristic classification, unknown-tool blocking, code-exec and dynamic gating
+- [x] Overrides cannot relax `blocked`/`execute`/`dynamic`/`lifecycle`; lifecycle tools never forwarded for a caller; undeclared arguments refused; explicit authorised device for dynamic calls (2026-10-15)
 - [x] Metadata-only audit log, redaction
 - [x] Workspace guard, SHA-256 identity, hash-verified staged copies
 - [x] Permanent Windows deployment (`docs/DEPLOYMENT.md`), static `--check-config` diagnostics, `config init --create-dirs`
@@ -17,13 +18,16 @@ Items are ticked only when the behaviour **and** its tests exist (see `docs/TEST
 ## Phase 1: verified provider adapters
 
 - [x] Pin upstream commits/packages and record licences (PROVIDER_MATRIX, THIRD_PARTY_NOTICES)
-- [x] Ghidra via re-mcp-ghidra 3.0.3: runtime-verified (Ghidra 12.1.4)
-- [x] Ghidra via MCPyGhidra 0.8.0: runtime-verified, including process-tree containment
+- [x] Ghidra via re-mcp-ghidra 3.0.3: `live_analysis_verified` for functions, decompile and xrefs (Ghidra 12.1.4)
+- [x] Ghidra via MCPyGhidra 0.8.0: `live_analysis_verified` for decompile, including process-tree containment
 - [x] Adapter contract tests against real MCP mock servers; child error translation, timeouts, crash isolation
 - [x] Per-provider timeouts, concurrency limits, conflict-group locks, restart budget
+- [x] Frida Mobile MCP mock contract tests from the pinned source (2026-10-15)
+- [x] REA 6.5.0 as an adapter-only static provider on a dedicated Node 24: `js.application` and `electron.fuses` `live_analysis_verified` (2026-10-15)
 - [ ] Runtime verification: official IDA MCP, ida-mcp-rs, re-mcp-ida (needs licensed IDA)
 - [ ] Runtime verification: JADX MCP (needs a Maven build), Binary Ninja MCP (needs Binary Ninja)
 - [ ] Runtime verification: Frida Mobile MCP (needs an authorised test device)
+- [ ] Any further REA tool (each needs a review of its implementation at the pin first)
 
 ## Phase 2: normalised evidence
 

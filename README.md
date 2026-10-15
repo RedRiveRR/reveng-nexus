@@ -9,15 +9,18 @@ evidence, compares engines without hiding their disagreements, and exports repor
 engine stays a separate, pinned, optional process with its own licence; nothing upstream is
 vendored.
 
-> **Status (0.2.0, 2026-10-13).** The gateway, policy engine, evidence store, comparison
+> **Status (0.2.0, updated 2026-10-15).** The gateway, policy engine, evidence store, comparison
 > and reporting are implemented and tested. Exact, observed test counts for each command
-> are in [docs/TESTING.md](docs/TESTING.md#test-accounting); two tests are
-> environment-gated (opt-in live Ghidra; a symlink test needing Windows Developer Mode).
+> are in [docs/TESTING.md](docs/TESTING.md#test-accounting); three tests are
+> environment-gated (opt-in live Ghidra, opt-in live REA, and a symlink test needing Windows Developer Mode).
 > The **Ghidra path is verified end to end with real Ghidra 12.1.4** through two upstreams
 > (re-mcp-ghidra 3.0.3 and MCPyGhidra 0.8.0), including a permanent Windows deployment and a
-> real Claude Code connection. IDA, Binary Ninja, JADX and Frida adapters are written from
-> the pinned upstream source but **were never executed** here (no licence, GUI, Maven build
-> or test device). LLM4Decompile is tested only against a mock inference endpoint. See
+> real Claude Code connection. Since 2026-10-15, REA (`rea-agents` 6.5.0) is verified live for
+> two static operations only (JavaScript/Electron ASAR analysis and Electron fuses); all its
+> other tools are blocked. IDA, Binary Ninja, JADX and Frida adapters are tested against mocks
+> built from the pinned upstream source but **were never executed** against the real engines
+> here (no licence, GUI, Maven build or test device). LLM4Decompile is tested only against a
+> mock inference endpoint. See
 > [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md) for each provider's verification state.
 
 ## What works today
@@ -25,13 +28,14 @@ vendored.
 | Area | State |
 |---|---|
 | MCP gateway (stdio; loopback Streamable HTTP) | working; tested over a real stdio subprocess and over HTTP |
-| Built-in engine: ELF/PE/Mach-O/DEX/APK parsing, strings, Capstone disassembly, AndroidManifest decoding | working, always available |
-| Ghidra via `re-mcp-ghidra` (stdio) and `mcpyghidra-headless` (launched HTTP) | working (runtime-verified) |
+| Built-in engine: ELF/PE/Mach-O/DEX/APK parsing, strings, Capstone disassembly, AndroidManifest decoding | working, always available; verified on the generated ELF/PE/Mach-O/APK fixtures for the operations listed in [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md) (Mach-O: headers only) |
+| Ghidra via `re-mcp-ghidra` (stdio) and `mcpyghidra-headless` (launched HTTP) | working: `live_analysis_verified` for the operations listed per upstream in [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md) (decompile on both; functions and xrefs on re-mcp-ghidra) |
 | Routing, sequential failover, per-provider concurrency, conflict-group locks, duplicate-capability detection | working (tested with real MCP mock engines) |
 | Cross-engine comparison (rebased identity, callees, constants, strings, call targets; per-group independence) | working |
 | Evidence store (SQLite, migrations), cases, findings, reviews, Markdown/JSON reports | working |
 | Policy: read-only, code execution, dynamic analysis, workspace guard, audit, redaction | enforced and tested |
-| IDA (official / ida-mcp-rs / re-mcp-ida), Binary Ninja, JADX, Frida | adapters exist; **not runtime-tested here** |
+| REA: static JavaScript/Electron (ASAR) analysis and Electron fuses | working for these two operations (`live_analysis_verified`, opt-in; disabled in the example config); every other REA tool blocked |
+| IDA (official / ida-mcp-rs / re-mcp-ida), Binary Ninja, JADX, Frida | adapters exist (mock-tested, except `ida_official`: gating only); **not runtime-tested here** |
 | LLM4Decompile | adapter tested against a mock OpenAI-compatible server only |
 
 ## Quick start (Windows PowerShell, Ghidra-first, no commercial software)
@@ -106,9 +110,10 @@ For MCP clients that only speak HTTP (for example GhidrAssist's MCP client):
 | Native static | `nexus_analyze_binary`, `nexus_get_binary_metadata`, `nexus_list_functions`, `nexus_decompile_function`, `nexus_disassemble_function`, `nexus_get_xrefs`, `nexus_get_control_flow`, `nexus_search_strings`, `nexus_compare_function` |
 | AI (optional) | `nexus_ai_decompile` (always `ai_generated` / `unverified`) |
 | Android | `nexus_analyze_apk`, `nexus_inspect_android_components`, `nexus_get_class_source` (JADX) |
+| JavaScript/Electron (REA) | `nexus_analyze_javascript_app` (ASAR parsed as inert text), `nexus_get_electron_fuses` |
 | Dynamic | `nexus_dynamic_analysis_status` (read-only status; instrumentation is policy-gated) |
 | Findings/evidence | `nexus_record_finding`, `nexus_get_findings`, `nexus_record_evidence`, `nexus_get_evidence`, `nexus_review`, `nexus_export_report` |
-| Escape hatch | `nexus_call_provider_tool` (raw upstream tool, policy-checked and audited) |
+| Escape hatch | `nexus_call_provider_tool` (raw upstream tool, policy-checked and audited; refused for adapter-only providers such as REA) |
 
 Every result carries an `evidence_id` and provenance (provider, original tool, engine,
 engine family, version, raw-output hash). `server.tool_mode: namespaced` additionally
@@ -125,7 +130,8 @@ citing evidence ids → `nexus_review` → `nexus_export_report`.
 | `ida_official`, `ida_rs`, `re_mcp_ida` | A licensed IDA Pro 9.4+ (idalib). The official server analyses only through `execute_python`, which stays blocked unless you enable `policy.allow_code_execution` for it. Enable **one** IDA controller per installation (they share `conflict_group: ida`). |
 | `binary_ninja` | A licensed Binary Ninja with the `binary_ninja_mcp` plugin running its server on `127.0.0.1:9009`, and the target open in the GUI. |
 | `jadx` | A checkout of Qtty/jadx-mcp-server built with Maven (`mvn clean package`, JDK 17+), its Python venv, and `JADX_MCP_HOME` set. |
-| `frida_mobile` | An authorised, disposable test device with frida-server, plus `policy.dynamic_analysis` with explicit `authorized_devices`, `authorized_targets` and `allowed_tools`. |
+| `frida_mobile` | An authorised, disposable test device with frida-server, plus `policy.dynamic_analysis` with explicit `authorized_devices`, `authorized_targets` and `allowed_tools`. Instrumentation calls must name the authorised device and target explicitly. |
+| `rea` | A dedicated Node 22.19+/24.11+ and a pinned local `rea-agents` 6.5.0 install, never `npx` (see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#rea-optional-dedicated-node-runtime)). |
 | `llm4decompile` | A locally served LLM4Decompile checkpoint behind `/v1/completions` (e.g. vLLM). Weights are under the DeepSeek model licence. |
 
 ## Documentation

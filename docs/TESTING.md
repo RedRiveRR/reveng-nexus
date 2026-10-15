@@ -5,28 +5,38 @@
 ```powershell
 python -m pytest -q                                   # default suite (no external engines)
 $env:REVENG_NEXUS_LIVE_GHIDRA = "1"                   # opt-in: real Ghidra
-$env:GHIDRA_INSTALL_DIR = "C:\tools\ghidra_12.1.4_PUBLIC"
+$env:GHIDRA_INSTALL_DIR = "$env:LOCALAPPDATA\Programs\Ghidra\ghidra_12.1.4_PUBLIC"
 python -m pytest tests/integration -m integration -v
+
+$env:REVENG_NEXUS_LIVE_REA = "1"                      # opt-in: real REA (pinned install, see DEPLOYMENT.md)
+$env:REA_NODE  = "$env:LOCALAPPDATA\Programs\RevEngNexus\node-v24.21.0-win-x64\node.exe"
+$env:REA_ENTRY = "$env:LOCALAPPDATA\Programs\RevEngNexus\rea-agents-6.5.0\node_modules\rea-agents\scripts\rea.mjs"
+python -m pytest tests/integration/test_rea_live.py -m integration -v
 ```
 
 The default suite needs no proprietary software, network service or device. Upstream
 engines are simulated by **real MCP servers** (`tests/mock_servers/`): processes speaking
 MCP 2.3 over stdio (`mock_engine.py`, which mirrors re-mcp's verified contract) and over
 launched Streamable HTTP (`mock_launched.py`, which mirrors MCPyGhidra's readiness
-protocol). Lifecycle, pagination, timeouts, crashes, failover and process-tree
-containment are therefore exercised through the real SDK and real subprocesses.
+protocol). Per-upstream mocks follow the pinned contracts in
+[ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md): `mock_adapters.py` (ida-mcp-rs, Binary Ninja,
+JADX), `mock_frida.py` (Frida Mobile MCP; never imports or runs Frida) and `mock_rea.py`
+(REA; never runs Node or REA). Lifecycle, pagination, timeouts, crashes, failover and
+process-tree containment are therefore exercised through the real SDK and real subprocesses.
 
 Fixtures are **generated from Python source** at test time and never executed:
 `elf_builder.py` (hand-assembled x86-64 ELF with symbols and calls), `pe_builder.py`
-(PE32+ importing `KERNEL32!ExitProcess`) and `apk_builder.py` (ZIP with a binary
-AndroidManifest and a DEX header). No binaries are committed.
+(PE32+ importing `KERNEL32!ExitProcess`), `macho_builder.py` (thin and universal Mach-O),
+`apk_builder.py` (ZIP with a binary AndroidManifest and a DEX header) and
+`electron_builder.py` (an ASAR archive of two small CommonJS files, and the ELF fixture with an
+appended Electron fuse wire; not a real Electron build). No binaries are committed.
 
 ## Coverage map
 
 | Area | Tests |
 |---|---|
 | Configuration parsing, validation, env expansion, 0.1 compatibility, `config init` | `test_config.py`, `test_cli.py` |
-| Policy and classification, heuristics, dynamic gating, hard blocks, deny patterns | `test_security.py` |
+| Policy and classification, heuristics, dynamic gating, hard blocks, deny patterns; `tool_overrides` cannot relax `blocked`/`execute`/`dynamic`/`lifecycle`; lifecycle tools never forwarded for a caller (since 2026-10-15) | `test_security.py` |
 | Redaction, metadata-only audit | `test_redaction_audit.py` |
 | Workspace boundary (outside, relative, `..`, prefix sibling, ADS, symlink, size), hashing, staging | `test_artifacts_formats.py` |
 | ELF/PE/APK parsing, export rules, strings with VAs, malformed inputs | `test_artifacts_formats.py` |
@@ -36,19 +46,24 @@ AndroidManifest and a DEX header). No binaries are committed.
 | Built-in provider operations, hash-change detection, capability errors | `test_builtin_provider.py` |
 | MCP provider lifecycle, paginated discovery, catalogue enforcement, audit, staging, timeout, crash and restart, error normalisation, missing executable and env, dynamic skip, launched HTTP, process-tree reaping, minimal child env, stale engine DB rebuild, handshake bounded by the startup (not per-call) timeout and abandoned without a livelock | `test_mcp_providers.py` |
 | Source-verified adapters (`ida_rs`, `binary_ninja`, `jadx`) against mock MCP servers: config/missing install, discovery and classification, normalised success with evidence provenance, unsupported operations, Binary Ninja wrong-view refusal, error propagation, unexpected payloads, timeout, cancellation, crash/restart, database switching and shutdown | `test_adapters_mocked.py` (mock: `mock_servers/mock_adapters.py`, built from the pinned source: [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)) |
+| Frida Mobile MCP (`frida_mobile`) against a mock of the 32 pinned tools: not started while policy is off, gating without `kind: dynamic`, missing Frida/npx isolation, classification and unmanifested tools, policy blocks before the server, decoy `target` arguments, missing explicit device, status envelopes and in-band errors, `isError`, timeout, cancellation, crash/restart, shutdown detach and orphan check | `test_frida_mocked.py` (mock: `mock_servers/mock_frida.py`) |
+| REA (`rea`) against a mock of the real 207-tool catalogue and Evidence envelope: pin and allowlist, overrides cannot reopen other tools, raw passthrough refused before the server, not exposed in namespaced mode, normalised `js.application` / `electron.fuses` with provenance, wrong digest and malformed answers, timeout and recovery, crash/reconnect, process-tree reaping including a grandchild, REA disabled | `test_rea_mocked.py` (mock: `mock_servers/mock_rea.py`) |
 | Routing priority and preference, duplicate detection, sequential failover, per-provider serialisation, conflict-group locks, parallelism across engines, workflows | `test_routing_orchestrator.py` |
 | LLM4Decompile prompt format, provenance, model verification, substitution refusal, remote-endpoint gating | `test_llm4decompile.py` |
 | Report export (Markdown/JSON), fence-injection safety | `test_report.py` |
 | MCP tool schemas, annotations, validation errors, end-to-end case over MCP, APK tools, namespaced mode, **gateway as a stdio subprocess**, **loopback Streamable HTTP** | `test_server.py` |
 | CLI commands | `test_cli.py` |
 | **Real Ghidra** through re-mcp-ghidra and MCPyGhidra | `tests/integration/test_ghidra_live.py` (opt-in) |
+| **Real REA** 6.5.0 through Nexus (two static operations) | `tests/integration/test_rea_live.py` (opt-in) |
 
 ## Test accounting
 
-The suite collects **260 tests** (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). Two are environment-gated, not failing:
+The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) and the final review to 476 ([table](#final-review-2026-10-15-evening)). Environment-gated tests, not failing:
 
 - `tests/integration/test_ghidra_live.py::test_live_ghidra_providers_end_to_end` is
   skipped unless `REVENG_NEXUS_LIVE_GHIDRA=1` and `GHIDRA_INSTALL_DIR` are set.
+- `tests/integration/test_rea_live.py` (since 2026-10-15) is skipped unless
+  `REVENG_NEXUS_LIVE_REA=1` and `REA_NODE` / `REA_ENTRY` point at existing files.
 - `tests/test_artifacts_formats.py::test_guard_refuses_symlinks` is skipped when the OS
   refuses to create a symlink (Windows without Developer Mode or admin). Its assertion is
   unchanged; on a host that allows symlinks it runs.
@@ -60,6 +75,126 @@ which was a count predicted before the final run, not an observed one. The suite
 already grown from 154 to 160 tests over that session. This session added 5 tests (static
 diagnostics, `config init --create-dirs`, non-loopback HTTP refusal, DNS-rebinding
 rejection, background provider start), giving 165. Every count below was observed.
+
+## Final review (2026-10-15, evening)
+
+Five independent read-only reviews (HTTP/policy/paths, REA, Frida, provider interoperability,
+docs) found 14 more defects; all were fixed with a regression test that failed before the fix
+(list in [SECURITY.md](SECURITY.md#residual-risks-and-limitations)). Observed on the final
+working tree, one pytest process at a time, free memory checked before each run (lowest
+observed: 5.6 GB free):
+
+| Command | Result |
+|---|---|
+| `python -m pytest -q` (default, no live env) | **473 passed, 3 skipped** (live Ghidra, live REA, symlink), 476 collected; 7 min 44 s |
+| `tests/integration/test_ghidra_live.py` with `REVENG_NEXUS_LIVE_GHIDRA=1` (real Ghidra 12.1.4, `re_mcp` and `mcpyghidra`) | **1 passed**, 58 s |
+| `tests/integration/test_rea_live.py` with `REVENG_NEXUS_LIVE_REA=1` (real `rea-agents` 6.5.0) | **1 passed**, 26 s |
+| `test_security.py`, `test_config.py`, `test_net_boundary.py` | 133 passed |
+| `test_audit_regressions.py`, `test_interop_d.py`, `test_mcp_providers.py`, `test_artifacts_formats.py` | 72 passed, 1 skipped (symlink) |
+| `test_rea_mocked.py` | 34 passed |
+| `test_frida_mocked.py` | 57 passed (mock only; no Frida, device or npx) |
+| `test_adapters_mocked.py` | 72 passed |
+| `ruff check`, `ruff format --check` (74 files), `mypy src` (37 files), `compileall` with SyntaxWarning as error | clean |
+| `--check-config` (example config, permanent config) | exit 0 |
+| Permanent evidence DB, `mode=ro` | `integrity_check` ok, 0 foreign-key violations |
+
+After every run only processes that existed before it were running (no Java, Ghidra, REA,
+Node or mock server left). The live tests ran separately, never together. The mock and unit
+results are not live verification: re-mcp-ida, ida_rs, ida_official, Binary Ninja, JADX,
+Frida and LLM4Decompile still have no live run.
+
+## Security audit remediation (2026-10-15)
+
+A five-part read-only audit before enabling REA permanently (HTTP boundary, REA confinement and
+lifecycle passthrough, engine identity and readiness, Frida/policy, public repo and docs). The
+fixes and the tests that pin them are listed in [SECURITY.md](SECURITY.md); the
+"Not tested" table below was updated. Observed after the fixes, on the working tree, each
+command run on its own (one pytest process at a time):
+
+| Command | Result |
+|---|---|
+| `python -m pytest -q` (default, no live env) | **416 passed, 3 skipped** (live Ghidra, live REA, symlink), 419 collected; 6 min 17 s |
+| `tests/integration/test_ghidra_live.py` with `REVENG_NEXUS_LIVE_GHIDRA=1` (real Ghidra 12.1.4, both `re_mcp` and `mcpyghidra`) | **1 passed**, 46 s |
+| `tests/integration/test_rea_live.py` with `REVENG_NEXUS_LIVE_REA=1` (real `rea-agents` 6.5.0) | **1 passed**, 23 s |
+| `test_frida_mocked.py` | 42 passed, 69 s |
+| `test_security.py`, `test_config.py`, `test_net_boundary.py` | 119 passed |
+| `test_rea_mocked.py` | 28 passed |
+| `test_audit_regressions.py`, `test_adapters_mocked.py` | 85 passed |
+| `ruff check`, `ruff format --check` (73 files), `mypy src` (37 files), `compileall` | clean |
+| `--check-config` (example config, permanent config) | exit 0 |
+| Permanent evidence DB, `mode=ro` | `integrity_check` ok |
+
+The two live tests were run separately, not in one combined run with both live switches set;
+an earlier combined attempt was stopped by the host for low memory (no REA, mock or Ghidra
+process was left behind). The live results above are the first after the audit fixes; the
+2026-10-15 REA live result in the next section predates them. Superseded by the
+[final review](#final-review-2026-10-15-evening) above.
+
+## REA integration, Frida contracts and policy fixes (2026-10-15)
+
+Earlier the same day, **before** the security-audit fixes above; its counts (328/325/327) are
+historical, not the current totals.
+
+**REA** (`rea` adapter, npm `rea-agents` 6.5.0 on a dedicated Node 24.21.0; pin and install in
+[PROVIDER_MATRIX.md](PROVIDER_MATRIX.md#rea-rea-static-javascriptelectron-only)):
+- `tests/integration/test_rea_live.py` (opt-in) **passed 1/1 in 10 s** against the real
+  server: handshake and the 207-tool catalogue through Nexus (name hash matches the pin), only
+  the two allowlisted tools allowed, raw passthrough refused, a real `js.application` on a
+  generated ASAR (2 JavaScript files parsed; REA reported the code as never executed) and a real
+  `electron.fuses` on a generated ELF with a fuse wire, evidence stored with target SHA-256,
+  provider, tool, engine version and raw output, cancellation then recovery, no REA Node
+  process left after shutdown, REA disabled (built-in still works, `js.application`
+  unavailable) and re-enabled, fixtures byte-unchanged, nothing written to the REA home dir.
+- `tests/test_rea_mocked.py`: 27 tests passed. Timeout, malformed output, wrong digest,
+  crash/reconnect and process-tree reaping (including a grandchild) are verified **only**
+  against the mock.
+- REA is `live_analysis_verified` for these two static operations only.
+
+**Frida Mobile MCP** (`tests/test_frida_mocked.py`, mock of the 32 pinned tools): `mock_tested`;
+no Frida, device or npx was used, so live use stays blocked. Defects found while reading the
+pinned source and fixed (each pinned by a test that failed before its fix):
+1. A decoy `target` argument authorised tools whose real subject is a session, program or pid.
+   Arguments the tool's input schema does not declare are now refused (dynamic tools always,
+   static tools on caller-initiated calls).
+2. Implicit device fallback (`FRIDA_DEVICE_ID`, first USB device, local host). Dynamic calls to
+   tools that declare a device argument must name an authorised device.
+3. `adapter: frida_mobile` without `kind: dynamic` started as a static provider. Adapters now
+   declare their kind; config forces or validates it.
+4. Tools missing from the pinned manifest fell back to the verb heuristic; now `unknown`.
+5. No detach on shutdown (upstream cleans up only on SIGINT/SIGTERM); the adapter now calls
+   `stop_instrumentation {all: true}` internally.
+6. `get_status` accepted any envelope; it now needs the pinned structured envelope, warns
+   otherwise and raises on an in-band `result.error`.
+
+**General policy fix:** `tool_overrides` were applied before the pinned manifest, so an
+override could relax a hard block, contradicting [SECURITY.md](SECURITY.md). An override can now
+tighten any class but never relax `blocked`, `execute` or `dynamic` (from the manifest or the
+tool's name): `test_tool_overrides_cannot_unblock_adapter_hard_blocks`,
+`test_tool_overrides_cannot_downgrade_execute_or_dynamic`.
+
+**Environment re-check (2026-10-15, read-only):** IDA absent (`IDADIR` unset, no install);
+Binary Ninja absent, nothing listening on `127.0.0.1:9009`; Maven absent, `JADX_MCP_HOME`
+unset, JDK 25 present; no LLM endpoint on ports 8000/8080/11434/1234; frida and adb absent.
+These providers keep their states and blockers.
+
+**Live Ghidra:** re-run on 2026-10-15 in the combined run below: `test_live_ghidra_providers_end_to_end` passed in 51.5 s against Ghidra 12.1.4 (both `re_mcp` and `mcpyghidra`).
+
+| Final run (2026-10-15, working tree) | Collected | Passed | Skipped | Failed | Exit |
+|---|---|---|---|---|---|
+| `python -m pytest -q -p no:cacheprovider -rfEs` | 328 | **325** | 3 (live Ghidra, live REA, symlink) | 0 | 0 |
+| same with `REVENG_NEXUS_LIVE_GHIDRA=1` + `GHIDRA_INSTALL_DIR` and `REVENG_NEXUS_LIVE_REA=1` + `REA_NODE` + `REA_ENTRY` | 328 | **327** | 1 (symlink) | 0 | 0 |
+| live tests within that run | 2 | 2 (Ghidra 51.5 s; REA 20.1 s, real servers) | 0 | 0 | — |
+| of which Frida mock tests (`test_frida_mocked.py`) | 38 | 38 | 0 | 0 | — |
+| of which REA mock tests (`test_rea_mocked.py`) | 27 | 27 | 0 | 0 | — |
+
+| Other check (2026-10-15) | Result |
+|---|---|
+| `ruff check src tests scripts` / `ruff format --check src tests scripts` | all checks passed / 70 files already formatted |
+| `python -m mypy src --ignore-missing-imports` | no issues in 36 source files |
+| `python -m compileall -q src tests scripts` | exit 0 |
+| `--check-config` (example / permanent) | exit 0 / exit 0 |
+| Permanent evidence DB, `mode=ro` | `integrity_check` ok; 0 foreign-key violations; 79 evidence rows (unchanged: tests use temporary stores) |
+| `git diff --check`; secret/privacy scan of every changed and new file | clean / clean |
 
 ## Upstream contract corrections (2026-10-14, evening)
 
@@ -95,7 +230,7 @@ is a reading of code, not a live run.
    [ARCHITECTURE.md](ARCHITECTURE.md#timeouts-and-their-bounds-since-2026-10-14)).
 
 **Baseline against HEAD.** The new tests were run against HEAD `6bbddad` from a byte-identical
-snapshot outside the repository (`PYTHONPATH=C:\tmp\rnx-lab\head-tree\src`, bytecode writing off):
+snapshot outside the repository (`PYTHONPATH=<snapshot>\src`, bytecode writing off):
 34 of the 35 new tests fail there, each for the defect it pins. Exceptions:
 `test_connection_owner_close_is_bounded_when_cooperative_cancel_is_ignored` passes on HEAD too
 (a characterisation test: HEAD's native-cancel fallback already handled it), and
@@ -127,12 +262,12 @@ offsets and truncation at every boundary.
 | Permanent evidence DB, `mode=ro` | `integrity_check` ok; 0 foreign-key violations; schema 1–2; 79 rows; 0 with missing raw output or unknown target |
 | Processes after the runs | no Java, mock-server, pytest or load-generator process left |
 
-Logs: `C:\tmp\rnx-lab\flaky-investigation\final2-*` and `contracts-*` (one `.log` and JUnit `.xml`
-per run, never overwritten).
+Logs: `final2-*` and `contracts-*` in a scratch directory outside the repository (one `.log`
+and JUnit `.xml` per run, never overwritten).
 
 ## Intermittent-failure investigation and adapter mocks (2026-10-14, afternoon)
 
-Durable logs: `C:\tmp\rnx-lab\flaky-investigation\` (one `.log` and one JUnit `.xml` per run, never overwritten; outside the repo).
+Durable logs: a scratch directory outside the repo (one `.log` and one JUnit `.xml` per run, never overwritten).
 
 **Original failure.** The failing run's log, pytest cache and temp directory were already gone, so the test that failed then is **still unidentified**.
 
@@ -260,15 +395,19 @@ Defects found and fixed during live verification, each now covered by a test:
 
 | Item | Reason |
 |---|---|
-| Official Hex-Rays ida-mcp, ida-mcp-rs, re-mcp-ida against real IDA | no IDA Pro licence/installation |
+| Official Hex-Rays ida-mcp, ida-mcp-rs, re-mcp-ida against real IDA | no IDA Pro licence/installation; re-mcp-ida's IDA response shapes are only unit-tested (`test_interop_d.py`), its call path only against the Ghidra-shaped mock |
 | Binary Ninja MCP | no Binary Ninja installation |
 | JADX MCP server | Maven not installed; the JVM daemon cannot be built here |
-| Frida Mobile MCP | no authorised test device (dynamic analysis is disabled by design); **no mock contract tests either**, only policy/gating unit tests |
+| Frida Mobile MCP against real Frida | no authorised test device (dynamic analysis is disabled by design); only `mock_tested` (since 2026-10-15) against a mock built from the pinned source |
 | LLM4Decompile with real weights | no GPU or served checkpoint; weights deliberately not downloaded |
 | GhidrAssist → Nexus over HTTP | no Ghidra GUI session; only Nexus' HTTP endpoint is tested |
 | Linux/macOS | only Windows was available; POSIX branches (process groups) are unexercised |
 | Symlink refusal | needs Developer Mode/admin on this host (junction/symlink code path is skipped, not failed) |
 | ida-mcp-rs, Binary Ninja and JADX against the real upstream | only `mock_tested` (since 2026-10-14): the mock fixtures follow the pinned upstream source ([ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)), which is a reading of code, not a live run; live use is blocked (no IDA licence, Binary Ninja or Maven) |
 | Mach-O symbols, functions and imports | the built-in parser decodes headers, segments, dylibs and `LC_MAIN` only, so `binary.functions` returns nothing for Mach-O |
-| REA (`rea-agents`) | evaluation paused on 2026-10-14; not integrated, no tests (installed Node 25.9.0 is outside its supported range) |
+| REA beyond `js.application` and `electron.fuses` | its other 205 tools are blocked by design and were never called; REA timeout, malformed output, wrong digest, crash/reconnect and grandchild reaping are mock-tested only; REA on a hostile ASAR or a real Electron build was not tried |
+| MCPyGhidra beyond `binary.decompile` live | only decompile is asserted by the live test; metadata and disassemble were observed in manual runs (2026-10-13/14); functions is mock-tested; the xrefs and cfg normalisers are unit-tested against the pinned 0.8.0 shapes; strings/imports/exports have no test |
+| re-mcp-ghidra cfg, strings, imports, exports live | the live test asserts functions, decompile and xrefs only |
+| Binary Ninja full-path identity against a real Binary Ninja | mock-tested only; the real `FileMetadata.filename` format (separators, case, `.bndb` after a save) is unconfirmed |
+| A launched server that binds `0.0.0.0` while announcing `127.0.0.1` | cannot be detected from the readiness line; only the announced host and the final URL are checked |
 | `ida_official`, `re_mcp_ida`, `binary_ninja` via `providers check` | not launched on 2026-10-14, because their `uvx`/`npx` commands would download upstream packages for engines that are not installed |

@@ -59,7 +59,7 @@ providers:
     priority: 10
 
   # --- Ghidra (open-source default path) ---------------------------------------------
-  # jtsylve/re-mcp Ghidra backend, stdio. Runtime-verified: re-mcp-ghidra 3.0.3, Ghidra 12.1.4, JDK 25.
+  # jtsylve/re-mcp Ghidra backend, stdio. Runtime-verified (functions, decompile, xrefs): re-mcp-ghidra 3.0.3, Ghidra 12.1.4, JDK 25.
   # Needs Ghidra 12+ and JDK 21+; uvx downloads the pinned package into an isolated env.
   - id: ghidra_remcp
     name: Ghidra via re-mcp-ghidra
@@ -81,7 +81,7 @@ providers:
     startup_timeout_seconds: 900
 
   # nightwing-us/mcpyghidra: one headless server per target, readiness JSON on stdout,
-  # then Streamable HTTP. Runtime-verified: mcpyghidra 0.8.0 + Ghidra 12.1.4.
+  # then Streamable HTTP. Runtime-verified (decompile only): mcpyghidra 0.8.0 + Ghidra 12.1.4.
   # Same engine family as ghidra_remcp: agreement between the two is consistency only.
   - id: ghidra_mcpy
     name: Ghidra via MCPyGhidra (headless)
