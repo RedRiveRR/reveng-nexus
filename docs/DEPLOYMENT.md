@@ -17,6 +17,8 @@ machine-specific and lives **outside** the repository. Only this description is 
 | REA (optional, since 2026-10-15) | `%LOCALAPPDATA%\Programs\RevEngNexus\rea-agents-6.5.0` | own `package.json`, npm cache and empty user config; see [below](#rea-optional-dedicated-node-runtime) |
 | REA home / temp sandbox dirs | `%LOCALAPPDATA%\RevEngNexus\data\rea-home`, `…\data\rea-tmp` | `HOME`/`USERPROFILE`/`TEMP`/`TMP` of the REA child in the example config |
 | Claude Code registration | `%USERPROFILE%\.claude.json` (user scope) | written by `claude mcp add --scope user` |
+| Dashboard snapshots | `%LOCALAPPDATA%\RevEngNexus\data\dashboard\gateway-<pid>.json` | one file per gateway process, replaced atomically; old files of inactive gateways pruned (10 newest kept, max 7 days); read by `reveng-nexus dashboard` |
+| Dashboard | http://127.0.0.1:8770/ | `& $nx --config $cfg dashboard` (Ctrl+C stops it; loopback only); see [DASHBOARD.md](DASHBOARD.md) |
 
 **Re-established 2026-10-16** after an OS reinstall, with the steps below and in the REA section:
 Ghidra and Node.js re-downloaded and verified (digests as recorded here), REA reinstalled and

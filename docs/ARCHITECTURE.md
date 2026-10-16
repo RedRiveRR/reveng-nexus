@@ -52,7 +52,10 @@
 | `evidence.py` | Evidence store and schema migrations |
 | `report.py` | Markdown and JSON case export |
 | `server.py` | MCP tool catalogue and handlers; stdio and loopback HTTP serving |
-| `cli.py` | `status`, `providers list/check`, `capabilities`, `analyze`, `report`, `serve`, `config check/init` |
+| `cli.py` | `status`, `providers list/check`, `capabilities`, `analyze`, `report`, `serve`, `dashboard`, `config check/init` |
+| `snapshot.py` | Sanitised, read-only state file per running gateway (`<data_dir>/dashboard/gateway-<pid>.json`), written by `serve` in a failure-isolated task; carries the gateway's own policy decisions |
+| `verification.py` | Documented verification state per provider (mirrors PROVIDER_MATRIX.md; checked by a test) |
+| `dashboard/` | Loopback-only, GET-only Starlette app reading snapshots, the audit tail and evidence counts (read-only); static vanilla-JS console ([DASHBOARD.md](DASHBOARD.md)) |
 
 ## Provider lifecycle
 

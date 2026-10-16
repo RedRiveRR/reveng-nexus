@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>RevEng Nexus Console</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Primary">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M6 8l10-5 10 5v16l-10 5-10-5z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M16 3v26M6 8l20 16M26 8L6 24" stroke="currentColor" stroke-width="1" opacity=".45"/></svg>
+        <div><div class="brand-name">RevEng Nexus</div><div class="brand-sub">operations console</div></div>
+      </div>
+      <nav>
+        <a href="#/overview" data-nav="overview"><span class="nav-ico" aria-hidden="true">◈</span>Overview</a>
+        <a href="#/providers" data-nav="providers"><span class="nav-ico" aria-hidden="true">⬡</span>Providers</a>
+        <a href="#/tools" data-nav="tools"><span class="nav-ico" aria-hidden="true">⌘</span>Tools</a>
+        <a href="#/architecture" data-nav="architecture"><span class="nav-ico" aria-hidden="true">⟴</span>Architecture</a>
+        <a href="#/security" data-nav="security"><span class="nav-ico" aria-hidden="true">⛨</span>Security</a>
+        <a href="#/activity" data-nav="activity"><span class="nav-ico" aria-hidden="true">≋</span>Activity</a>
+        <a href="#/definitions" data-nav="definitions"><span class="nav-ico" aria-hidden="true">ⓘ</span>Definitions</a>
+      </nav>
+      <div class="sidebar-foot">Read-only monitor. Nothing here can call a tool or change policy. No authentication: reachable only from this machine, but readable by any process running as your user.</div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menu-btn" aria-label="Toggle navigation" aria-expanded="false">☰</button>
+        <div class="topbar-status" id="topbar-status" aria-live="polite"></div>
+        <div class="topbar-actions">
+          <label class="toggle"><input type="checkbox" id="auto-refresh" checked> <span>Auto-refresh 15 s</span></label>
+          <button class="btn" id="refresh-btn" type="button">Refresh</button>
+        </div>
+      </header>
+      <main id="main" tabindex="-1"><div class="loading" role="status">Loading gateway state…</div></main>
+    </div>
+  </div>
+  <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-labelledby="drawer-title" role="dialog">
+    <div class="drawer-head"><h2 id="drawer-title">Details</h2><button class="icon-btn" id="drawer-close" aria-label="Close details">✕</button></div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

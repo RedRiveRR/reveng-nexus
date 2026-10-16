@@ -220,6 +220,10 @@ def cmd_providers_check(args: argparse.Namespace) -> int:
                 "error": manager.provider_errors.get(pid),
                 "skipped": manager.skipped.get(pid),
                 "tools_total": len(tools),
+                # Explicit counts: the name list below is shortened without --verbose, so its
+                # length is not a count (a 40-name list plus a marker once read as "41 callable").
+                "tools_policy_allowed_count": sum(1 for t in tools if t.decision.allowed),
+                "tools_callable_count": sum(1 for t in tools if t.callable),
                 "tools_callable": sorted(t.name for t in tools if t.callable),
                 "tools_blocked": {t.name: t.decision.reason for t in tools if not t.decision.allowed},
                 "capabilities": caps,
@@ -231,8 +235,9 @@ def cmd_providers_check(args: argparse.Namespace) -> int:
             result = {"health": {"status": "unavailable"}, "error": describe_exception(exc)["message"]}
         if not args.verbose:
             result.pop("tools_blocked", None)
-            if len(result.get("tools_callable", [])) > 40:
-                result["tools_callable"] = result["tools_callable"][:40] + ["..."]
+            callable_names = result.get("tools_callable", [])
+            if len(callable_names) > 40:
+                result["tools_callable"] = callable_names[:40] + [f"... (+{len(callable_names) - 40} more)"]
         report[pid] = result
         status = (result.get("health") or {}).get("status")
         caps = result.get("capabilities") or {}
@@ -327,20 +332,43 @@ def cmd_serve(args: argparse.Namespace) -> int:
         # Answer the MCP handshake immediately; providers (JVMs, uvx installs) start in the
         # background and tool calls wait for startup to finish.
         startup = asyncio.create_task(manager.start())
+        # Read-only state files for `reveng-nexus dashboard` (best effort, never on stdout).
+        snapshots = None
+        from .snapshot import SnapshotWriter, snapshots_enabled
+
+        if snapshots_enabled():
+            snapshots = asyncio.create_task(SnapshotWriter(manager, transport=transport).run())
         try:
             if transport == "http":
                 await serve_http(manager, args.host, args.port, background_start=True)
             else:
                 await serve_stdio(manager, background_start=True)
         finally:
-            if not startup.done():
-                startup.cancel()
-            with contextlib.suppress(BaseException):
-                await startup
+            for task in (snapshots, startup):
+                if task is not None and not task.done():
+                    task.cancel()
+                with contextlib.suppress(BaseException):
+                    if task is not None:
+                        await task
             await manager.close()
 
     asyncio.run(run())
     return 0
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the read-only local dashboard (reads gateway snapshots; starts no provider)."""
+    from .dashboard.app import LOOPBACK_HOSTS, run
+
+    if args.host not in LOOPBACK_HOSTS:
+        print(
+            f"Refusing to serve the dashboard on {args.host!r}: it has no authentication and binds "
+            f"loopback only ({', '.join(LOOPBACK_HOSTS)}).",
+            file=sys.stderr,
+        )
+        return 2
+    config = _load(args)
+    return run(config, args.host, args.port)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -389,6 +417,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8765)
     s.set_defaults(func=cmd_serve)
+
+    d = sub.add_parser("dashboard", help="Serve the read-only local web dashboard (loopback only)")
+    d.add_argument("--host", default="127.0.0.1", help="Loopback address to bind (default 127.0.0.1)")
+    d.add_argument("--port", type=int, default=8770, help="Port (default 8770)")
+    d.set_defaults(func=cmd_dashboard)
 
     cfg = sub.add_parser("config", help="Configuration helpers")
     csub = cfg.add_subparsers(dest="config_command", required=True)

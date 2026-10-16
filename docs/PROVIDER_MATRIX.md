@@ -96,8 +96,11 @@ oldest: awesome-llm-reverse-engineering 2025-07-28). The eleventh, REA, was adde
   `GHIDRA_MCP_DISABLE_EXECUTE=1`, `GHIDRA_MCP_DISABLE_BATCH=1` and
   `GHIDRA_MCP_DISABLE_TOOL_SEARCH=1`. Requires Ghidra 12+ and JDK 21+. Upstream pins
   `mcp<2`; it runs in its own uvx environment, so it never conflicts with the gateway's MCP 2.3.
-- **Observed contract:** 134 tools, all MCP-annotated; 41 remain callable under the default
-  read-only policy. `open_database(file_path, database_id, run_auto_analysis, keep_open,
+- **Observed contract:** 134 tools, all MCP-annotated; **66** are callable under the default
+  read-only policy (60 read by trusted annotation, 6 read by the pinned manifest; 68 blocked:
+  64 mutate, 3 lifecycle, 1 meta-tool). Earlier records said "41": that was the length of the
+  shortened `providers check` list (40 names + `...`), not a count; replaying today's catalogue
+  through the 2026-10-13 policy code also gives 66 ([DASHBOARD.md](DASHBOARD.md#finding-41-callable-versus-66-re-mcp-ghidra-2026-10-16)). `open_database(file_path, database_id, run_auto_analysis, keep_open,
   force_new)` returns immediately; `wait_for_analysis` **requires** `database`.
 - **Live findings (handled by the adapter):**
   - `run_auto_analysis` defaults to **False**. Without it the engine reported 1-byte

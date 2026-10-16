@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,37 @@ from reveng_nexus.config import parse_config  # noqa: E402
 
 MOCK_ENGINE = str(TESTS / "mock_servers" / "mock_engine.py")
 MOCK_LAUNCHED = str(TESTS / "mock_servers" / "mock_launched.py")
+
+# The permanent runtime layout (docs/DEPLOYMENT.md). Tests must never write there.
+PERMANENT_RUNTIME = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "RevEngNexus"
+
+
+def inside_permanent_runtime(path: str | Path) -> bool:
+    resolved = str(Path(path).expanduser().resolve()).casefold()
+    root = str(PERMANENT_RUNTIME.resolve()).casefold()
+    return resolved == root or resolved.startswith(root.rstrip("\\/") + os.sep)
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_permanent_runtime(monkeypatch):
+    """Fail any test whose setup resolves the audit log or evidence store to the permanent runtime.
+
+    Every ProviderManager opens both from its config's data_dir, so a test config that silently
+    resolved to the real deployment would fail here before writing anything.
+    """
+    from reveng_nexus.audit import AuditLog
+    from reveng_nexus.evidence import EvidenceStore
+
+    monkeypatch.delenv("REVENG_NEXUS_CONFIG", raising=False)
+    for cls in (AuditLog, EvidenceStore):
+        original = cls.__init__
+
+        def guarded(self, path, *args, __original=original, __name=cls.__name__, **kwargs):
+            if inside_permanent_runtime(path):
+                raise AssertionError(f"test tried to open the permanent runtime {__name}: {path}")
+            __original(self, path, *args, **kwargs)
+
+        monkeypatch.setattr(cls, "__init__", guarded)
 
 
 @pytest.fixture

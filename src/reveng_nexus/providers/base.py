@@ -332,8 +332,13 @@ class AnalysisProvider(ABC):
             "conflict_group": cfg.conflict_group,
             "max_concurrency": cfg.max_concurrency,
             "timeout_seconds": cfg.timeout_seconds,
+            # Three different counts (docs/DASHBOARD.md "Metric definitions"): tools the upstream
+            # listed, tools the policy allows at all (adapter-internal use included), and raw tools a
+            # caller may invoke directly. An adapter-only provider (REA) has allowed > callable == 0.
             "tool_count": len(self._tools),
+            "policy_allowed_tool_count": sum(1 for t in self._tools.values() if t.decision.allowed),
             "callable_tool_count": sum(1 for t in self._tools.values() if t.callable),
+            "adapter_only": bool(getattr(getattr(self, "adapter", None), "adapter_only", False)),
             "stats": dict(self.stats),
             "last_error": self.last_error,
         }

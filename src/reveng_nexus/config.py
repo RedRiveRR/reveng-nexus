@@ -476,6 +476,11 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> NexusC
         allowed_roots.append(_resolve_relative(expanded, base))
     max_size = workspace.get("max_artifact_size_mb", raw.get("max_target_size_mb", 250))
     max_size = _int(max_size, "'max_target_size_mb'", 1, 1024 * 64)
+    for key in ("data_dir", "allowed_roots"):
+        # 0.1 accepted these at the top level; the workspace section wins. Say so instead of
+        # silently ignoring a top-level value (a misplaced data_dir once sent writes elsewhere).
+        if key in raw and key in workspace and raw[key] != workspace[key]:
+            warnings.append(f"'{key}' is set both at the top level and under 'workspace'; the workspace value is used.")
     data_dir = _resolve_relative(str(workspace.get("data_dir", raw.get("data_dir", "./data"))), base)
     follow_symlinks = _bool(workspace.get("follow_symlinks", False), "workspace.follow_symlinks")
 

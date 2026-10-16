@@ -58,7 +58,7 @@ appended Electron fuse wire; not a real Electron build). No binaries are committ
 
 ## Test accounting
 
-The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) the final review to 476 ([table](#final-review-2026-10-15-evening)) and the follow-up batch to 497 ([table](#follow-up-batch-2026-10-16)); the pre-commit restart-budget fix added one test (498, [table](#re-verification-on-a-reinstalled-machine-2026-10-16)). Environment-gated tests, not failing:
+The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) the final review to 476 ([table](#final-review-2026-10-15-evening)) and the follow-up batch to 497 ([table](#follow-up-batch-2026-10-16)); the pre-commit restart-budget fix added one test (498, [table](#re-verification-on-a-reinstalled-machine-2026-10-16)); the dashboard and tool-count work added 26 (524) and its pre-commit review 10 more (534, [table](#dashboard-and-tool-count-audit-2026-10-16-uncommitted)). Environment-gated tests, not failing:
 
 - `tests/integration/test_ghidra_live.py` (`test_live_ghidra_providers_end_to_end` and, since
   2026-10-16, `test_live_ghidra_operations_per_provider`) is skipped unless `REVENG_NEXUS_LIVE_GHIDRA=1` and `GHIDRA_INSTALL_DIR` are set.
@@ -75,6 +75,46 @@ which was a count predicted before the final run, not an observed one. The suite
 already grown from 154 to 160 tests over that session. This session added 5 tests (static
 diagnostics, `config init --create-dirs`, non-loopback HTTP refusal, DNS-rebinding
 rejection, background provider start), giving 165. Every count below was observed.
+
+## Dashboard and tool-count audit (2026-10-16, uncommitted)
+
+On the reinstalled integration machine, working tree on top of `2bbef45`, one pytest process
+at a time:
+
+| Command | Result |
+|---|---|
+| `.venv\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider` (no live env) | **520 passed, 4 skipped**, 524 collected, exit 0, 7 min 12 s. Skips (`-rs`): live Ghidra ×2 and live REA ×1 (opt-in variables unset), symlink ×1 (no Developer Mode) |
+| `tests/test_dashboard.py` | 26 passed |
+| `tests/integration/test_ghidra_live.py` with `REVENG_NEXUS_LIVE_GHIDRA=1` | **2 passed**, 79 s |
+| `tests/integration/test_rea_live.py` with `REVENG_NEXUS_LIVE_REA=1` | **1 passed**, 15 s |
+| `ruff check`, `ruff format --check` (80 files), `mypy src` (42 files), `compileall` with SyntaxWarning as error, both `--check-config`, `node --check` on the dashboard script, `git diff --check` | clean |
+| Fresh headless Claude Code session (`claude -p`, only `nexus_status` and `nexus_list_providers` allowed) | reveng-nexus connected; both calls returned; ghidra_remcp 134 discovered / 66 allowed / 66 callable; REA 207 / 2 / 0, adapter-only |
+| Dashboard against the permanent config with a real gateway session | `/api/state` reported the live snapshot (same counts), all seven views rendered in headless Edge without errors; listener `127.0.0.1:8770` only |
+
+**Pre-commit review (same day).** Snapshot retention (one atomically replaced file per gateway,
+touch-only heartbeats, bounded owner-scoped pruning), reader retries for Windows sharing
+violations, snapshot file I/O moved off the event loop, history-vs-health labels for audit
+records, a misplaced-`data_dir` config warning and a test guard against the permanent runtime.
+Results after the review:
+
+| Command | Result |
+|---|---|
+| `.venv\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider` (no live env, machine otherwise idle) | **530 passed, 4 skipped**, 534 collected, exit 0, 6 min 58 s; same four skips (`-rs`) |
+| `tests/test_dashboard.py` | 36 passed; the two concurrency tests 10/10 and 15/15 on repetition |
+| `tests/integration/test_ghidra_live.py` (live) | **2 passed**, 74 s |
+| `tests/integration/test_rea_live.py` (live) | **1 passed**, 14 s |
+| ruff, format (80 files), mypy (42 files), compileall, both `--check-config`, `node --check`, `git diff --check` | clean |
+
+Two intermediate full runs failed once each and were investigated: (1) the new concurrency
+test caught a transient Windows sharing violation on read (fixed by the reader retry above);
+(2) `test_adapters_mocked.py::test_target_open_uses_startup_timeout` (unchanged code) missed
+its 8 s mock-handshake budget while headless Edge was rendering the dashboard in parallel; it
+passed 3/3 alone, 75/75 in its file and in the final idle run. It is load-sensitive by design
+(its comment notes a 2.5 s idle handshake).
+
+`test_cancelled_provider_start_is_audited_as_cancelled_not_failed` reproduces the old label
+against the `2bbef45` source (outcome `failed`) and passes on the working tree (`cancelled`).
+The 41-versus-66 replay is described in [DASHBOARD.md](DASHBOARD.md#finding-41-callable-versus-66-re-mcp-ghidra-2026-10-16).
 
 ## Re-verification on a reinstalled machine (2026-10-16)
 
@@ -431,7 +471,7 @@ Maven, adb or Frida.
 | `reveng-nexus --config config/providers.example.yaml --check-config` | valid; exit 0 |
 | `reveng-nexus --config %LOCALAPPDATA%\RevEngNexus\config\providers.yaml --check-config` | valid; 0 diagnostics; exit 0 |
 | Wheel built with `uv build` and installed into a fresh venv | `--version` 0.2.0; `--check-config` ok from outside the repo |
-| `providers check` (permanent config, real Ghidra) | exit 0; `builtin` ready; `ghidra_remcp` ready, 134 tools / 41 callable, 9 binary operations; `ghidra_mcpy` ready (per-target, no live session) |
+| `providers check` (permanent config, real Ghidra) | exit 0; `builtin` ready; `ghidra_remcp` ready, 134 tools / 41 callable (*corrected 2026-10-16: 41 was the length of the shortened `tools_callable` list, 40 names + `...`; the callable count was 66, see [DASHBOARD.md](DASHBOARD.md#finding-41-callable-versus-66-re-mcp-ghidra-2026-10-16)*), 9 binary operations; `ghidra_mcpy` ready (per-target, no live session) |
 | `analyze <workspace>\nexus_fixture.elf --compare` (permanent config) | exit 0; 0 failed steps; 5 functions decompiled by `ghidra_remcp`; `_start` comparison: decompilation `same_family_consistency` (ghidra ×2), disassembly `independent_agreement` (ghidra + capstone), overall `same_family_consistency` / medium |
 | `report <case>` | Markdown/JSON written to the data dir; contains Ghidra's real pseudocode (`add_numbers(2,3)`, `0x1337`) |
 | Evidence retrieval | decompile evidence readable with provider, original tool, engine family and raw-output hash |

@@ -37,6 +37,7 @@ vendored.
 | REA: static JavaScript/Electron (ASAR) analysis and Electron fuses | working for these two operations (`live_analysis_verified`, opt-in; disabled in the example config); every other REA tool blocked |
 | IDA (official / ida-mcp-rs / re-mcp-ida), Binary Ninja, JADX, Frida | adapters exist (mock-tested, except `ida_official`: gating only); **not runtime-tested here** |
 | LLM4Decompile | adapter tested against a mock OpenAI-compatible server only |
+| Local dashboard (`reveng-nexus dashboard`, http://127.0.0.1:8770/) | read-only console over gateway snapshots: health, effective policy, providers, every tool's policy decision, architecture, audit activity; loopback only, GET only ([docs/DASHBOARD.md](docs/DASHBOARD.md)) |
 
 ## Quick start (Windows PowerShell, Ghidra-first, no commercial software)
 
@@ -140,6 +141,7 @@ citing evidence ids → `nexus_review` → `nexus_export_report`.
 - [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md): every upstream: pin, licence, launch command, verification level, limitations
 - [docs/SECURITY.md](docs/SECURITY.md): enforced controls (with tests), residual risks, deployment advice
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): permanent Windows layout, Claude Code registration, changing paths, isolation
+- [docs/DASHBOARD.md](docs/DASHBOARD.md): the local read-only dashboard: architecture, metric definitions, security, the 41-vs-66 tool-count finding
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): environment, checks, how to add an adapter
 - [docs/OBSIDIAN_WORKFLOW.md](docs/OBSIDIAN_WORKFLOW.md): the private project-memory vault and token-saving session workflow
 - [docs/TESTING.md](docs/TESTING.md): what the tests cover, and the exact results from this machine

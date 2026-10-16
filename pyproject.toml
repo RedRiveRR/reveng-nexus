@@ -18,6 +18,7 @@ dependencies = [
   "anyio>=4.9,<5",
   "httpx2>=2.10,<3",
   "uvicorn>=0.31,<1",
+  "starlette>=0.48,<2",  # dashboard (already required by mcp)
   "pyelftools==0.32",
   "pefile==2024.8.26",
 ]

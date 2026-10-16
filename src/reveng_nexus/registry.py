@@ -79,6 +79,11 @@ class ProviderManager:
         self.providers: dict[str, AnalysisProvider] = {}
         self.provider_errors: dict[str, str] = {}
         self.skipped: dict[str, str] = {}
+        # Result of the most recent health() run and when it finished (read by the dashboard
+        # snapshot, which never triggers a liveness probe of its own).
+        self.last_health: dict[str, Any] = {}
+        self.last_health_at: float | None = None
+        self.started_at = time.time()
         self._provider_sems: dict[str, asyncio.Semaphore] = {}
         self._group_locks: dict[tuple[str, str], asyncio.Lock] = defaultdict(asyncio.Lock)
         self._global_sem = asyncio.Semaphore(config.analysis.max_concurrent_provider_calls)
@@ -146,17 +151,21 @@ class ProviderManager:
                 except BaseException as exc:  # noqa: BLE001 - isolate every provider failure
                     if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                         raise
-                    message = (
-                        describe_exception(exc)["message"]
-                        if not isinstance(exc, TimeoutError)
-                        else (f"startup exceeded {provider.config.startup_timeout_seconds}s")
-                    )
+                    # A start cut short by the gateway's own shutdown (e.g. `claude mcp list` stops
+                    # the server after the handshake) is a cancellation, not a provider failure.
+                    cancelled = isinstance(exc, asyncio.CancelledError)
+                    if cancelled:
+                        message = "startup cancelled: the gateway stopped before this provider was ready"
+                    elif isinstance(exc, TimeoutError):
+                        message = f"startup exceeded {provider.config.startup_timeout_seconds}s"
+                    else:
+                        message = describe_exception(exc)["message"]
                     self.provider_errors[provider.id] = message
                     provider.last_error = {"message": message, "at": time.time()}
                     self.audit.write(
                         "provider_started",
                         provider_id=provider.id,
-                        outcome="failed",
+                        outcome="cancelled" if cancelled else "failed",
                         error=message,
                         duration_ms=round((time.monotonic() - started) * 1000),
                     )
@@ -262,6 +271,7 @@ class ProviderManager:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 out[cfg.id] = {"status": "unavailable", "detail": describe_exception(exc)["message"]}
+        self.last_health, self.last_health_at = dict(out), time.time()
         return out
 
     def capability_registry(self) -> dict[str, Any]:
