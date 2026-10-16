@@ -58,10 +58,10 @@ appended Electron fuse wire; not a real Electron build). No binaries are committ
 
 ## Test accounting
 
-The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) and the final review to 476 ([table](#final-review-2026-10-15-evening)). Environment-gated tests, not failing:
+The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) the final review to 476 ([table](#final-review-2026-10-15-evening)) and the follow-up batch to 497 ([table](#follow-up-batch-2026-10-16)); the pre-commit restart-budget fix added one test (498, [table](#re-verification-on-a-reinstalled-machine-2026-10-16)). Environment-gated tests, not failing:
 
-- `tests/integration/test_ghidra_live.py::test_live_ghidra_providers_end_to_end` is
-  skipped unless `REVENG_NEXUS_LIVE_GHIDRA=1` and `GHIDRA_INSTALL_DIR` are set.
+- `tests/integration/test_ghidra_live.py` (`test_live_ghidra_providers_end_to_end` and, since
+  2026-10-16, `test_live_ghidra_operations_per_provider`) is skipped unless `REVENG_NEXUS_LIVE_GHIDRA=1` and `GHIDRA_INSTALL_DIR` are set.
 - `tests/integration/test_rea_live.py` (since 2026-10-15) is skipped unless
   `REVENG_NEXUS_LIVE_REA=1` and `REA_NODE` / `REA_ENTRY` point at existing files.
 - `tests/test_artifacts_formats.py::test_guard_refuses_symlinks` is skipped when the OS
@@ -75,6 +75,78 @@ which was a count predicted before the final run, not an observed one. The suite
 already grown from 154 to 160 tests over that session. This session added 5 tests (static
 diagnostics, `config init --create-dirs`, non-loopback HTTP refusal, DNS-rebinding
 rejection, background provider start), giving 165. Every count below was observed.
+
+## Re-verification on a reinstalled machine (2026-10-16)
+
+The integration machine's OS was reinstalled after the follow-up batch below. The permanent
+layout ([DEPLOYMENT.md](DEPLOYMENT.md)) was rebuilt from the documented steps: Ghidra 12.1.4
+(release ZIP SHA-256 matched GitHub's published digest), Node.js 24.21.0 (`SHASUMS256.txt.asc`
+verified with the nodejs/release-keys keyring; ZIP SHA-256 as recorded), `rea-agents` 6.5.0
+(lockfile integrity as pinned, 178 locked / 146 installed packages, `frida` not installed;
+`npm audit signatures`: 0 invalid, 0 missing; SLSA provenance names commit `3b79af2`), a fresh
+config from `config init` with REA enabled as before, and the regenerated workspace fixture
+(SHA-256 `59bb6fa4…eef9f`, unchanged). The previous evidence DB was not recoverable; a new one
+was created. Python 3.12.15, JDK 21.0.12. Results below are from this machine only:
+
+| Command | Result |
+|---|---|
+| `.venv\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider` (no live env) | **494 passed, 4 skipped**, 498 collected, exit 0, 9 min 31 s. Skip reasons (`-rs`): live Ghidra ×2 and live REA ×1 (opt-in variables unset), symlink ×1 (no Developer Mode) |
+| `tests/integration/test_ghidra_live.py` with `REVENG_NEXUS_LIVE_GHIDRA=1` | **2 passed**, 104 s |
+| `tests/integration/test_rea_live.py` with `REVENG_NEXUS_LIVE_REA=1` | **1 passed**, 19 s |
+| `providers check` on the permanent config | exit 0: builtin, both Ghidra providers and REA ready (REA: 2/2 operations, no raw-callable tool) |
+| `ruff check`, `ruff format --check` (74 files), `mypy src` (37 files), `compileall` with SyntaxWarning as error, both `--check-config`, `git diff --check` | clean |
+| New evidence DB, `mode=ro` | `integrity_check` ok, 0 foreign-key violations |
+
+The pre-commit review on this machine found that a reconnect that failed did not end the restart
+window: after one completed restart more than 10 minutes earlier, a child that no longer started
+was restarted on every caller request. The quiet period now counts from the end of the last
+attempt, successful or not (`test_failed_reconnects_count_against_the_restart_budget`, which
+fails against the previous code: a third attempt is made instead of "restart budget exhausted").
+
+## Follow-up batch (2026-10-16)
+
+Results in this section were observed on the integration machine before its OS reinstall.
+
+Open Issue #12, Issue #27, part of Issue #26, Mach-O symbols and three Ghidra normalisation
+defects found by a new live per-operation test. Observed on the final working tree, one pytest
+process at a time (lowest free memory 6.7 GB):
+
+| Command | Result |
+|---|---|
+| `python -m pytest -q` (default, no live env) | **493 passed, 4 skipped** (two live Ghidra tests, live REA, symlink), 497 collected; 7 min 9 s (after the pre-commit audit) |
+| `tests/integration/test_ghidra_live.py` with `REVENG_NEXUS_LIVE_GHIDRA=1` (real Ghidra 12.1.4) | **2 passed**, 98 s: the end-to-end test and the new per-operation test (both wrappers: metadata, functions, decompile, disassemble, xrefs to/from, cfg, strings, imports, exports on the ELF fixture) |
+| `tests/integration/test_rea_live.py` with `REVENG_NEXUS_LIVE_REA=1` | **1 passed**, 10 s, while the gateway's own REA child kept running (the test counts REA processes it started and orphans whose parent exited) |
+| `test_security.py`, `test_config.py`, `test_net_boundary.py`, `test_server.py` | 148 passed |
+| `test_audit_regressions.py`, `test_interop_d.py`, `test_mcp_providers.py`, `test_artifacts_formats.py`, `test_builtin_fixtures.py` | 104 passed, 1 skipped (symlink) |
+| `test_rea_mocked.py` / `test_frida_mocked.py` / `test_adapters_mocked.py` | 34 / 57 / 75 passed (mock only) |
+| `test_gateway_answers_handshake_while_slow_providers_start`, repeated | 10/10 passed normally; 5/5 passed with 8 busy-loop processes on 8 cores |
+| `ruff check`, `ruff format --check` (74 files), `mypy src` (37 files), `compileall` with SyntaxWarning as error, both `--check-config` | clean |
+| Permanent evidence DB, `mode=ro` | `integrity_check` ok, 0 foreign-key violations |
+
+**Issue #12 (handshake test).** Diagnostic runs outside the suite timed spawn → `initialize` and
+`initialize` → `tools/list` separately: unloaded 1.6-1.9 s with or without the slow provider;
+with 8 CPU hogs a gateway **with no provider at all** took median 6.5 s, max 13.7 s (6/10 over
+the old 6 s limit); with 16 hogs 25-59 s. `tools/list` itself took about 0.01 s throughout. The
+6 s wall clock measured the gateway's own interpreter start, not provider startup. The test now
+checks ordering: the slow mock creates a marker only after its startup delay, and the marker must
+not exist when the handshake returns. With a pre-fix serve order (providers started before
+serving) the check fails (marker present at 11.2 s; checked with a harness that applies the
+test's assertions, because the MCP SDK strips `PYTHONPATH` from the gateway subprocess); under 8 and 16 hogs it passed 8/8 while the
+old check failed 8/8. Issue #8 is unrelated and stays open.
+
+Every new regression test was also run against the pre-change source (`git archive HEAD src`)
+and failed there for the behaviour it pins: Mach-O symbols (6; missing `symbol_table`, no
+functions), ida_rs disassembly count (3; no `count` sent, no warning, 2 lines for `count=1`),
+guard existence oracle (1; filesystem touched), MCPyGhidra entry point and re-mcp CFG targets
+(2). The two restart-budget cases fail there only at setup (the window constant does not exist);
+the behaviour was checked separately: after a quiet period longer than the window, the old code
+refuses with "restart budget exhausted" and the new code reconnects with a fresh budget.
+
+A pre-commit audit then fixed: fat-slice reads not bounded to the slice's declared size, an
+undecodable Mach-O header or a universal file reported as an empty symbol list without a
+warning, an unparseable CFG successor reported as an edge, and the live REA test no longer
+seeing an orphaned REA worker. Each has a regression test that fails against the pre-audit code
+(the orphan case was checked with an inert orphaned Node process).
 
 ## Final review (2026-10-15, evening)
 
@@ -404,10 +476,9 @@ Defects found and fixed during live verification, each now covered by a test:
 | Linux/macOS | only Windows was available; POSIX branches (process groups) are unexercised |
 | Symlink refusal | needs Developer Mode/admin on this host (junction/symlink code path is skipped, not failed) |
 | ida-mcp-rs, Binary Ninja and JADX against the real upstream | only `mock_tested` (since 2026-10-14): the mock fixtures follow the pinned upstream source ([ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)), which is a reading of code, not a live run; live use is blocked (no IDA licence, Binary Ninja or Maven) |
-| Mach-O symbols, functions and imports | the built-in parser decodes headers, segments, dylibs and `LC_MAIN` only, so `binary.functions` returns nothing for Mach-O |
+| Mach-O beyond `LC_SYMTAB` | symbols come from `LC_SYMTAB` only (generated fixtures, unit-tested); function sizes are unknown by format; dyld export tries, chained fixups and `LC_DYSYMTAB` indirect symbols are not decoded; no real-world Mach-O was tried |
 | REA beyond `js.application` and `electron.fuses` | its other 205 tools are blocked by design and were never called; REA timeout, malformed output, wrong digest, crash/reconnect and grandchild reaping are mock-tested only; REA on a hostile ASAR or a real Electron build was not tried |
-| MCPyGhidra beyond `binary.decompile` live | only decompile is asserted by the live test; metadata and disassemble were observed in manual runs (2026-10-13/14); functions is mock-tested; the xrefs and cfg normalisers are unit-tested against the pinned 0.8.0 shapes; strings/imports/exports have no test |
-| re-mcp-ghidra cfg, strings, imports, exports live | the live test asserts functions, decompile and xrefs only |
+| Ghidra beyond the generated ELF | both wrappers are live-verified per operation on one generated static x86-64 ELF only: no PE, Mach-O, PIE, stripped or larger input; neither wrapper reports the entry point; references and strings from non-loaded sections carry no address space upstream |
 | Binary Ninja full-path identity against a real Binary Ninja | mock-tested only; the real `FileMetadata.filename` format (separators, case, `.bndb` after a save) is unconfirmed |
 | A launched server that binds `0.0.0.0` while announcing `127.0.0.1` | cannot be detected from the readiness line; only the announced host and the final URL are checked |
 | `ida_official`, `re_mcp_ida`, `binary_ninja` via `providers check` | not launched on 2026-10-14, because their `uvx`/`npx` commands would download upstream packages for engines that are not installed |

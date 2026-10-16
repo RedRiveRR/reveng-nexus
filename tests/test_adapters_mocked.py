@@ -955,3 +955,23 @@ async def test_lifecycle_tools_never_reach_server_even_with_overrides(
         assert tool not in {c["tool"] for c in calls(log)}
     finally:
         await mgr.close()
+
+
+@pytest.mark.parametrize(("count", "expected", "warned"), [(None, 2, False), (2, 2, True), (1, 1, True)])
+async def test_ida_rs_disassembly_requests_a_count_and_flags_a_listing_at_its_limit(
+    config_factory, workspace, elf_sample, tmp_path, count, expected, warned
+):
+    """disasm_function_at stops after `count` lines (default 200) without saying so
+    (handlers/disasm.rs:245-283): the adapter always sends a count and warns when it is reached."""
+    log = tmp_path / "calls.jsonl"
+    mgr = await started(config_factory(workspace, [adapter_mock("ida", "ida_rs", call_log=log)]))
+    try:
+        target = await target_of(mgr, elf_sample)
+        params = {"address": 0x401000, **({"count": count} if count else {})}
+        out = (await mgr.perform("binary.disassemble", target, params, provider_id="ida"))["result"]
+        assert len(out.normalized["instructions"]) == expected
+        assert any("returned its limit" in w for w in out.warnings) is warned
+        disasm = [c for c in calls(log) if c["tool"] == "disasm_function_at"]
+        assert disasm and "count" in disasm[-1]["arg_keys"]
+    finally:
+        await mgr.close()

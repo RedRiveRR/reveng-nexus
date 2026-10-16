@@ -11,6 +11,8 @@ Behaviour switches (environment variables):
   MOCK_SLOW_LIST_AFTER / MOCK_SLOW_LIST_SECONDS   after N complete listings, sleep before every page
   MOCK_CALL_LOG            append one line per tool call (tool name) to this file
   MOCK_PID_FILE            write this process's pid here (process-cleanup tests)
+  MOCK_STARTED_FLAG        create this file once MOCK_STARTUP_DELAY has elapsed, just before the
+                           MCP server starts (ordering tests: was the gateway answering before it?)
 It only *reads* the file handed to open_database; nothing is executed.
 """
 
@@ -335,6 +337,8 @@ async def main() -> None:
     if os.environ.get("MOCK_PID_FILE"):
         Path(os.environ["MOCK_PID_FILE"]).write_text(str(os.getpid()), encoding="utf-8")
     await anyio.sleep(float(os.environ.get("MOCK_STARTUP_DELAY", "0")))
+    if os.environ.get("MOCK_STARTED_FLAG"):
+        Path(os.environ["MOCK_STARTED_FLAG"]).write_text("started", encoding="utf-8")
     server = Server("mock-engine", version=f"mock-{FLAVOR}", on_list_tools=on_list_tools, on_call_tool=on_call_tool)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())

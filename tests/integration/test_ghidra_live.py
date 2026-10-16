@@ -102,3 +102,73 @@ async def test_live_ghidra_providers_end_to_end(config_factory, workspace, elf_s
         assert "ghidra" in cmp_["engine_families"]
     finally:
         await mgr.close()
+
+
+async def test_live_ghidra_operations_per_provider(config_factory, workspace, elf_sample):
+    """Each read-only operation on both wrappers, checked against the fixture's own layout
+    (tests/fixtures/elf_builder.py). Addresses are file addresses (ET_EXEC at 0x400000)."""
+    from fixtures.elf_builder import GREETING, KEY_LABEL, build_elf
+
+    _blob, fx, symbols = build_elf()
+    strings = {
+        GREETING.rstrip(b"\x00").decode(): symbols["greeting"],
+        KEY_LABEL.rstrip(b"\x00").decode(): symbols["key_label"],
+    }
+    main = fx["main"].address
+    calls = {
+        main + 14: fx["add_numbers"].address,
+        main + 21: fx["check_key"].address,
+        main + 26: fx["get_greeting"].address,
+    }
+    mgr = ProviderManager(config_factory(workspace, [REMCP, MCPY], analysis={"operation_timeout_seconds": 1800}))
+    await mgr.start()
+    try:
+        assert mgr.provider_errors == {}, mgr.provider_errors
+        intake = await mgr.intake(str(elf_sample), case_title="live ghidra per operation")
+        target = mgr.target_context(intake["target"]["sha256"], intake["case_id"])
+
+        async def run(pid, operation, params):
+            out = await mgr.perform(operation, target, params, provider_id=pid, max_failover=0)
+            record = mgr.evidence.get_evidence_record(out["evidence"]["evidence_id"])
+            assert (record["provider_id"], record["target_id"]) == (pid, target.sha256)
+            return out["result"]
+
+        for pid in ("ghidra_remcp", "ghidra_mcpy"):
+            meta = (await run(pid, "binary.metadata", {})).normalized
+            assert (meta["bits"], meta["image_base"], meta["function_count"]) == (64, 0x400000, 5), (pid, meta)
+            # neither wrapper reports the ELF entry point (re-mcp-ghidra has no field; MCPyGhidra's
+            # "entry_point" is its first external entry), so Nexus reports it as unknown
+            assert meta["entry_point"] is None, (pid, meta)
+
+            funcs = {f["name"]: f for f in (await run(pid, "binary.functions", {})).normalized["functions"]}
+            assert {n: f["address"] for n, f in funcs.items()} == {n: f.address for n, f in fx.items()}, pid
+            if pid == "ghidra_remcp":
+                assert {n: f["size"] for n, f in funcs.items()} == {n: f.size for n, f in fx.items()}
+
+            insns = (await run(pid, "binary.disassemble", {"name": "main"})).normalized["instructions"]
+            assert insns[0]["address"] == main and insns[-1]["mnemonic"] == "ret", (pid, insns)
+            assert [i["address"] for i in insns if i["mnemonic"] == "call"] == list(calls), pid
+
+            refs_to = (await run(pid, "binary.xrefs", {"address": fx["add_numbers"].address})).normalized["refs"]
+            assert any(r["from"] == main + 14 and r["is_call"] for r in refs_to), (pid, refs_to)
+            refs_from = (await run(pid, "binary.xrefs", {"address": main + 14, "direction": "from"})).normalized
+            assert [(r["from"], r["to"], r["is_call"]) for r in refs_from["refs"]] == [
+                (main + 14, fx["add_numbers"].address, True)
+            ], pid
+
+            (block,) = (await run(pid, "binary.cfg", {"name": "main"})).normalized["blocks"]
+            assert (block["start"], block["end"], block["successors"]) == (main, main + fx["main"].size, []), pid
+            if pid == "ghidra_remcp":
+                assert sorted(block["external_targets"]) == sorted(calls.values())
+            else:
+                assert sorted(block["called"]) == ["add_numbers", "check_key", "get_greeting"]
+
+            found = {s["value"]: s["address"] for s in (await run(pid, "binary.strings", {})).normalized["strings"]}
+            for value, address in strings.items():
+                assert found.get(value) == address, (pid, value, found)
+
+            assert (await run(pid, "binary.imports", {})).normalized["imports"] == [], pid  # static, no imports
+            exports = {e["name"] for e in (await run(pid, "binary.exports", {})).normalized["exports"]}
+            assert set(fx) <= exports, (pid, exports)
+    finally:
+        await mgr.close()

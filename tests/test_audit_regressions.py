@@ -221,3 +221,40 @@ async def test_mcpyghidra_metadata_null_sections_are_unknown_not_a_crash(section
             assert out.normalized["processor"] is None
         if section == "memory":
             assert out.normalized["image_base"] is None
+
+
+def test_outside_paths_get_one_answer_whether_or_not_they_exist(tmp_path, monkeypatch):
+    """The guard must not reveal whether a file outside allowed_roots exists (an existence oracle)."""
+    import pathlib
+
+    from reveng_nexus.artifacts import WorkspaceGuard
+    from reveng_nexus.errors import WorkspaceViolation
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    existing = tmp_path / "outside.bin"
+    existing.write_bytes(b"x")
+    guard = WorkspaceGuard((str(root),), 1024)
+    touched: list[str] = []
+
+    def no_resolve(self, strict=False):
+        touched.append(str(self))
+        raise AssertionError("filesystem touched")
+
+    monkeypatch.setattr(pathlib.Path, "resolve", no_resolve)
+    messages = []
+    for path in (existing, tmp_path / "missing.bin", tmp_path / "wsx" / "prefix-sibling.bin"):
+        with pytest.raises(WorkspaceViolation) as info:
+            guard.check(str(path))
+        messages.append(info.value.message)
+    assert len(set(messages)) == 1 and "outside configured allowed_roots" in messages[0]
+    assert touched == []
+
+
+async def test_mcpyghidra_first_external_entry_is_not_reported_as_the_program_entry():
+    """tools/core.py:686-701: memory.entry_point is the first *external* entry point (every exported
+    symbol on ELF), else the first function; live on the ELF fixture it was add_numbers, not e_entry."""
+    ctx = {"architecture": {"processor": "x86"}, "memory": {"image_base": "0x400000", "entry_point": "0x400100"}}
+    out = await _adapter(ctx).op_binary_metadata(PROV, TGT, {}, {})
+    assert out.normalized["entry_point"] is None
+    assert out.normalized["first_external_entry"] == 0x400100

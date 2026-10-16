@@ -72,6 +72,22 @@ def _va_to_offset(address: int, meta: dict[str, Any]) -> tuple[int, int] | None:
     return None
 
 
+def _symbol_table_warnings(meta: dict[str, Any]) -> list[str]:
+    """An empty list from a missing or unusable symbol table is unknown, not empty (Mach-O)."""
+    if meta.get("format") == "macho_universal":
+        return ["universal Mach-O: symbols are decoded per architecture slice (binary.metadata) and not merged here"]
+    state = meta.get("symbol_table")
+    if state == "not_decoded":
+        return ["the Mach-O header could not be decoded: functions, imports and exports are unknown, not empty"]
+    if state == "absent":
+        return ["no symbol table (LC_SYMTAB) in this file: functions, imports and exports are unknown, not empty"]
+    if state == "out_of_bounds":
+        return ["the symbol table points outside the file and was not decoded: results are unknown, not empty"]
+    if state == "partial":
+        return ["only part of a very large symbol table was decoded"]
+    return []
+
+
 class BuiltinStaticProvider(AnalysisProvider):
     engine = "nexus-builtin"
     engine_family = "nexus-formats"
@@ -184,7 +200,7 @@ class BuiltinStaticProvider(AnalysisProvider):
                 "basis": "symbol tables / exports / entry point (no code discovery)",
                 "image_base": meta.get("image_base"),
             }
-            warnings = []
+            warnings = _symbol_table_warnings(meta)
             if meta.get("stripped"):
                 warnings.append("target is stripped; built-in function list is incomplete by construction")
             return self._result(
@@ -202,6 +218,7 @@ class BuiltinStaticProvider(AnalysisProvider):
                     "total": len(rows),
                     "libraries": meta.get("libraries", []),
                 },
+                warnings=_symbol_table_warnings(meta),
                 claim=f"{len(rows)} {key}",
             )
 

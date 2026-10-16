@@ -412,3 +412,67 @@ async def test_reconnect_inside_open_keeps_the_new_session(config_factory, works
         assert tools.count("open_database") == 2, tools
     finally:
         await mgr.close()
+
+
+@pytest.mark.parametrize("quiet_period", [False, True])
+async def test_restart_budget_bounds_crash_loops_but_resets_after_a_healthy_period(
+    config_factory, workspace, elf_sample, monkeypatch, quiet_period
+):
+    """Two restarts per window: a third connection loss in a row exhausts the budget, but a
+    restart requested a full window after the last completed one starts afresh."""
+    import anyio
+
+    from reveng_nexus.providers import mcp as mcp_module
+
+    monkeypatch.setattr(mcp_module, "_RESTART_RESET_SECONDS", 1.5)
+    mgr = await started(config_factory(workspace, [mock_engine("crashy", env={"MOCK_CRASH_TOOL": "get_strings"})]))
+    try:
+        target = await target_of(mgr, elf_sample)
+        provider = mgr.providers["crashy"]
+        for expected_restarts in (1, 2):
+            with pytest.raises(CapabilityUnavailable):
+                await mgr.perform("binary.strings", target, {}, provider_id="crashy", max_failover=0)
+            await mgr.perform("binary.functions", target, {}, provider_id="crashy")  # reconnects
+            assert provider.describe()["restarts"] == expected_restarts
+        if quiet_period:
+            await anyio.sleep(2.0)  # connected and healthy for longer than the (patched) window
+        with pytest.raises(CapabilityUnavailable):
+            await mgr.perform("binary.strings", target, {}, provider_id="crashy", max_failover=0)
+        if quiet_period:
+            out = await mgr.perform("binary.functions", target, {}, provider_id="crashy")
+            assert out["result"].normalized["total"] == 5
+            assert provider.describe()["restarts"] == 1, "earlier crashes no longer count"
+        else:
+            with pytest.raises(CapabilityUnavailable) as info:
+                await mgr.perform("binary.functions", target, {}, provider_id="crashy", max_failover=0)
+            assert "restart budget (2) is exhausted" in json.dumps(info.value.details)
+    finally:
+        await mgr.close()
+
+
+async def test_failed_reconnects_count_against_the_restart_budget(config_factory, workspace, monkeypatch):
+    """A reconnect that fails still ends a restart attempt: after a completed restart long ago,
+    a child that no longer starts gets two attempts per window, not one per caller request."""
+    from reveng_nexus.providers import mcp as mcp_module
+
+    monkeypatch.setattr(mcp_module, "_RESTART_RESET_SECONDS", 60.0)
+    mgr = await started(config_factory(workspace, [mock_engine("eng")]))
+    try:
+        provider = mgr.providers["eng"]
+        provider._last_restart = time.monotonic() - 120.0  # last completed restart: two windows ago
+        attempts = 0
+
+        async def broken_connect() -> None:
+            nonlocal attempts
+            attempts += 1
+            raise ProviderUnavailable("eng: child does not start")
+
+        monkeypatch.setattr(provider, "_connect_global", broken_connect)
+        for _ in range(2):
+            with pytest.raises(ProviderUnavailable, match="does not start"):
+                await provider._restart_global()
+        with pytest.raises(ProviderUnavailable, match=r"restart budget \(2\) is exhausted"):
+            await provider._restart_global()
+        assert attempts == 2
+    finally:
+        await mgr.close()

@@ -199,9 +199,14 @@ providers:
     # Upstream only honours the value "1" for its FRIDA_MCP_* switches, so these are not a
     # protection by themselves; Nexus' own hard blocks are. Dynamic calls to tools that take a
     # device must name an authorised device (no fallback to FRIDA_DEVICE_ID, USB or the host).
+    # Upstream reads and writes ~/.config/frida-mobile-mcp/ (config.ts, logger.ts), so HOME points
+    # into a Nexus-owned directory. `npx -y` pins only the top-level package (no shrinkwrap):
+    # before any live use, install it locally as for REA and point command/args at that install.
     env:
       FRIDA_MCP_ALLOW_CUSTOM_SCRIPTS: "0"
       FRIDA_MCP_MEMORY_WRITE: "0"
+      HOME: '${LOCALAPPDATA}\RevEngNexus\data\frida-home'
+      USERPROFILE: '${LOCALAPPDATA}\RevEngNexus\data\frida-home'
     protocol_mode: legacy
     priority: 50
     timeout_seconds: 120

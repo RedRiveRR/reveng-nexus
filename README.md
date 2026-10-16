@@ -9,10 +9,10 @@ evidence, compares engines without hiding their disagreements, and exports repor
 engine stays a separate, pinned, optional process with its own licence; nothing upstream is
 vendored.
 
-> **Status (0.2.0, updated 2026-10-15).** The gateway, policy engine, evidence store, comparison
+> **Status (0.2.0, updated 2026-10-16).** The gateway, policy engine, evidence store, comparison
 > and reporting are implemented and tested. Exact, observed test counts for each command
-> are in [docs/TESTING.md](docs/TESTING.md#test-accounting); three tests are
-> environment-gated (opt-in live Ghidra, opt-in live REA, and a symlink test needing Windows Developer Mode).
+> are in [docs/TESTING.md](docs/TESTING.md#test-accounting); four tests are
+> environment-gated (two opt-in live Ghidra tests, opt-in live REA, and a symlink test needing Windows Developer Mode).
 > The **Ghidra path is verified end to end with real Ghidra 12.1.4** through two upstreams
 > (re-mcp-ghidra 3.0.3 and MCPyGhidra 0.8.0), including a permanent Windows deployment and a
 > real Claude Code connection. Since 2026-10-15, REA (`rea-agents` 6.5.0) is verified live for
@@ -28,8 +28,8 @@ vendored.
 | Area | State |
 |---|---|
 | MCP gateway (stdio; loopback Streamable HTTP) | working; tested over a real stdio subprocess and over HTTP |
-| Built-in engine: ELF/PE/Mach-O/DEX/APK parsing, strings, Capstone disassembly, AndroidManifest decoding | working, always available; verified on the generated ELF/PE/Mach-O/APK fixtures for the operations listed in [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md) (Mach-O: headers only) |
-| Ghidra via `re-mcp-ghidra` (stdio) and `mcpyghidra-headless` (launched HTTP) | working: `live_analysis_verified` for the operations listed per upstream in [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md) (decompile on both; functions and xrefs on re-mcp-ghidra) |
+| Built-in engine: ELF/PE/Mach-O/DEX/APK parsing, strings, Capstone disassembly, AndroidManifest decoding | working, always available; verified on the generated ELF/PE/Mach-O/APK fixtures for the operations listed in [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md) (Mach-O: headers, sections and `LC_SYMTAB` symbols) |
+| Ghidra via `re-mcp-ghidra` (stdio) and `mcpyghidra-headless` (launched HTTP) | working: `live_analysis_verified` for the operations listed per upstream in [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md) (on both: metadata, functions, decompile, disassemble, xrefs to/from, cfg, strings, imports, exports, on the generated ELF fixture) |
 | Routing, sequential failover, per-provider concurrency, conflict-group locks, duplicate-capability detection | working (tested with real MCP mock engines) |
 | Cross-engine comparison (rebased identity, callees, constants, strings, call targets; per-group independence) | working |
 | Evidence store (SQLite, migrations), cases, findings, reviews, Markdown/JSON reports | working |

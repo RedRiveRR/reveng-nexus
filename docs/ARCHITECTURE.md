@@ -40,7 +40,7 @@
 | `config.py` | YAML schema, validation, `${VAR}` expansion, 0.1 key compatibility |
 | `policy.py`, `security.py` | Tool classification (deny patterns → override → adapter manifest or the adapter's unlisted-tool class → trusted annotations → verb heuristic; an override may tighten but never relax `blocked`, `execute`, `dynamic` or `lifecycle`; lifecycle tools are never forwarded for a caller) and enforcement, including refusal of arguments the tool's schema does not declare |
 | `artifacts.py` | `WorkspaceGuard` (allowed roots, traversal, symlink/junction, NTFS ADS, size), hashing, identification, per-provider staged copies |
-| `formats/` | ELF (pyelftools), PE (pefile), Mach-O headers, DEX header, APK + binary AndroidManifest parser, string extraction |
+| `formats/` | ELF (pyelftools), PE (pefile), Mach-O headers, sections and `LC_SYMTAB` symbols, DEX header, APK + binary AndroidManifest parser, string extraction |
 | `providers/base.py` | `AnalysisProvider` lifecycle, `ToolInfo`, `OperationResult`, policy/timeout/audit wrapper around every raw tool call |
 | `providers/builtin.py` | Always-on static engine |
 | `providers/mcp.py` | Child MCP servers: stdio, Streamable HTTP, launch-then-connect; owner tasks, restart budget, process-tree containment |
@@ -78,7 +78,7 @@
    check that their bound tools still exist, prepare a per-target session (open database,
    load APK) using a **staged copy**, call tools, and normalise results while keeping the raw output.
 6. **Recover.** A closed connection (`MCPError CONNECTION_CLOSED`, broken pipe) tears the
-   owner down. The next call reconnects, up to two restarts with backoff. Timeouts use
+   owner down. The next call reconnects, up to two restarts with backoff; the budget starts over for a restart requested 10 minutes after the last restart attempt ended (successful or not). Timeouts use
    `anyio.fail_after` per tool call, plus a per-operation budget.
 7. **Shut down.** Adapters close their sessions (re-mcp saves only Nexus's private engine
    database; the Frida adapter first asks the server to stop all instrumentation, bounded to

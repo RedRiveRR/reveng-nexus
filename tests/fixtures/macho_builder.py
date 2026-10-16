@@ -77,3 +77,78 @@ def build_universal(thin: bytes | None = None, cputype: int = CPU_X86_64) -> byt
 def write_macho(path: Path, universal: bool = False) -> Path:
     path.write_bytes(build_universal() if universal else build_thin())
     return path
+
+
+# --- thin image with sections and an LC_SYMTAB (symbol decoding tests) -----------------------
+LC_SYMTAB = 0x2
+TEXT_SECT_OFF, CSTRING_OFF, LINKEDIT_OFF = 0x400, 0x500, 0x1000
+MAIN_OFF, HELPER_OFF = 0x400, 0x410
+SYM_CODE = {
+    MAIN_OFF: bytes.fromhex("e80b00000031c0c3"),  # call _helper ; xor eax, eax ; ret
+    HELPER_OFF: bytes.fromhex("b801000000c3"),  # mov eax, 1 ; ret
+}
+CSTRING = b"nexus fixture\x00"
+STRTAB = b"\x00_main\x00_helper\x00_greeting\x00_printf\x00"
+S_ATTR_PURE_INSTRUCTIONS = 0x80000000
+SYMBOLS = {  # name -> (address, kind); what a correct decoder must report
+    "_main": TEXT_VMADDR + MAIN_OFF,
+    "_helper": TEXT_VMADDR + HELPER_OFF,
+    "_greeting": TEXT_VMADDR + CSTRING_OFF,
+}
+
+
+def _section64(sect: bytes, seg: bytes, addr: int, size: int, offset: int, flags: int) -> bytes:
+    return struct.pack("<16s16sQQIIIIIIII", sect, seg, addr, size, offset, 0, 0, 0, flags, 0, 0, 0)
+
+
+def _nlist64(strx: int, ntype: int, nsect: int, desc: int, value: int) -> bytes:
+    return struct.pack("<IBBHQ", strx, ntype, nsect, desc, value)
+
+
+def build_thin_with_symbols(*, symoff: int | None = None) -> bytes:
+    """__TEXT (__text, __cstring), __LINKEDIT and LC_SYMTAB. Symbols, in order: a stab entry
+    (skipped), local _helper and external _main in __text, external _greeting in __cstring (an
+    export, not a function), undefined _printf from library ordinal 1, then one entry with an
+    out-of-range name index and one with an out-of-range section index (both skipped)."""
+    s = {name: STRTAB.index(name.encode() + b"\x00") for name in ("_main", "_helper", "_greeting", "_printf")}
+    nlists = [
+        _nlist64(s["_main"], 0x24, 1, 0, TEXT_VMADDR + MAIN_OFF),  # N_FUN stab
+        _nlist64(s["_helper"], 0x0E, 1, 0, TEXT_VMADDR + HELPER_OFF),  # N_SECT
+        _nlist64(s["_main"], 0x0F, 1, 0, TEXT_VMADDR + MAIN_OFF),  # N_SECT | N_EXT
+        _nlist64(s["_greeting"], 0x0F, 2, 0, TEXT_VMADDR + CSTRING_OFF),
+        _nlist64(s["_printf"], 0x01, 0, 1 << 8, 0),  # N_UNDF | N_EXT, ordinal 1
+        _nlist64(0xFFFF, 0x0F, 1, 0, TEXT_VMADDR + MAIN_OFF),  # name index past the string table
+        _nlist64(s["_helper"], 0x0E, 9, 0, TEXT_VMADDR + HELPER_OFF),  # section 9 does not exist
+    ]
+    symtab = b"".join(nlists)
+    stroff = LINKEDIT_OFF + len(symtab)
+    linkedit = symtab + STRTAB
+    dylib_size = (24 + len(DYLIB) + 7) & ~7
+    dylib = struct.pack("<IIIIII", LC_LOAD_DYLIB, dylib_size, 24, 2, 0x10000, 0x10000) + DYLIB
+    dylib += b"\x00" * (dylib_size - len(dylib))
+    text_seg = struct.pack(
+        "<II16sQQQQiiII", LC_SEGMENT_64, 72 + 2 * 80, b"__TEXT", TEXT_VMADDR, 0x1000, 0, 0x1000, 5, 5, 2, 0
+    )
+    text_seg += _section64(
+        b"__text", b"__TEXT", TEXT_VMADDR + TEXT_SECT_OFF, 0x20, TEXT_SECT_OFF, S_ATTR_PURE_INSTRUCTIONS
+    )
+    text_seg += _section64(b"__cstring", b"__TEXT", TEXT_VMADDR + CSTRING_OFF, len(CSTRING), CSTRING_OFF, 0x2)
+    commands = [
+        _segment(b"__PAGEZERO", 0, TEXT_VMADDR, 0, 0, 0),
+        text_seg,
+        _segment(b"__LINKEDIT", TEXT_VMADDR + 0x1000, 0x1000, LINKEDIT_OFF, len(linkedit), 1),
+        dylib,
+        struct.pack("<IIQQ", LC_MAIN, 24, MAIN_OFF, 0),
+        struct.pack(
+            "<IIIIII", LC_SYMTAB, 24, LINKEDIT_OFF if symoff is None else symoff, len(nlists), stroff, len(STRTAB)
+        ),
+    ]
+    body = b"".join(commands)
+    header = struct.pack("<IiiIIIII", 0xFEEDFACF, CPU_X86_64, 3, MH_EXECUTE, len(commands), len(body), MH_FLAGS, 0)
+    image = bytearray(LINKEDIT_OFF + len(linkedit))
+    image[: len(header) + len(body)] = header + body
+    for off, code in SYM_CODE.items():
+        image[off : off + len(code)] = code
+    image[CSTRING_OFF : CSTRING_OFF + len(CSTRING)] = CSTRING
+    image[LINKEDIT_OFF:] = linkedit
+    return bytes(image)

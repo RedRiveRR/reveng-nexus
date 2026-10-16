@@ -286,3 +286,35 @@ async def test_jadx_accepts_its_own_staged_copy(tmp_path):
     prov = FakeProvider("jadx", "jadx", {"load_apk": _jadx(info), "get_all_classes": _jadx(["a.B"])})
     res = await ADAPTERS["jadx"].perform(prov, "apk.classes", target, {})
     assert res.normalized["classes"] == ["a.B"]
+
+
+async def test_remcp_ghidra_cfg_keeps_call_destinations_out_of_the_successors(tmp_path):
+    # re-mcp-ghidra tools/cfg.py:89-96 takes successors from BasicBlockModel.getDestinations() with
+    # no flow type; observed live on the ELF fixture: main's one block "succeeds" to its three callees.
+    answer = {
+        "blocks": [
+            {"start": "0x400119", "end": "0x40013f", "size": 38, "successors": ["0x400100", "0x400104", "0x400111"]},
+        ]
+    }
+    loop = {
+        "blocks": [
+            {"start": "0x401000", "end": "0x401008", "size": 8, "successors": ["0x401008", "0x402000"]},
+            {"start": "0x401008", "end": "0x401010", "size": 8, "successors": ["0x401000"]},
+        ]
+    }
+    for payload, expected in (
+        (answer, [([], [0x400100, 0x400104, 0x400111])]),
+        (loop, [([0x401008], [0x402000]), ([0x401000], [])]),
+    ):
+        prov = FakeProvider("ghidra_remcp", "ghidra", _remcp_ida({"get_basic_blocks": _result(payload)}))
+        res = await ADAPTERS["re_mcp"].perform(prov, "binary.cfg", FakeTarget(tmp_path), {"address": 0x400119})
+        assert [(b["successors"], b["external_targets"]) for b in res.normalized["blocks"]] == expected
+
+
+async def test_remcp_cfg_never_turns_an_unparseable_address_into_an_edge(tmp_path):
+    payload = {"blocks": [{"start": "garbage", "end": "0x401008", "successors": ["also-garbage", "0x402000"]}]}
+    prov = FakeProvider("ghidra_remcp", "ghidra", _remcp_ida({"get_basic_blocks": _result(payload)}))
+    res = await ADAPTERS["re_mcp"].perform(prov, "binary.cfg", FakeTarget(tmp_path), {"address": 0x401000})
+    (block,) = res.normalized["blocks"]
+    assert (block["successors"], block["external_targets"]) == ([], [0x402000])
+    assert any("could not be parsed" in w for w in res.warnings)

@@ -53,7 +53,10 @@ class McPyGhidraAdapter(McpAdapter):
             "compiler": arch.get("compiler"),
             "file_format": (ctx.get("program") or {}).get("file_format"),
             "image_base": parse_address(memory.get("image_base")),
-            "entry_point": parse_address(memory.get("entry_point")),
+            # Not the program entry: upstream takes the first external entry point (every exported
+            # symbol on ELF), else the first function, else the image base (tools/core.py:686-701).
+            "entry_point": None,
+            "first_external_entry": parse_address(memory.get("entry_point")),
             "function_count": (ctx.get("analysis") or {}).get("function_count"),
             "engine_version": f"{app.get('name', 'Ghidra')} {app.get('version', '')}".strip(),
         }

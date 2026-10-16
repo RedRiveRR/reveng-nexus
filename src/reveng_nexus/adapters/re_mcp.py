@@ -321,15 +321,30 @@ class ReMcpAdapter(McpAdapter):
         payload, _text, raw = await self.call(
             provider, target, "get_basic_blocks", {"address": ref, "database": session["database"]}
         )
+        rows = [
+            block
+            for block in (
+                (payload or {}).get("blocks", (payload or {}).get("items", [])) if isinstance(payload, dict) else []
+            )
+            if isinstance(block, dict)
+        ]
+        starts = {parse_address(b.get("start") or b.get("start_address")) for b in rows} - {None}
         blocks = []
-        for block in (
-            (payload or {}).get("blocks", (payload or {}).get("items", [])) if isinstance(payload, dict) else []
-        ):
+        for block in rows:
+            # re-mcp-ghidra takes successors from BasicBlockModel.getDestinations() without the flow
+            # type (tools/cfg.py:89-96), so call targets in other functions arrive as "successors".
+            # Only destinations that are blocks of this function are CFG edges; the rest are kept
+            # apart, unlabelled (call or jump: upstream does not say).
+            raw_targets = block.get("successors", []) or []
+            targets = [t for t in (parse_address(s) for s in raw_targets) if t is not None]
+            if len(targets) < len(raw_targets):
+                note_warning("get_basic_blocks: a successor address that could not be parsed was ignored")
             blocks.append(
                 {
                     "start": parse_address(block.get("start") or block.get("start_address")),
                     "end": parse_address(block.get("end") or block.get("end_address")),
-                    "successors": [parse_address(s) for s in block.get("successors", []) or []],
+                    "successors": [t for t in targets if t in starts],
+                    "external_targets": [t for t in targets if t not in starts],
                 }
             )
         return self.result(

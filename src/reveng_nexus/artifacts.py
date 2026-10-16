@@ -46,12 +46,21 @@ class WorkspaceGuard:
 
     def __init__(self, allowed_roots: tuple[str, ...], max_bytes: int, follow_symlinks: bool = False):
         self.roots = tuple(Path(r).expanduser().resolve() for r in allowed_roots)
+        # Configured and resolved spellings of every root, for the lexical pre-check in check().
+        self._root_texts = tuple(
+            {_norm(Path(os.path.normpath(Path(r).expanduser()))) for r in allowed_roots}
+            | {_norm(r) for r in self.roots}
+        )
         self.max_bytes = max_bytes
         self.follow_symlinks = follow_symlinks
 
     @property
     def enabled(self) -> bool:
         return bool(self.roots)
+
+    def _lexically_inside(self, candidate: Path) -> bool:
+        text = _norm(Path(os.path.normpath(candidate)))
+        return any(text == root or text.startswith(root.rstrip(os.sep) + os.sep) for root in self._root_texts)
 
     def check(self, raw_path: str) -> Path:
         if not self.roots:
@@ -77,6 +86,10 @@ class WorkspaceGuard:
             raise WorkspaceViolation("alternate data stream paths are not accepted")
         if any(part == ".." for part in candidate.parts):
             raise WorkspaceViolation("'..' path segments are not accepted")
+        if not self._lexically_inside(candidate):
+            # Refused before the filesystem is touched, so the answer is the same whether or not an
+            # outside file exists. Links inside a root are still resolved and checked below.
+            raise WorkspaceViolation("target is outside configured allowed_roots")
         try:
             resolved = candidate.resolve(strict=True)
         except (OSError, RuntimeError) as exc:

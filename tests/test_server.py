@@ -320,18 +320,24 @@ async def test_http_rejects_foreign_host_header(config_factory, workspace):
 
 
 def test_gateway_answers_handshake_while_slow_providers_start(tmp_path, workspace):
-    """Regression: Claude Code saw the server as 'pending' because providers started before initialize."""
-    import time
+    """Regression: Claude Code saw the server as 'pending' because providers started before initialize.
 
+    The slow provider creates a marker only after its startup delay, so the check is an ordering one
+    (the gateway answered while the provider was still starting), not a wall-clock budget: the
+    gateway's own interpreter start under CPU load took 5-14 s on an 8-core host (Open Issue #12).
+    """
     import anyio
 
+    started = tmp_path / "slow_engine.started"
     config = tmp_path / "config" / "providers.yaml"
     config.parent.mkdir()
     config.write_text(
         yaml.safe_dump(
             {
                 "workspace": {"allowed_roots": [str(workspace)], "data_dir": str(tmp_path / "data")},
-                "providers": [mock_engine("slow_engine", env={"MOCK_STARTUP_DELAY": "8"})],
+                "providers": [
+                    mock_engine("slow_engine", env={"MOCK_STARTUP_DELAY": "8", "MOCK_STARTED_FLAG": str(started)})
+                ],
             }
         ),
         encoding="utf-8",
@@ -341,14 +347,13 @@ def test_gateway_answers_handshake_while_slow_providers_start(tmp_path, workspac
         params = StdioServerParameters(
             command=sys.executable, args=["-m", "reveng_nexus", "--config", str(config), "serve"]
         )
-        t0 = time.monotonic()
         async with Client(params, read_timeout_seconds=60) as client:
             names = {t.name for t in (await client.list_tools()).tools}
-            handshake = time.monotonic() - t0
             assert REQUIRED <= names
-            assert handshake < 6, f"handshake took {handshake:.1f}s; providers must start in the background"
+            assert not started.exists(), "the gateway answered only after the provider had started"
             status = payload(await client.call_tool("nexus_status", {}))
             assert status["providers"]["slow_engine"]["status"] == "ready", "tool calls wait for startup"
+            assert started.exists()
 
     anyio.run(run)
 

@@ -1,15 +1,18 @@
 """Built-in engine against every generated fixture: recognition, metadata, truncation, hash preservation."""
 
 import hashlib
+import struct
 
 import pytest
 from fixtures.macho_builder import (
     CPU_X86,
     ENTRY_OFF,
+    SYMBOLS,
     TEXT_VMADDR,
     TEXT_VMADDR_32,
     build_thin,
     build_thin32,
+    build_thin_with_symbols,
     build_universal,
     write_macho,
 )
@@ -33,7 +36,9 @@ def test_macho_thin_metadata(macho_sample):
     assert {"LC_SEGMENT_64", "LC_LOAD_DYLIB", "LC_UUID", "LC_MAIN"} <= set(meta["load_commands"])
     text = next(s for s in meta["segments"] if s["name"] == "__TEXT")
     assert text["offset"] == 0 and text["file_size"] == 0x1000
-    assert meta["functions"] == [] and any("symbols are not decoded" in n for n in meta["notes"])
+    # this image has no LC_SYMTAB: the empty lists mean "unknown", which the result must say
+    assert meta["symbol_table"] == "absent" and meta["functions"] == []
+    assert any("No LC_SYMTAB" in n and "unknown, not empty" in n for n in meta["notes"])
 
 
 def test_macho_universal_slice(workspace):
@@ -155,3 +160,105 @@ def test_truncated_macho_parses_what_is_present(tmp_path, builder):
         assert complete == expected, (builder, cut, complete)
         if cut < len(blob) and len(expected) < 2:
             assert meta.get("truncated") is True
+
+
+def test_macho_symbols_are_decoded_from_lc_symtab(tmp_path):
+    path = tmp_path / "syms.macho"
+    path.write_bytes(build_thin_with_symbols())
+    meta = inspect_file(path)
+    assert meta["symbol_table"] == "decoded"
+    # defined symbols in the instruction section only; Mach-O records no size
+    assert [(f["name"], f["address"], f["size"]) for f in meta["functions"]] == [
+        ("_main", SYMBOLS["_main"], None),
+        ("_helper", SYMBOLS["_helper"], None),
+    ]
+    assert meta["imports"] == [{"name": "_printf", "library": "/usr/lib/libSystem.B.dylib", "kind": "N_UNDF"}]
+    assert [(e["name"], e["address"]) for e in meta["exports"]] == [
+        ("_main", SYMBOLS["_main"]),
+        ("_greeting", SYMBOLS["_greeting"]),  # external data symbol: an export, never a function
+    ]
+    assert meta["symbols_skipped"] == 2  # bad name index and bad section index; the stab entry is ignored
+    text = next(s for s in meta["sections"] if s["name"] == "__TEXT,__text")
+    assert text["executable"] and (text["vaddr"], text["offset"]) == (SYMBOLS["_main"], 0x400)
+
+
+def test_macho_symtab_outside_the_file_is_unknown_not_empty(tmp_path):
+    path = tmp_path / "badsym.macho"
+    path.write_bytes(build_thin_with_symbols(symoff=0x7FFFFFF0))
+    meta = inspect_file(path)
+    assert meta["symbol_table"] == "out_of_bounds"
+    assert meta["functions"] == meta["imports"] == meta["exports"] == []
+    assert any("outside the file" in n for n in meta["notes"])
+    assert [s["name"] for s in meta["segments"]] == ["__PAGEZERO", "__TEXT", "__LINKEDIT"]
+
+
+def test_macho_universal_slice_symbols_are_slice_relative(tmp_path):
+    path = tmp_path / "fatsyms.macho"
+    path.write_bytes(build_universal(build_thin_with_symbols()))
+    slice0 = inspect_file(path)["slices"][0]
+    assert slice0["symbol_table"] == "decoded"
+    assert [f["name"] for f in slice0["functions"]] == ["_main", "_helper"]
+    assert next(s for s in slice0["sections"] if s["name"] == "__TEXT,__text")["offset"] == 0x1000 + 0x400
+
+
+def test_truncated_macho_symbol_table_never_reads_past_the_end(tmp_path):
+    blob = build_thin_with_symbols()
+    for cut in range(len(blob) - 120, len(blob)):
+        path = tmp_path / f"cut_{cut}"
+        path.write_bytes(blob[:cut])
+        meta = inspect_file(path)  # must not raise
+        assert meta["symbol_table"] == "out_of_bounds" and meta["functions"] == []
+
+
+async def test_builtin_reports_macho_symbols_and_flags_a_missing_table(config_factory, workspace):
+    with_syms = workspace / "nexus_syms.macho"
+    with_syms.write_bytes(build_thin_with_symbols())
+    without = write_macho(workspace / "nexus_nosyms.macho")
+    mgr = ProviderManager(config_factory(workspace))
+    await mgr.start()
+    try:
+        for path, expected, warned in ((with_syms, ["_main", "_helper"], False), (without, [], True)):
+            intake = await mgr.intake(str(path))
+            target = mgr.target_context(intake["target"]["sha256"])
+            funcs = (await mgr.perform("binary.functions", target, {}, provider_id="builtin"))["result"]
+            assert [f["name"] for f in funcs.normalized["functions"]] == expected
+            assert any("unknown, not empty" in w for w in funcs.warnings) is warned
+            imports = (await mgr.perform("binary.imports", target, {}, provider_id="builtin"))["result"]
+            assert [i["name"] for i in imports.normalized["imports"]] == (["_printf"] if not warned else [])
+        # a decoded symbol is usable as a disassembly anchor (no size: the count bounds the listing)
+        target = mgr.target_context((await mgr.intake(str(with_syms)))["target"]["sha256"])
+        dis = await mgr.perform("binary.disassemble", target, {"name": "_helper", "count": 2}, provider_id="builtin")
+        assert [i["mnemonic"] for i in dis["result"].normalized["instructions"]] == ["mov", "ret"]
+    finally:
+        await mgr.close()
+
+
+def test_macho_universal_slice_reads_stay_inside_the_declared_slice(tmp_path):
+    """A slice whose LC_SYMTAB points past its declared size must not be decoded from the bytes
+    that follow it in the fat file."""
+    thin = build_thin_with_symbols()
+    blob = bytearray(build_universal(thin))
+    struct.pack_into(">I", blob, 8 + 12, 0x1000)  # fat_arch.size: the slice ends before __LINKEDIT
+    path = tmp_path / "short_slice.macho"
+    path.write_bytes(bytes(blob))
+    slice0 = inspect_file(path)["slices"][0]
+    assert slice0["symbol_table"] == "out_of_bounds" and slice0["functions"] == []
+    assert [s["name"] for s in slice0["segments"]] == ["__PAGEZERO", "__TEXT", "__LINKEDIT"]
+
+
+async def test_builtin_flags_undecodable_and_universal_macho_symbols(config_factory, workspace):
+    bad = workspace / "nexus_badheader.macho"
+    bad.write_bytes(build_thin()[:20])  # thin magic, header cut short
+    assert inspect_file(bad)["symbol_table"] == "not_decoded"
+    fat = workspace / "nexus_fat.macho"
+    fat.write_bytes(build_universal(build_thin_with_symbols()))
+    mgr = ProviderManager(config_factory(workspace))
+    await mgr.start()
+    try:
+        intake = await mgr.intake(str(fat))
+        target = mgr.target_context(intake["target"]["sha256"])
+        funcs = (await mgr.perform("binary.functions", target, {}, provider_id="builtin"))["result"]
+        assert funcs.normalized["functions"] == []
+        assert any("decoded per architecture slice" in w for w in funcs.warnings)
+    finally:
+        await mgr.close()

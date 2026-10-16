@@ -28,7 +28,7 @@ is a JSON object**. Errors: `ToolError::to_tool_result()` → `CallToolResult::e
 | `idb_meta` | — | object: `processor`, `bits`, `file_type`, `loader`, `function_count`, `image_base`, `base_address`, `min_address`, `max_address`, `main_address`, `input_file_*` (hex strings). **No entry-point key.** | `ida/handlers/globals.rs` |
 | `list_functions` | `limit`, `offset`, `filter` | `FunctionListResult {functions:[{address,name,size}], total, next_offset?}` (typed) | `ida/types.rs` |
 | `decompile` | `address` (**numeric only**) | single address: **plain text** pseudocode | `server/mod.rs` `decompile` |
-| `disasm_function_at` | `address` or `target_name` | **plain text**, one `"{:#x}:\t{line}"` per instruction | `ida/handlers/disasm.rs` |
+| `disasm_function_at` | `address` or `target_name`, plus `count` (Nexus always sends it: the caller's value or 5000, the upstream maximum; the default of 200 is applied silently, `server/requests.rs:339-351`) | **plain text**, one `"{:#x}:\t{line}"` per instruction, at most `count` lines and no truncation marker; a listing of exactly `count` lines adds a warning | `ida/handlers/disasm.rs:245-283` |
 | `xrefs_to` / `xrefs_from` | `address` (**numeric only**), `limit` | `XRefListResult {xrefs:[{from,to,type,is_code}], truncated}` (typed) | `ida/types.rs`, `XrefsOutput::Single` |
 | `strings` | `limit`, `filter` | `StringListResult {strings:[{address,content,length}], total}` (typed); the text is in **`content`** | `ida/types.rs` |
 | `imports` | `limit` | JSON **array** of `ImportInfo {address,name,ordinal}`: **no module field** | `ida/types.rs` |
@@ -173,6 +173,21 @@ parses it in a REA Node worker (REA-owned Job Object, private temp cwd), never e
 `analysis_timeout_ms` applies per JavaScript source, and the whole call is bounded by Nexus's
 `timeout_seconds`. `inspect_electron_fuses` reads bytes in process. Nexus never stages an
 `.asar.unpacked` directory, so unpacked entries are reported unavailable.
+
+## re-mcp Ghidra backend and MCPyGhidra: observations from the live per-operation test (2026-10-15)
+
+- Both report addresses as bare offsets (re-mcp-ghidra `format_address(addr.getOffset())`,
+  `tools/xrefs.py:66`, `:94`): references and strings from non-loaded sections (symbol and string
+  tables) arrive as small numbers (0, 80, 1, 7, ...) that look like memory addresses. Nexus passes
+  them on unchanged; it cannot tell the address space either.
+- re-mcp-ghidra `get_basic_blocks` successors come from `BasicBlockModel.getDestinations()` with
+  no flow type (`tools/cfg.py:89-96`), so callee entry blocks appear as successors. Nexus keeps
+  only destinations that are blocks of the function as `successors` and reports the rest as
+  `external_targets`, unlabelled.
+- MCPyGhidra `context.memory.entry_point` is the first external entry point (every exported symbol
+  on ELF), else the first function, else the image base (`tools/core.py:686-701`); on the fixture
+  it named `add_numbers`, not `e_entry`. Nexus keeps it as `first_external_entry` and reports
+  `entry_point` as unknown. re-mcp-ghidra's `get_database_info` has no entry point at all.
 
 ## re-mcp IDA backend: jtsylve/re-mcp `7b38aa9` (PyPI `re-mcp-ida` 3.0.3)
 

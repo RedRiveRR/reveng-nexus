@@ -62,18 +62,40 @@ def rea_provider(home: Path, *, enabled: bool = True) -> dict:
 
 
 def rea_processes() -> list[int]:
-    """PIDs of node processes running the pinned REA entry point (Windows only)."""
+    """PIDs of node processes running the pinned REA install that this test must account for
+    (Windows only): descendants of this test process, and orphans whose parent has exited (a leaked
+    REA worker after its REA parent died). An REA child of another live gateway, such as the one a
+    Claude Code session keeps running with the permanent config, is excluded."""
     if os.name != "nt":
         return []
     script = (
-        "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
-        "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
+        "Get-CimInstance Win32_Process | "
+        "Select-Object ProcessId, ParentProcessId, Name, CommandLine | ConvertTo-Json -Compress"
     )
     out = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True).stdout
     rows = json.loads(out) if out.strip() else []
     rows = [rows] if isinstance(rows, dict) else rows
+    parent = {r["ProcessId"]: r["ParentProcessId"] for r in rows}
+
+    def ours(pid: int) -> bool:
+        if parent.get(pid) not in parent:
+            return True  # orphan: its parent has exited, so no other live gateway owns it
+        seen: set[int] = set()
+        while pid in parent and pid not in seen:
+            seen.add(pid)
+            pid = parent[pid]
+            if pid == os.getpid():
+                return True
+        return False
+
     needle = str(Path(ENTRY).parent.parent).lower()
-    return [r["ProcessId"] for r in rows if needle in (r.get("CommandLine") or "").lower()]
+    return [
+        r["ProcessId"]
+        for r in rows
+        if (r.get("Name") or "").lower() == "node.exe"
+        and needle in (r.get("CommandLine") or "").lower()
+        and ours(r["ProcessId"])
+    ]
 
 
 async def _settle_gone() -> list[int]:

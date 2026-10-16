@@ -45,9 +45,9 @@ was observed live with re-mcp-ghidra and a wrong `GHIDRA_INSTALL_DIR`.
 
 | Provider id | Upstream | Pinned revision / package | Licence | Integration method | Verification state | Blocker |
 |---|---|---|---|---|---|---|
-| `builtin` | RevEng Nexus | repo 0.2.0; pyelftools 0.32, pefile 2024.8.26, capstone 5.0.9 | MIT (deps: Public domain / MIT / BSD-3) | in-process | `live_analysis_verified` only for the generated fixtures and operations that `tests/test_builtin_fixtures.py` and `tests/test_builtin_provider.py` assert: ELF metadata, functions, strings, disassembly; PE metadata, imports, strings; Mach-O metadata, strings, entry disassembly (headers, segments, dylibs and `LC_MAIN` only, no function list); APK manifest, components, strings | — |
-| `ghidra_remcp` | [jtsylve/re-mcp](https://github.com/jtsylve/re-mcp), Ghidra backend | `7b38aa9`; PyPI `re-mcp-ghidra==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | `live_analysis_verified` for `binary.functions`, `binary.decompile`, `binary.xrefs` with direction `to` (automated live test; direction `from` is mock-tested; re-run passed 2026-10-15); `binary.metadata` and `binary.disassemble` observed live in manual runs (2026-10-13/14, stored evidence) but not asserted by a test; cfg/strings/imports/exports `mock_tested` only | — |
-| `ghidra_mcpy` | [nightwing-us/mcpyghidra](https://github.com/nightwing-us/mcpyghidra) | `f1e130c` (v0.8.0); PyPI `mcpyghidra==0.8.0` | Apache-2.0 (+ NOTICE) | launch → JSON readiness → Streamable HTTP, one server per target | `live_analysis_verified` for `binary.decompile` only (automated live test, re-run passed 2026-10-15); `binary.metadata` and `binary.disassemble` observed live in manual runs (2026-10-13/14) but not asserted by a test; `binary.functions` `mock_tested`; xrefs/cfg/strings/imports/exports `reviewed_not_tested` (normalisers unit-tested against pinned 0.8.0 shapes) | — |
+| `builtin` | RevEng Nexus | repo 0.2.0; pyelftools 0.32, pefile 2024.8.26, capstone 5.0.9 | MIT (deps: Public domain / MIT / BSD-3) | in-process | `live_analysis_verified` only for the generated fixtures and operations that `tests/test_builtin_fixtures.py` and `tests/test_builtin_provider.py` assert: ELF metadata, functions, strings, disassembly; PE metadata, imports, strings; Mach-O metadata, strings, entry disassembly and `LC_SYMTAB` symbols (functions = defined symbols in instruction sections, imports = undefined external symbols with their dylib, exports = defined external symbols; sizes unknown; an absent or out-of-bounds table is reported as unknown, not empty); APK manifest, components, strings | — |
+| `ghidra_remcp` | [jtsylve/re-mcp](https://github.com/jtsylve/re-mcp), Ghidra backend | `7b38aa9`; PyPI `re-mcp-ghidra==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | `live_analysis_verified` (automated live tests, `tests/integration/test_ghidra_live.py`, passed 2026-10-15; re-run passed 2026-10-16, also on the reinstalled integration machine) for `binary.metadata` (bits, image base, function count; no entry point reported), `binary.functions` (names, addresses, sizes), `binary.decompile`, `binary.disassemble`, `binary.xrefs` in both directions, `binary.cfg` (call destinations as `external_targets`, not successors), `binary.strings`, `binary.imports` (empty on the static fixture), `binary.exports`; all on one generated static x86-64 ELF | — |
+| `ghidra_mcpy` | [nightwing-us/mcpyghidra](https://github.com/nightwing-us/mcpyghidra) | `f1e130c` (v0.8.0); PyPI `mcpyghidra==0.8.0` | Apache-2.0 (+ NOTICE) | launch → JSON readiness → Streamable HTTP, one server per target | `live_analysis_verified` (automated live tests, passed 2026-10-15; re-run passed 2026-10-16, also on the reinstalled integration machine) for `binary.decompile`, `binary.metadata` (upstream's `entry_point` is its first external entry, so Nexus reports the entry as unknown), `binary.functions` (no sizes upstream), `binary.disassemble`, `binary.xrefs` in both directions, `binary.cfg`, `binary.strings`, `binary.imports` (empty on the fixture), `binary.exports`; all on one generated static x86-64 ELF | — |
 | `re_mcp_ida` | jtsylve/re-mcp, IDA backend | `7b38aa9`; PyPI `re-mcp-ida==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | `mock_tested` for the shared call path only (its mock imitates the Ghidra backend); the IDA response shapes (xref `from`/`to`, `pseudocode`, `disasm`, no image base) are `unit_tested` against the pinned source (`tests/test_interop_d.py`) | `blocked`: licensed IDA 9+ (none installed) |
 | `ida_official` | [HexRaysSA/ida-mcp](https://github.com/HexRaysSA/ida-mcp) | `df6de79`; PyPI `ida-mcp==20261008.0.1` | MIT | stdio MCP child; analysis only via `execute_python` (blocked by default) | `unit_tested` (manifest / code-execution gate) | `blocked`: licensed IDA 9.4+ with idalib |
 | `ida_rs` | [blacktop/ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) | `15d16ab` (v9.5.0-beta.6); stable tag v9.4.5 | MIT | stdio MCP child (`--read-only`) | `mock_tested` (mock fixtures built from the pinned upstream source, see [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md); never run against the real engine) | `blocked`: licensed IDA Pro 9.4; `IDADIR` unset |
@@ -55,7 +55,7 @@ was observed live with re-mcp-ghidra and a wrong `GHIDRA_INSTALL_DIR`.
 | `jadx` | [Qtty/jadx-mcp-server](https://github.com/Qtty/jadx-mcp-server) | `4e6d890` (pom 1.0.0) | **no LICENSE file**: no redistribution rights | stdio Python MCP → JVM daemon `127.0.0.1:8765` | `mock_tested` (mock fixtures built from the pinned upstream source, see [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md); never run against the real engine) | `blocked`: Maven build of the daemon (Maven absent; JDK 25 present); `JADX_MCP_HOME` unset |
 | `frida_mobile` | [monkeywave/frida-mobile-mcp](https://github.com/monkeywave/frida-mobile-mcp) | `b2da55d`; npm `frida-mobile-mcp@0.2.3` | MIT | stdio npm child, **dynamic**, never started while policy is off | `mock_tested` (2026-10-15: mock built from the pinned source, see [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md); never run against real Frida or a device) | `blocked`: no authorised test device; no frida/adb; policy disabled by design |
 | `llm4decompile` | [albertan017/LLM4Decompile](https://github.com/albertan017/LLM4Decompile) | `85b364b` | code MIT; **weights: DeepSeek License Agreement** | OpenAI-compatible `/v1/completions` you serve | `mock_tested` (local mock HTTP endpoint; not MCP) | `blocked`: no served checkpoint (nothing listening on 8000/8080/11434/1234); weights deliberately not downloaded |
-| `rea` | [morluto/rea](https://github.com/morluto/rea), npm `rea-agents` | `3b79af2` (tag `rea-agents-6.5.0`); npm `rea-agents@6.5.0` | MIT | stdio MCP child (`node rea.mjs mcp`) on a dedicated Node 24.21.0; **adapter-only**, two static tools allowed | `live_analysis_verified` (2026-10-15) **for `js.application` and `electron.fuses` only** + `mock_tested` | — (disabled in the example config; the other 205 REA tools are blocked by design) |
+| `rea` | [morluto/rea](https://github.com/morluto/rea), npm `rea-agents` | `3b79af2` (tag `rea-agents-6.5.0`); npm `rea-agents@6.5.0` | MIT | stdio MCP child (`node rea.mjs mcp`) on a dedicated Node 24.21.0; **adapter-only**, two static tools allowed | `live_analysis_verified` (2026-10-15; live test re-run passed 2026-10-16 on the reinstalled integration machine) **for `js.application` and `electron.fuses` only** + `mock_tested` | — (disabled in the example config; the other 205 REA tools are blocked by design) |
 | — | [symgraph/GhidrAssist](https://github.com/symgraph/GhidrAssist) | `db0bb3d` | MIT | none; Ghidra plugin acting as an MCP *client* of Nexus' loopback HTTP endpoint | `not_integrated` as a provider (by design); client path untested | Ghidra GUI session for the client test |
 | — | [ram-elgov/awesome-llm-reverse-engineering](https://github.com/ram-elgov/awesome-llm-reverse-engineering) | `55366aa` | README states "MIT" | research reading list | `not_integrated` (not a runtime component) | — |
 
@@ -82,13 +82,14 @@ oldest: awesome-llm-reverse-engineering 2025-07-28). The eleventh, REA, was adde
 
 ### Built-in (`builtin`, always on)
 - **Operations:** metadata, symbol-table/export function list, imports, exports and strings
-  for ELF, PE and Mach-O (Mach-O is headers only); Capstone disassembly of
+  for ELF, PE and Mach-O (Mach-O from `LC_SYMTAB` when present); Capstone disassembly of
   symbol-bounded ranges; APK manifest and components (the project's own binary-XML parser).
 - **Evidence:** parsed structures are `direct_observation`; Capstone output is `engine_derived`
   with engine family `capstone`. Capstone is independent of Ghidra and IDA, which makes it a
   real cross-check for instruction listings, but it does **no code discovery**.
 - **Limitations:** no decompiler; no control-flow recovery; the PE function list is exports
-  plus the entry point; Mach-O symbols are not decoded.
+  plus the entry point; Mach-O function sizes are unknown (the format does not record them), and dyld export
+  tries and chained fixups are not decoded.
 
 ### Ghidra via re-mcp (`ghidra_remcp`)
 - **Launch:** `uvx --python 3.12 re-mcp-ghidra==3.0.3` with `GHIDRA_INSTALL_DIR`, plus
@@ -108,6 +109,13 @@ oldest: awesome-llm-reverse-engineering 2025-07-28). The eleventh, REA, was adde
     warning.
   - `serverInfo` reports "Ghidra 3.4.8", which is the server framework's version, not
     Ghidra's. Nexus labels it "server-reported".
+  - Addresses are bare offsets (`format_address(addr.getOffset())`, tools/xrefs.py:66 and :94):
+    references and strings from non-loaded sections (symbol and string tables) arrive as small
+    numbers such as 0 or 80, indistinguishable from memory addresses. Nexus does not reinterpret
+    them; MCPyGhidra behaves the same way (observed live 2026-10-15).
+  - `get_basic_blocks` takes successors from `BasicBlockModel.getDestinations()` without flow
+    types (tools/cfg.py:89-96), so call targets arrive as successors. Destinations that are not
+    blocks of the function are reported as `external_targets`.
 - **Policy:** the meta-tools `call`, `batch` and `execute` can reach any tool by name, so they
   are hard-blocked. `open/close/wait_for_analysis` are lifecycle tools used only by the gateway.
 
@@ -127,9 +135,13 @@ oldest: awesome-llm-reverse-engineering 2025-07-28). The eleventh, REA, was adde
   Java GUI plugin fails to compile on stderr in headless mode; this is harmless.
 - **Independence:** same engine family as `ghidra_remcp`. Agreement between the two is
   reported as `same_family_consistency`, never as independent confirmation.
-- **Test coverage (since the 2026-10-15 audit):** live: decompile only; mock (`mock_launched.py`):
-  metadata, decompile, functions; unit (`tests/test_audit_regressions.py`): the cfg and xref
-  normalisers against the pinned 0.8.0 shapes; strings/imports/exports have no test.
+- **Test coverage:** live (`test_live_ghidra_operations_per_provider`, 2026-10-15): metadata,
+  functions, decompile, disassemble, xrefs to/from, cfg, strings, imports, exports on the ELF
+  fixture; mock (`mock_launched.py`): metadata, decompile, functions; unit
+  (`tests/test_audit_regressions.py`): cfg, xref and metadata normalisers. `context`'s
+  `memory.entry_point` is the first external entry point, else the first function, else the image
+  base (tools/core.py:686-701): Nexus keeps it as `first_external_entry` and reports `entry_point`
+  as unknown.
 
 ### Hex-Rays official IDA MCP (`ida_official`)
 - Six tools (upstream snapshot): `open_database`, `execute_python`, `reference`,

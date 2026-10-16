@@ -28,6 +28,10 @@ from ..redaction import redact_text
 from .base import AnalysisProvider, OperationResult, ProviderHealth, TargetContext, ToolInfo
 
 _MAX_RESTARTS = 2
+# A restart requested this long after the end of the last restart attempt (successful or not) starts with a fresh budget: at
+# most _MAX_RESTARTS within any such window (restarts only ever happen on a caller's request), so
+# the limit bounds crash loops, not the number of unrelated crashes over a gateway's lifetime.
+_RESTART_RESET_SECONDS = 600.0
 _MAX_TOOL_PAGES = 100  # pagination guard; the whole listing also shares one deadline
 
 _PASSTHROUGH_ENV = ("JAVA_HOME", "GHIDRA_INSTALL_DIR", "IDADIR", "ANDROID_HOME", "ANDROID_SDK_ROOT")
@@ -264,6 +268,7 @@ class McpProvider(AnalysisProvider):
         self._target_owners: OrderedDict[str, _ConnectionOwner] = OrderedDict()
         self._active_target: str | None = None
         self._restarts = 0
+        self._last_restart: float | None = None
         self._call_lock = asyncio.Lock()
         self.server_info: dict[str, Any] = {}
         self.adapter_state: dict[str, Any] = {}
@@ -601,6 +606,8 @@ class McpProvider(AnalysisProvider):
         return client
 
     async def _restart_global(self) -> None:
+        if self._last_restart is not None and time.monotonic() - self._last_restart >= _RESTART_RESET_SECONDS:
+            self._restarts = 0
         if self._restarts >= _MAX_RESTARTS:
             raise ProviderUnavailable(
                 f"{self.id}: connection lost and restart budget ({_MAX_RESTARTS}) is exhausted; see {self.log_path}"
@@ -609,8 +616,13 @@ class McpProvider(AnalysisProvider):
         if self._owner is not None:
             await self._owner.close()
         self.started = False
-        await anyio.sleep(min(2.0 * self._restarts, 5.0))
-        await self._connect_global()
+        try:
+            await anyio.sleep(min(2.0 * self._restarts, 5.0))
+            await self._connect_global()
+        finally:
+            # Quiet time is counted from the end of the last attempt, failed or not: a child that
+            # no longer starts gets _MAX_RESTARTS attempts per window, not one per caller request.
+            self._last_restart = time.monotonic()
 
     async def release_target(self, sha256: str) -> None:
         owner = self._target_owners.pop(sha256, None)

@@ -135,6 +135,10 @@ def _ida_more(tool: str, payload: Any) -> list[str]:
     return []
 
 
+# DisasmFunctionAtRequest.count is 1-5000 (src/server/requests.rs:348-350); the default is 200.
+_IDA_DISASM_MAX = 5000
+
+
 class IdaRsAdapter(McpAdapter):
     async def prepare(self, provider, target) -> dict[str, Any]:
         sessions = provider.adapter_state.setdefault("sessions", {})
@@ -283,6 +287,10 @@ class IdaRsAdapter(McpAdapter):
     async def op_binary_disassemble(self, provider, target, session, params):
         address, name, ref = function_ref(params)
         args: dict[str, Any] = {"address": ref} if address is not None else {"target_name": name}
+        # Upstream stops after `count` lines (default 200) with no truncation marker
+        # (server/mod.rs disasm_function_at, handlers/disasm.rs:245-283): always ask explicitly.
+        count = max(1, min(int(params.get("count") or _IDA_DISASM_MAX), _IDA_DISASM_MAX))
+        args["count"] = count
         payload, text, raw = await self.call(provider, target, "disasm_function_at", args)
         # A plain-text listing is parsed below; a JSON payload must carry an instruction list.
         warnings = [] if payload is None else _json_listing(payload, "disasm_function_at", "instructions", "lines")[1]
@@ -299,6 +307,10 @@ class IdaRsAdapter(McpAdapter):
                 )
         if not instructions:
             instructions = parse_listing_lines(text)
+        if len(instructions) >= count:
+            warnings.append(
+                f"disasm_function_at returned its limit of {count} instructions; the function may be longer"
+            )
         return self.result(
             provider,
             "binary.disassemble",

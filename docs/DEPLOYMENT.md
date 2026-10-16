@@ -18,6 +18,14 @@ machine-specific and lives **outside** the repository. Only this description is 
 | REA home / temp sandbox dirs | `%LOCALAPPDATA%\RevEngNexus\data\rea-home`, `…\data\rea-tmp` | `HOME`/`USERPROFILE`/`TEMP`/`TMP` of the REA child in the example config |
 | Claude Code registration | `%USERPROFILE%\.claude.json` (user scope) | written by `claude mcp add --scope user` |
 
+**Re-established 2026-10-16** after an OS reinstall, with the steps below and in the REA section:
+Ghidra and Node.js re-downloaded and verified (digests as recorded here), REA reinstalled and
+checked against its pin, a fresh `config init` (REA block then enabled with absolute paths, after
+a timestamped backup), the workspace fixture regenerated, and the Claude Code registration
+re-added. The old evidence DB was lost with the machine; a new, empty one was created. The system
+Node.js on the reinstalled machine is 24.20.0; REA still uses the dedicated 24.21.0 runtime.
+Results: [TESTING.md](TESTING.md#re-verification-on-a-reinstalled-machine-2026-10-16).
+
 ## Set up from scratch
 
 ```powershell

@@ -76,7 +76,7 @@ IDA_TOOLS = [
     _tool("idb_meta", annotations=RO),
     _tool("list_functions", "limit", "offset", "filter", annotations=RO),
     _tool("decompile", "address", annotations=RO),
-    _tool("disasm_function_at", "address", "target_name", annotations=RO),
+    _tool("disasm_function_at", "address", "target_name", "offset", "count", annotations=RO),  # requests.rs:339-351
     _tool("xrefs_to", "address", "limit", annotations=RO),
     _tool("xrefs_from", "address", "limit", annotations=RO),
     _tool("strings", "limit", "filter", annotations=RO),
@@ -276,8 +276,9 @@ def _ida(name: str, args: dict[str, Any]) -> CallToolResult:
         start = fn["address"]
         if name == "decompile":  # single address: Content::text(code)
             return _text(f"__int64 __fastcall {fn['name']}()\n{{\n  return 0LL;\n}}")
-        if name == "disasm_function_at":  # handlers/disasm.rs: "{:#x}:\t{line}" per instruction
-            return _text(f"{start:#x}:\tpush    rbp\n{start + 1:#x}:\tretn")
+        if name == "disasm_function_at":  # handlers/disasm.rs: "{:#x}:\t{line}" per instruction, at most `count`
+            lines = [f"{start:#x}:\tpush    rbp", f"{start + 1:#x}:\tretn"]
+            return _text("\n".join(lines[: int(args.get("count") or 200)]))
         if name == "basic_blocks":  # Vec<BasicBlockInfo> as a pretty JSON array
             return _rust_pretty(
                 [
