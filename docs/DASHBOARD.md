@@ -1,8 +1,9 @@
 # Local dashboard
 
-A read-only web console for RevEng Nexus: gateway health, effective policy, providers,
-every discovered tool with the gateway's own policy decision, the request path, and the
-recorded activity. It cannot call a tool, change policy or read arbitrary files.
+A read-only web console for RevEng Nexus in five sections: Overview (is Nexus healthy?),
+Catalog (providers and tools), Security (what is allowed and blocked), Activity (what has
+happened) and System (architecture, definitions, diagnostics). Simple by default; every
+technical detail stays reachable through disclosures, drawers and filters. It cannot call a tool, change policy or read arbitrary files.
 
 ```powershell
 reveng-nexus --config "$env:LOCALAPPDATA\RevEngNexus\config\providers.yaml" dashboard
@@ -161,29 +162,87 @@ any local process of the same user can read it. Snapshot files hold the tool cat
 policy decisions (no secrets, no target data) and are readable by the same user. Workspace
 roots and the config path are shown with the home directory shortened.
 
-## Pages
+## Navigation and pages
 
-* **Overview:** gateway state, uptime (live only), effective policy, provider health,
-  the distinct counts, recorded activity, documented verification coverage, warnings
-  (config, audit and snapshot write failures, configured-vs-effective policy mismatches),
-  gateway processes.
-* **Providers:** searchable and filterable cards; detail pages with identity and health,
-  upstream pin, documented verification, the counts, how the adapter works, why tools are
-  restricted (class × decision), and the operation-to-upstream-tool mappings.
-* **Tool Explorer:** every `nexus_*` tool and every discovered upstream tool, filterable by
-  provider, operation, status (callable / adapter-only / blocked / exposed), policy class and
-  verification; details show the decision and reason, the request path, identity, readable
-  input schema (required/optional) and the raw schema. Nothing can be invoked.
-* **Architecture:** the real request path as an interactive SVG (click, or Tab + Enter, for
-  responsibility, inputs/outputs, dependencies, health, verification, restrictions, pins).
-  Edges are solid for ready providers and dashed otherwise; there is no traffic animation,
-  because there is no live request stream.
-* **Security:** configured vs effective policy, hard blocks (unrelaxable classes, mutation
-  patterns, global deny patterns), REA's two-operation allowlist mapped to operations and
-  Nexus tools, target and network rules, per-provider restrictions, recorded policy denials.
-* **Activity:** audit-log tail (metadata only), event counts, recent events with filters,
-  evidence-store counts. No arguments or results exist to show.
-* **Definitions:** every metric, freshness state, policy class and verification state.
+Simple by default, comprehensive on demand: each page answers one question at a glance,
+and every technical datum is one disclosure, drawer or filter away. Five sections, with a
+second row of views only where a section has several:
+
+| Section | Question | Views and routes |
+|---|---|---|
+| **Overview** | Is Nexus healthy? | `#/overview` |
+| **Catalog** | What is available, and how does it work? | Providers `#/catalog/providers`, provider detail `#/catalog/providers/<id>`; Tools `#/catalog/tools`, tool detail `#/catalog/tools/<provider>/<tool>` |
+| **Security** | What is allowed and what is blocked? | `#/security` |
+| **Activity** | What has happened? | `#/activity` |
+| **System** | How is everything connected, and what do the figures mean? | Architecture `#/system/architecture`, Definitions `#/system/definitions`, Diagnostics `#/system/diagnostics` |
+
+Routes are hash routes, so links can be shared, and browser back and forward work.
+The routes of the earlier seven-page layout redirect: `#/providers[/<id>]`,
+`#/tools`, `#/tools/provider/<id>` (opens Tools filtered to that provider),
+`#/architecture`, `#/definitions`. Filters, sort order, open disclosures and the
+architecture toggle are kept in memory while the page is open (not in the URL). Escape
+closes a drawer; tables, rows, disclosures and graph nodes are keyboard-operable.
+
+* **Overview:** one status line: health, freshness, version, uptime (live only), the
+  policy in a phrase, and providers ready of enabled. Four figures: ready providers,
+  callable tools, blocked tools, warnings. When the snapshot is not live, the figures are
+  labelled "last known". A single *Needs attention* list (severity, source, link; at most five
+  items, the rest in Diagnostics) and the five latest audit events (labelled `history` when
+  older than the running gateway). *Detailed metrics* (collapsed) lists all eight counts with
+  their definitions.
+* **Catalog › Providers:** a compact table (name and engine, health, enabled, documented
+  verification, one count summary) with search and a status filter; verification and
+  enabled filters under *Advanced filters*. The provider page has *Summary* (health and
+  detail, freshness, enabled, verification, adapter-only), *Capabilities* (declared and usable
+  operations, operation → upstream tools), *Tools* (discovered/allowed/callable/blocked/exposed
+  and a searchable tool list), and collapsed *Technical details* (upstream pin, engine and
+  transport, server-reported version, restarts, last health check, configuration diagnostics,
+  how the adapter works, documented limitations, verification record and prerequisite, the
+  class × decision breakdown) and *Detailed health result* (fields and the raw record).
+* **Catalog › Tools:** tool, provider, access, operation and a one-line explanation per row;
+  search, provider and access filters; operation, policy class and verification under
+  *Advanced filters*. The drawer has six sections: *Summary*, *Access decision* (the
+  gateway's decision and reason, allowed / callable / adapter-only / exposed), *How it works*
+  (operations, upstream tool, public name with copy, request path), *Input schema* (required
+  first, constraints, raw schema collapsed), *Security classification* (class and meaning,
+  source, unrelaxable restriction, upstream annotations), *Verification* (provider record;
+  per-tool coverage is not recorded and says so). Nothing can be invoked.
+* **Security:** the five controls with their state and consequence in plain words, and
+  which policy classes are callable, adapter-internal or blocked. Collapsed: hard blocks
+  (unrelaxable classes, mutation patterns, global deny patterns), configured vs effective
+  policy, provider-specific restrictions, the REA allowlist (tool → operation → Nexus tool),
+  targets/staging/workspace, network and dashboard access (including the no-authentication
+  caveat), every distinct policy-decision reason with counts, recorded policy denials.
+* **Activity:** time, event, provider, outcome, duration and explanation per record; event
+  and outcome filters, provider and era under *Advanced filters*; a note when legacy
+  cancellation records exist. Selecting a record opens all its sanitised fields, its era and
+  note. *Summary and evidence* (collapsed): audit-log facts, event counts, calls by provider,
+  evidence-store counts, telemetry notes.
+* **System › Architecture:** the request path with the gateway, policy, registry, stores,
+  enabled providers and their upstreams; disabled providers fold into one node. *Show internal
+  components* adds the workspace guard, module names, edge labels and each disabled provider.
+  Every node opens its full explanation. No traffic is animated.
+* **System › Definitions:** searchable, grouped (provider and tool counts, operations, policy
+  and access, freshness, verification, findings including the Ghidra 41-versus-66 and REA
+  explanations); each entry expands to its exact source.
+* **System › Diagnostics:** searchable, severity-filtered findings in six groups (gateway,
+  providers, snapshots, configuration, verification, dependencies and blockers), most severe
+  first; groups that need attention open by default, empty groups say so. Gateway facts (pid,
+  Python, platform, transport, tool mode, start, health check, heartbeat, config path) and the
+  snapshot-file table are here. Every item is derived from the API; nothing is synthesised.
+
+### Where the earlier pages went
+
+| Earlier location | Now |
+|---|---|
+| Top bar: pid, transport, load time | System › Diagnostics › Gateway facts (header keeps freshness and age) |
+| Overview cards: gateway, policy, provider health, seven metrics, activity, verification coverage, unavailable dependencies, warnings, gateway processes | Overview status line, four figures, *Needs attention*, *Recent activity*, *Detailed metrics* (all eight counts); verification and dependencies → Diagnostics; processes → Diagnostics › Snapshots |
+| Providers cards and detail page | Catalog › Providers (table) and provider page (Summary, Capabilities, Tools, Technical details, Detailed health result) |
+| Tool Explorer and drawer | Catalog › Tools and its six-section drawer |
+| Architecture | System › Architecture (simplified default, internal toggle) |
+| Security cards | Security summary and its collapsed technical sections |
+| Activity cards and table | Activity table, record drawer, *Summary and evidence* |
+| Definitions | System › Definitions (grouped, searchable) |
 
 ## Unavailable telemetry
 
@@ -191,9 +250,9 @@ roots and the config path are shown with the home directory shortened.
 * Arguments, results and target content are never logged, so they cannot be shown.
 * Per-target servers (MCPyGhidra) list their tools only once a target session exists, so
   their "discovered" count is 0 until then.
-* Audit records are history, not health. The Activity page labels each record `this
-  gateway` (written since the running gateway started) or `history`; provider health comes
-  only from the gateway snapshot. Audit lines written before 2026-10-16 recorded a provider
+* Audit records are history, not health. Activity marks every record written before the
+  running gateway started with a `history` tag (era filter: current / historical, and the
+  record drawer states it); provider health comes only from the gateway snapshot. Audit lines written before 2026-10-16 recorded a provider
   start cut short by gateway shutdown (`claude mcp add/get/list` stop the server right after
   the handshake) as `failed` with `CancelledError`. Such starts are now recorded as
   `cancelled`. The old lines are shown exactly as written, with an explanatory note and a

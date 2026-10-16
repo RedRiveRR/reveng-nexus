@@ -37,7 +37,7 @@ vendored.
 | REA: static JavaScript/Electron (ASAR) analysis and Electron fuses | working for these two operations (`live_analysis_verified`, opt-in; disabled in the example config); every other REA tool blocked |
 | IDA (official / ida-mcp-rs / re-mcp-ida), Binary Ninja, JADX, Frida | adapters exist (mock-tested, except `ida_official`: gating only); **not runtime-tested here** |
 | LLM4Decompile | adapter tested against a mock OpenAI-compatible server only |
-| Local dashboard (`reveng-nexus dashboard`, http://127.0.0.1:8770/) | read-only console over gateway snapshots: health, effective policy, providers, every tool's policy decision, architecture, audit activity; loopback only, GET only ([docs/DASHBOARD.md](docs/DASHBOARD.md)) |
+| Local dashboard (`reveng-nexus dashboard`, http://127.0.0.1:8770/) | read-only console over gateway snapshots in five sections: Overview (health at a glance), Catalog (providers and tools with their policy decisions), Security, Activity (audit history) and System (architecture, definitions, diagnostics); details on demand; loopback only, GET only, no authentication, so readable by any process running as your user ([docs/DASHBOARD.md](docs/DASHBOARD.md)) |
 
 ## Quick start (Windows PowerShell, Ghidra-first, no commercial software)
 

@@ -683,3 +683,151 @@ def test_misplaced_top_level_data_dir_is_reported(tmp_path):
     assert any("'data_dir' is set both" in w for w in config.warnings)
     quiet = parse_config({"workspace": {"data_dir": str(tmp_path / "data")}}, base_dir=tmp_path)
     assert not any("set both" in w for w in quiet.warnings)
+
+
+# -- redesigned navigation and information coverage -----------------------------------------
+STATIC = ROOT / "src" / "reveng_nexus" / "dashboard" / "static"
+
+
+def test_navigation_has_five_sections_subviews_and_legacy_redirects():
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    sections = re.findall(r'data-section="([a-z]+)"', html)
+    assert sections == ["overview", "catalog", "security", "activity", "system"]
+    for view in (
+        "overview",
+        "security",
+        "activity",
+        '"catalog/providers"',
+        '"catalog/tools"',
+        '"system/architecture"',
+        '"system/definitions"',
+        '"system/diagnostics"',
+    ):
+        assert view in js, view
+    assert 'catalog: [["providers", "Providers"], ["tools", "Tools"]]' in js
+    assert '["architecture", "Architecture"], ["definitions", "Definitions"], ["diagnostics", "Diagnostics"]' in js
+    for old, new in (
+        ("providers", "catalog/providers"),
+        ("tools", "catalog/tools"),
+        ("architecture", "system/architecture"),
+        ("definitions", "system/definitions"),
+    ):
+        assert f'{old}: "{new}"' in js, old
+    assert 'parts[0] === "tools" && parts[1] === "provider"' in js  # old #/tools/provider/<id>
+    assert "history.replaceState" in js  # redirects keep back/forward history clean
+
+
+def test_ui_consumes_every_preserved_backend_field():
+    """Inventory check: each datum the old pages showed is still produced and still read by the UI."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    from reveng_nexus.dashboard.data import METRIC_DEFINITIONS
+
+    for key in METRIC_DEFINITIONS:  # every metric definition is categorised explicitly
+        assert f'"{key}"' in js, key
+    fields = [
+        # gateway / freshness / warnings
+        "freshness",
+        "age_seconds",
+        "started_at",
+        "last_health_at",
+        "heartbeat_seconds",
+        "config_warnings",
+        "audit_write_failures",
+        "snapshot_write_failures",
+        "policy_mismatches",
+        "unreadable_snapshots",
+        "instances",
+        # policy and security
+        "read_only",
+        "code_execution",
+        "dynamic_analysis",
+        "remote_ai",
+        "remote_providers",
+        "unrelaxable_classes",
+        "default_blocked_tool_patterns",
+        "global_blocked_tool_patterns",
+        "allowed_roots",
+        "max_artifact_bytes",
+        "follow_symlinks",
+        "policy_denials",
+        # providers and tools
+        "pinned_revision",
+        "package_version",
+        "limitations",
+        "verified_on",
+        "operations",
+        "usable_operations",
+        "adapter_only",
+        "used_by_operations",
+        "exposed_to_clients",
+        "classification_source",
+        "class_meaning",
+        "annotations",
+        "input_schema",
+        "policy_reason",
+        "public_name",
+        "server_info",
+        "restarts",
+        # documented records and definitions
+        "verification",
+        "blocker",
+        "scope",
+        "last_recorded",
+        "verification_states",
+        "freshness_legend",
+        "tool_classes",
+        "architecture",
+        # activity
+        "era",
+        "note",
+        "legacy_cancel_records",
+        "current_gateway_since",
+        "event_counts",
+        "calls_by_provider",
+        "evidence_by_provider_tool",
+        "telemetry_notes",
+        "records_read",
+        "tail_only",
+    ]
+    missing_ui = [f for f in fields if f not in js]
+    assert missing_ui == []
+
+
+async def test_backend_still_produces_every_field_the_ui_reads(config_factory, workspace):
+    config = config_factory(workspace, [mock_engine("eng"), rea_mock(), mock_engine("off", enabled=False)])
+    mgr = await started(config)
+    try:
+        await mgr.health()
+        SnapshotWriter(mgr).write()
+        dash = DashboardData(config)
+        state, act = dash.state(), dash.activity()
+    finally:
+        await mgr.close()
+    blob = json.dumps({"state": state, "activity": act})
+    for field in (
+        "freshness",
+        "age_seconds",
+        "heartbeat_seconds",
+        "unrelaxable_classes",
+        "default_blocked_tool_patterns",
+        "used_by_operations",
+        "exposed_to_clients",
+        "classification_source",
+        "pinned_revision",
+        "limitations",
+        "verification_states",
+        "freshness_legend",
+        "tool_classes",
+        "legacy_cancel_records",
+        "current_gateway_since",
+        "event_counts",
+        "calls_by_provider",
+        "telemetry_notes",
+        "unreadable_snapshots",
+        "instances",
+        "era",
+    ):
+        assert f'"{field}"' in blob, field
+    rea = provider(state["primary"], "rea")
+    assert rea["counts"]["policy_allowed_tools"] == 2 and rea["counts"]["callable_tools"] == 0
