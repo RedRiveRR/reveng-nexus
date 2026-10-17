@@ -233,6 +233,75 @@ def test_protection_bypass_is_hard_blocked_everywhere(profile, tool):
     assert not engine.decide(provider, tool, cls, arguments=args, input_schema=schema).allowed
 
 
+# -- tool_overrides cannot downgrade a pinned mutating tool --------------------------------------------------
+
+_PINNED_MUTATE = [("re_mcp", "save_database"), ("mcpyghidra", "patch"), ("ida_rs", "save_idb")]
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+@pytest.mark.parametrize(("adapter", "tool"), _PINNED_MUTATE)
+@pytest.mark.parametrize("override", ["read", "unknown", "execute", "dynamic", "lifecycle"])
+def test_override_cannot_downgrade_a_manifest_mutating_tool(profile, adapter, tool, override):
+    """A tool the pinned manifest classifies as mutate keeps that class whatever an override says:
+    "read" would make it callable under read-only policy; other classes would move it to a different
+    gate. With writes off (restricted, balanced, or full_access with read_only: true) it stays
+    denied, and in every profile the decision equals the one without the override."""
+    from reveng_nexus.adapters import ADAPTERS
+
+    manifest = ADAPTERS[adapter].manifest
+    assert manifest[tool] == "mutate"  # precondition: pinned as mutating at the reviewed release
+    plain = ProviderConfig(id="prov", name="p", command="x", adapter=adapter)
+    overridden = ProviderConfig(id="prov", name="p", command="x", adapter=adapter, tool_overrides={tool: override})
+    for read_only in {profile != "full_access", True}:
+        engine = _engine(profile, read_only=read_only)
+        cls = engine.classify(overridden, tool, manifest=manifest)
+        assert (cls.tool_class, cls.source) == ("mutate", "manifest")
+        decision = engine.decide(overridden, tool, cls, arguments={})
+        baseline = engine.decide(plain, tool, engine.classify(plain, tool, manifest=manifest), arguments={})
+        assert decision.allowed == baseline.allowed
+        if read_only:
+            assert not decision.allowed, decision.reason
+
+
+@pytest.mark.parametrize("override", ["read", "unknown"])
+def test_override_cannot_downgrade_an_adapter_class_for_unlisted_tools(override):
+    engine = _engine("balanced")
+    provider = ProviderConfig(id="prov", name="p", command="x", tool_overrides={"frob": override})
+    cls = engine.classify(provider, "frob", unlisted_class="mutate")
+    assert (cls.tool_class, cls.source) == ("mutate", "manifest")
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_override_may_still_tighten_a_manifest_mutating_tool(profile):
+    from reveng_nexus.adapters import ADAPTERS
+
+    manifest = ADAPTERS["re_mcp"].manifest
+    engine = _engine(profile)
+    for override, expected in (("blocked", "blocked"), ("mutate", "mutate")):
+        provider = ProviderConfig(id="prov", name="p", command="x", tool_overrides={"save_database": override})
+        cls = engine.classify(provider, "save_database", manifest=manifest)
+        assert (cls.tool_class, cls.source) == (expected, "override")
+    blocked = ProviderConfig(id="prov", name="p", command="x", tool_overrides={"save_database": "blocked"})
+    cls = engine.classify(blocked, "save_database", manifest=manifest)
+    assert not engine.decide(blocked, "save_database", cls, arguments={}).allowed
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_ordinary_overrides_of_unpinned_tools_still_apply(profile):
+    """Explicit classifications of tools no manifest pins stay the operator's decision, including a
+    name that merely looks mutating (the heuristic is a guess, not a reviewed classification)."""
+    engine = _engine(profile)
+    assert engine.classify(PROVIDER, "rename_function").tool_class == "mutate"  # heuristic only
+    provider = ProviderConfig(
+        id="prov", name="p", command="x", tool_overrides={"frob": "read", "rename_function": "read", "list_x": "mutate"}
+    )
+    for tool, expected in (("frob", "read"), ("rename_function", "read"), ("list_x", "mutate")):
+        cls = engine.classify(provider, tool)
+        assert (cls.tool_class, cls.source) == (expected, "override")
+    frob = engine.classify(provider, "frob")
+    assert engine.decide(provider, "frob", frob, arguments={}).allowed  # verified read: every profile
+
+
 # -- every surface agrees with the others and with invocation --------------------------------------------------
 
 

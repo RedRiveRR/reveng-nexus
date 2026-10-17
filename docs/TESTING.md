@@ -207,6 +207,36 @@ After every run no test process was left (non-zombie check, rechecked for up to 
 covered: macOS (EPERM/zombie handling is from the SDK's documentation, untested), Windows, real
 REA behind the guard.
 
+Security review follow-up on PR #1 (2026-10-17, same Linux container):
+
+* **Override downgrade of pinned mutating tools.** `PolicyEngine.classify()` protected only
+  `blocked`/`execute`/`dynamic`/`lifecycle` from overrides, so `tool_overrides: {save_database:
+  read}` turned a manifest-pinned `mutate` into a callable read under read-only policy. A pinned
+  `mutate` (manifest, or the adapter's class for unlisted tools) now accepts only `mutate` or
+  `blocked`; a name-only `mutate` guess stays operator-correctable. Before the fix 47 of the new
+  tests failed (every override was accepted in place of the pinned class); the tightening and
+  ordinary-override tests passed before and after.
+* **Guard transfer-prefix collisions.** `_stdio_launch` passed the guard the plain environment
+  plus the transfer chunks, so a provider variable such as `REVENG_NEXUS_GUARD_ENV_x` made the
+  guard refuse to start ("incomplete chunks") and `REVENG_NEXUS_GUARD_ENV_0` was overwritten in
+  the guard's environment. The guard now gets only the chunks (plus the SDK's fixed defaults);
+  the provider's variables, prefixed or not, travel inside the encoded copy. This also drops the
+  duplicate plain copy: the guard's environment is about 4/3 of the server's instead of 7/3. A
+  launch whose encoded copy would exceed `SC_ARG_MAX` is refused before anything starts, with a
+  message naming both sizes (before: an opaque `OSError: [Errno 7] Argument list too long`).
+  Before the fix 5 of the new or changed tests failed.
+
+| Command | Result |
+|---|---|
+| access-profile, security, config, Frida, adapter, server and dashboard files | 387 passed |
+| environment/launch subset of `test_process_lifecycle.py`, 3 repeats | 8 passed each time |
+| `pytest -q -rs` | **716 passed, 0 failed**, 8 skipped (as above), 724 collected, 6 min 37 s |
+| ruff check, ruff format --check (87 files), mypy (45 files), compileall, `--check-config` on the example, `node --check app.js`, `git diff --check` | clean |
+
+No test process was left after any run (non-zombie check, rechecked for up to 10 s). Not run:
+Windows, macOS, real REA. The dashboard's "never relaxable" list still shows the four
+unconditional classes only; the pinned-`mutate` rule is enforced but not listed there.
+
 Skips: live Ghidra x2, live REA x1 (opt-in variables unset), NTFS ADS x1, UNC x4 (Windows
 concepts). The Windows suite and the live Ghidra/REA tests have **not** been re-run for these
 changes.

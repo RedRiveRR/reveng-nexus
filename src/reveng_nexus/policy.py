@@ -54,6 +54,11 @@ _TARGET_ARGS = ("target", "package", "package_name", "bundle_id", "identifier", 
 # "lifecycle" tools take filesystem paths (open_idb path/idb_out, open_database file_path,
 # load_apk apkPath) that the workspace guard never sees, so they cannot become "read" either.
 _UNRELAXABLE = frozenset({"blocked", "execute", "dynamic", "lifecycle"})
+# A *pinned* class (manifest, or the adapter's class for unlisted tools) is a reviewed reading of the
+# upstream release: an override may not turn a pinned mutating tool into a read (callable under
+# read-only policy) or move it to another gate either. A name-based "mutate" guess stays the
+# operator's to correct.
+_PINNED_UNRELAXABLE = _UNRELAXABLE | {"mutate"}
 # Classification sources an operator or a reviewed upstream pin stands behind.
 VERIFIED_SOURCES = frozenset({"manifest", "override"})
 
@@ -138,8 +143,9 @@ class PolicyEngine:
             override = provider.tool_overrides[tool_name]
             # An override may tighten but never relax a hard block, a lifecycle tool or an
             # execution/instrumentation class, whether it comes from the pinned manifest or from the
-            # tool's name (an unlisted "frobnicate_exec_shell" keeps its execute-shaped heuristic).
-            protected = {c for c in (pinned, heuristic) if c in _UNRELAXABLE}
+            # tool's name (an unlisted "frobnicate_exec_shell" keeps its execute-shaped heuristic),
+            # nor a pinned mutating class (only "mutate" or "blocked" are accepted there).
+            protected = {pinned} & _PINNED_UNRELAXABLE | {heuristic} & _UNRELAXABLE
             if not protected or override == "blocked" or protected == {override}:
                 return ToolClassification(override, "override")
         if pinned is not None:

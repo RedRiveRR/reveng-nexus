@@ -76,8 +76,11 @@
    that group when the server exits (the SDK alone kills the tree only of a server that fails
    to exit). The server's environment is the one Nexus built (the SDK's defaults merged with
    it), passed to the guard in encoded `REVENG_NEXUS_GUARD_ENV_*` variables that the server never
-   sees, because the guard's own interpreter changes its environment at start-up. Launched HTTP
-   servers get Nexus's own Job Object or POSIX process group.
+   sees, because the guard's own interpreter changes its environment at start-up. They are the
+   guard's only variables besides the SDK's defaults, so a provider variable using that prefix
+   travels inside the encoded copy like any other. A launch whose encoded copy (about 4/3 of the
+   environment) would exceed the system's argument/environment limit is refused with a clear
+   error. Launched HTTP servers get Nexus's own Job Object or POSIX process group.
 4. **Discover.** `tools/list` is paginated to completion; each tool is classified and given
    a policy decision, which is re-checked on every call with the actual arguments and the
    tool's input schema. For an adapter-only provider (REA) every caller-initiated raw call is

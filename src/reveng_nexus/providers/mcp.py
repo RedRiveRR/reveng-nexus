@@ -49,13 +49,45 @@ def _stdio_launch(
 
     POSIX: through ``_stdio_guard.py``, which reaps the server's descendants when the server exits
     (the MCP SDK only kills the process group of a server that fails to exit). The server's own
-    argv follows ``--`` unchanged; ``env`` travels encoded beside the guard's environment, because
-    the guard's interpreter alters its own at start-up, and is the only environment the server
-    gets. Windows: unchanged; the SDK's Job Object reaps the tree.
+    argv follows ``--`` unchanged. ``env`` travels only encoded (``encode_environment``): the guard
+    gets nothing but the transfer variables (plus the SDK's fixed defaults), so a provider variable
+    that happens to use the transfer prefix cannot be mistaken for, or overwritten by, a transfer
+    chunk, and the guard's interpreter, which alters its own environment at start-up, never
+    passes it on. Raises ValueError when the encoded copy (about 4/3 of the environment's size)
+    would not fit the system's argument/environment limit. Windows: unchanged; the SDK's Job
+    Object reaps the tree.
     """
     if not (os.name != "nt" if posix is None else posix):
         return list(command), env
-    return [sys.executable, "-I", str(STDIO_GUARD), "--", *command], {**env, **encode_environment(env)}
+    argv = [sys.executable, "-I", str(STDIO_GUARD), "--", *command]
+    launch_env = encode_environment(env)
+    needed = _exec_space(argv, launch_env) + _SDK_DEFAULTS_ALLOWANCE
+    limit = _arg_max()
+    if limit is not None and needed > limit:
+        raise ValueError(
+            f"launching it through the stdio guard needs about {needed} bytes of argument/environment "
+            f"space (the environment is passed encoded, about 4/3 of its size), over the system "
+            f"limit of {limit}; reduce the provider's environment"
+        )
+    return argv, launch_env
+
+
+# Room for the environment the SDK merges in (HOME, LOGNAME, PATH, SHELL, TERM, USER).
+_SDK_DEFAULTS_ALLOWANCE = 8 * 1024
+
+
+def _exec_space(argv: list[str], env: dict[str, str]) -> int:
+    """Bytes execve() needs for ``argv`` and ``env``: each string, its NUL and its pointer."""
+    strings = [os.fsencode(a) for a in argv] + [os.fsencode(k) + b"=" + os.fsencode(v) for k, v in env.items()]
+    return sum(len(item) + 1 + 8 for item in strings)
+
+
+def _arg_max() -> int | None:
+    try:
+        limit = os.sysconf("SC_ARG_MAX")
+    except (AttributeError, ValueError, OSError):
+        return None
+    return limit if limit > 0 else None
 
 
 def _resolve_command(command: str) -> list[str]:

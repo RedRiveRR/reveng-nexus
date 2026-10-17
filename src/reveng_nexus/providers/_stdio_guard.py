@@ -12,7 +12,10 @@ POSIX through this guard:
   stdin, stdout and stderr, argv and working directory, and no shell;
 * its environment is the one Nexus built, passed byte for byte through ``GUARD_ENV_PREFIX``
   variables (see ``encode_environment``) and never the guard's own: the guard's interpreter
-  changes its environment at start-up (PEP 538 locale coercion sets ``LC_CTYPE``);
+  changes its environment at start-up (PEP 538 locale coercion sets ``LC_CTYPE``). Nexus gives
+  the guard only those variables (and the SDK's fixed defaults), so every ``GUARD_ENV_PREFIX``
+  name the guard sees is a transfer chunk, and provider variables with that prefix travel
+  inside the encoded copy like any other;
 * when the server exits, the guard empties that group: SIGTERM, then SIGKILL only if members are
   left after a bounded grace period, so the server's descendants do not outlive it;
 * SIGTERM, SIGINT and SIGHUP sent to the guard (the SDK escalates with SIGTERM when the server
@@ -72,7 +75,9 @@ def encode_environment(env: Mapping[str, str]) -> dict[str, str]:
 
 def decode_environment(environ: Mapping[str, str]) -> dict[bytes, bytes] | None:
     """The environment carried by ``environ``'s ``GUARD_ENV_PREFIX`` variables; None if there are
-    none. Raises ValueError for an incomplete or malformed set."""
+    none. Raises ValueError for an incomplete or malformed set. Every prefixed name is taken as a
+    chunk: the launcher must pass no other variable with this prefix (``_stdio_launch`` passes
+    only the chunks)."""
     chunks = {k[len(GUARD_ENV_PREFIX) :]: v for k, v in environ.items() if k.startswith(GUARD_ENV_PREFIX)}
     if not chunks:
         return None

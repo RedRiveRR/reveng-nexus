@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from reveng_nexus.providers._stdio_guard import GUARD_ENV_PREFIX
+from reveng_nexus.providers._stdio_guard import GUARD_ENV_PREFIX, decode_environment
 from reveng_nexus.providers.mcp import STDIO_GUARD, _ProcessTree, _stdio_launch
 from reveng_nexus.registry import ProviderManager
 
@@ -219,7 +219,7 @@ async def test_stdio_server_receives_exactly_the_environment_nexus_built(config_
 
     pid_file = tmp_path / "tree.json"
     provider = _tree_provider(pid_file)
-    provider["env"] |= {"NEXUS_PROBE": "a=b  c ü $HOME *", "EMPTY_VALUE": ""}
+    provider["env"] |= {"NEXUS_PROBE": "a=b  c ü $HOME *", "EMPTY_VALUE": ""} | _PREFIX_COLLISIONS
     mgr = ProviderManager(config_factory(workspace, [provider]))
     pids: dict[str, int] = {}
     try:
@@ -349,12 +349,22 @@ def _env_executable() -> str:
     return found
 
 
+# Provider variables that use the guard's transfer prefix: a non-numeric suffix, a chunk-shaped
+# name and the bare prefix. They belong to the provider and must arrive unchanged.
+_PREFIX_COLLISIONS = {
+    f"{GUARD_ENV_PREFIX}x": "provider value",
+    f"{GUARD_ENV_PREFIX}0": "not a chunk",
+    GUARD_ENV_PREFIX: "",
+}
+
+
 @posix_only
-@pytest.mark.parametrize("extra", [{}, {"LC_CTYPE": "C"}, {"LANG": "C", "LC_ALL": "C"}])
+@pytest.mark.parametrize("extra", [{}, {"LC_CTYPE": "C"}, {"LANG": "C", "LC_ALL": "C"}, _PREFIX_COLLISIONS], ids=str)
 def test_guard_passes_exactly_the_built_environment_to_a_non_python_server(tmp_path, extra):
     """The guard's own interpreter coerces a C locale (PEP 538: it sets LC_CTYPE=C.UTF-8 in its
     environment). The server must still get the environment Nexus built: no added LC_CTYPE, an
-    explicit LC_CTYPE=C kept, and no guard marker variables."""
+    explicit LC_CTYPE=C kept, the provider's own variables that share the guard's transfer
+    prefix kept, and no guard marker variables."""
     env_exe = _env_executable()
     env = {"PATH": os.path.dirname(env_exe), "HOME": str(tmp_path), "NEXUS_PROBE": "a=b  c ü $HOME *", "EMPTY": ""}
     env |= extra
@@ -545,6 +555,36 @@ def test_stdio_launch_is_only_wrapped_on_posix():
     assert wrapped[: wrapped.index("--") + 1] == [sys.executable, "-I", str(STDIO_GUARD), "--"]
     assert wrapped[wrapped.index("--") + 1 :] == command  # REA's last argument stays exactly "mcp"
     assert STDIO_GUARD.is_file()
-    markers = {k: v for k, v in launch_env.items() if k not in env}
-    assert markers and all(k.startswith(GUARD_ENV_PREFIX) for k in markers)
-    assert {k: launch_env[k] for k in env} == env
+    # The guard gets only the transfer variables; the server's environment travels inside them.
+    assert launch_env and all(k.startswith(GUARD_ENV_PREFIX) for k in launch_env)
+    expected = {os.fsencode(k): os.fsencode(v) for k, v in env.items()}
+    assert decode_environment(launch_env) == expected
+    colliding = env | _PREFIX_COLLISIONS
+    _argv, launch_env = _stdio_launch(command, colliding, posix=True)
+    assert decode_environment(launch_env) == {os.fsencode(k): os.fsencode(v) for k, v in colliding.items()}
+
+
+@posix_only
+def test_stdio_launch_refuses_an_environment_the_system_cannot_pass(tmp_path):
+    """The encoded copy is about 4/3 of the environment's size. A launch that would exceed the
+    system's argument/environment limit fails with a clear message instead of an opaque E2BIG,
+    and the guard is never started."""
+    limit = os.sysconf("SC_ARG_MAX")
+    huge = {"HOME": str(tmp_path), "BIG": "x" * limit}
+    with pytest.raises(ValueError, match="argument/environment space"):
+        _stdio_launch([sys.executable, "-c", "pass"], huge, posix=True)
+    assert _stdio_launch(["x"], huge, posix=False) == (["x"], huge)  # Windows: unchanged
+
+
+@posix_only
+async def test_provider_with_an_oversized_environment_fails_with_a_clear_error(config_factory, workspace, tmp_path):
+    pid_file = tmp_path / "tree.json"
+    provider = _tree_provider(pid_file)
+    provider["env"] |= {"BIG": "x" * os.sysconf("SC_ARG_MAX")}
+    mgr = ProviderManager(config_factory(workspace, [provider]))
+    try:
+        await mgr.start()
+        assert "argument/environment space" in str(mgr.provider_errors.get("tree", "")), mgr.provider_errors
+        assert not pid_file.exists()  # nothing was started
+    finally:
+        await mgr.close()
