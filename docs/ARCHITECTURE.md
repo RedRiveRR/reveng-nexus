@@ -38,14 +38,15 @@
 | Module | Responsibility |
 |---|---|
 | `config.py` | YAML schema, validation, `${VAR}` expansion, 0.1 key compatibility |
-| `policy.py`, `security.py` | Tool classification (deny patterns → override → adapter manifest or the adapter's unlisted-tool class → trusted annotations → verb heuristic; an override may tighten but never relax `blocked`, `execute`, `dynamic` or `lifecycle`; lifecycle tools are never forwarded for a caller) and enforcement, including refusal of arguments the tool's schema does not declare |
+| `access.py` | The one definition of what a caller can reach: per-tool access state (`exposed`, `callable`, `adapter_only`, `missing_prerequisite`, `blocked_by_profile`, `blocked_by_policy`, `catalogue_mismatch`, `unknown`), provider state, collision-free namespaced names and the exposure map. MCP `tools/list`, namespaced dispatch, `nexus_list_tools`, provider summaries, `describe()`, the CLI and snapshots all use it |
+| `policy.py`, `security.py` | Access profile (`restricted`/`balanced`/`full_access`: derived reads callable or not, verified writes under full_access only); tool classification (protection-bypass and deny patterns → override → adapter manifest or the adapter's unlisted-tool class → trusted annotations → verb heuristic; an override may tighten but never relax `blocked`, `execute`, `dynamic` or `lifecycle`; lifecycle tools are never forwarded for a caller) and enforcement, including refusal of arguments the tool's schema does not declare |
 | `artifacts.py` | `WorkspaceGuard` (allowed roots, traversal, symlink/junction, NTFS ADS, size), hashing, identification, per-provider staged copies |
 | `formats/` | ELF (pyelftools), PE (pefile), Mach-O headers, sections and `LC_SYMTAB` symbols, DEX header, APK + binary AndroidManifest parser, string extraction |
 | `providers/base.py` | `AnalysisProvider` lifecycle, `ToolInfo`, `OperationResult`, policy/timeout/audit wrapper around every raw tool call |
 | `providers/builtin.py` | Always-on static engine |
 | `providers/mcp.py` | Child MCP servers: stdio, Streamable HTTP, launch-then-connect; owner tasks, restart budget, process-tree containment |
 | `providers/llm4decompile.py` | Optional AI decompilation adapter |
-| `adapters/` | Per-upstream bindings of Nexus operations to real tool names, manifests and normalisers, with pinned revisions. An adapter may also fix the provider kind (`provider_kind`, Frida: `dynamic`), the class of tools missing from its manifest (`unlisted_tool_class`: Frida `unknown`, REA `blocked`) and refuse all raw passthrough (`adapter_only`, REA) |
+| `adapters/` | Per-upstream bindings of Nexus operations to real tool names, manifests and normalisers, with pinned revisions. An adapter may also fix the provider kind (`provider_kind`, Frida: `dynamic`), the class of tools missing from its manifest (`unlisted_tool_class`: Frida `unknown`, REA `blocked`) and refuse all raw passthrough (`adapter_only`, REA). `tool_gate` lets an adapter withhold a tool for a reason beyond its class (REA: pin drift, profile tier, missing helper, not reviewed); it applies to listings, capability status and every call, the adapter's own included. REA's full classification is `adapters/rea_catalogue.py` |
 | `registry.py` | `ProviderManager`: start/stop with failure isolation, capability registry and duplicate detection, routing, failover, semaphores, conflict-group locks, evidence recording |
 | `compare.py` | Feature-based cross-engine comparison with rebasing and per-group independence |
 | `orchestrator.py` | Workflows and function prioritisation |
@@ -70,8 +71,13 @@
 3. **Connect.** Each MCP connection lives in a dedicated *owner task*, because anyio cancel
    scopes must exit in the task that entered them. The child gets a minimal environment:
    the SDK's safe defaults, explicitly inherited variables, then provider `env`.
-   Stdio children run under the SDK's Windows Job Object; launched HTTP servers get Nexus's
-   own Job Object or POSIX process group.
+   Stdio children run under the SDK's Windows Job Object; on POSIX they are started through
+   `providers/_stdio_guard.py`, which runs the server in a process group of its own and empties
+   that group when the server exits (the SDK alone kills the tree only of a server that fails
+   to exit). The server's environment is the one Nexus built (the SDK's defaults merged with
+   it), passed to the guard in encoded `REVENG_NEXUS_GUARD_ENV_*` variables that the server never
+   sees, because the guard's own interpreter changes its environment at start-up. Launched HTTP
+   servers get Nexus's own Job Object or POSIX process group.
 4. **Discover.** `tools/list` is paginated to completion; each tool is classified and given
    a policy decision, which is re-checked on every call with the actual arguments and the
    tool's input schema. For an adapter-only provider (REA) every caller-initiated raw call is

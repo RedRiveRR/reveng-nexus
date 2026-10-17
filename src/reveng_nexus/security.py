@@ -15,6 +15,13 @@ DEFAULT_BLOCKED_TOOL_PATTERNS = (
     r"(^|_)(bypass|unpin|disable_pinning)(_|$)",
 )
 
+# Protection-bypass tools (SSL pinning, root/jailbreak/debugger detection) are hard-blocked in every
+# profile and under every gate: no tool_overrides entry, dynamic allowlist or profile reopens them.
+PROTECTION_BYPASS_PATTERNS = (
+    r"(^|_)(bypass|unpin|unpinning|disable_pinning|disable_ssl_pinning)(_|$)",
+    r"(^|_)(anti_?root|anti_?jailbreak|hide_?root|hide_?jailbreak|anti_?debug|anti_?frida)(_|$)",
+)
+
 READ_VERBS = frozenset(
     {
         "get",

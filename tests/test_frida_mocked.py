@@ -255,8 +255,14 @@ async def test_discovery_classification_and_capabilities(config_factory, workspa
         for name, (tool_class, allowed) in _EXPECTED.items():
             assert tools[name].classification.tool_class == tool_class, name
             assert tools[name].decision.allowed is allowed, name
+        from reveng_nexus.security import PROTECTION_BYPASS_PATTERNS, matches_patterns
+
         for name in [*mock_frida.UPSTREAM_TOOL_NAMES, "frobnicate_device"]:
-            assert tools[name].classification.source == "manifest", name
+            # protection-bypass names are hard-blocked by pattern before the manifest is consulted
+            bypass = matches_patterns(name, PROTECTION_BYPASS_PATTERNS)
+            assert tools[name].classification.source == ("pattern" if bypass else "manifest"), name
+            if bypass:
+                assert tools[name].classification.tool_class == "blocked", name
         assert provider.list_capabilities() == {"dynamic.status": {"available": True, "tools": ["get_status"]}}
         assert provider.server_info.get("version") == "0.1.0", "upstream hardcodes 0.1.0 (server.ts:46-49)"
         assert (provider.engine, provider.engine_family) == ("frida", "frida")

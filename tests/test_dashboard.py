@@ -88,21 +88,27 @@ async def test_namespaced_mode_exposes_exactly_the_callable_tools(config_factory
 async def test_rea_is_allowed_for_its_adapter_but_never_callable_or_exposed(config_factory, workspace):
     mgr = await started(config_factory(workspace, [rea_mock()], server={"tool_mode": "namespaced"}))
     try:
+        from reveng_nexus.adapters.rea_catalogue import ENABLED_TOOLS
+
         entry = provider(build_snapshot(mgr), "rea")
         allowed = sorted(t["name"] for t in entry["tools"] if t["policy_allowed"])
-        assert allowed == ["analyze_javascript_application", "inspect_electron_fuses"]
+        assert allowed == sorted(ENABLED_TOOLS)  # balanced (default): live-verified + reviewed reads
         assert entry["counts"]["callable_tools"] == 0 and entry["counts"]["exposed_tools"] == 0
         assert entry["adapter_only"] is True
         ops = {t["name"]: t["used_by_operations"] for t in entry["tools"] if t["policy_allowed"]}
-        assert ops == {
-            "analyze_javascript_application": ["js.application"],
-            "inspect_electron_fuses": ["electron.fuses"],
-        }
-        assert sorted(entry["usable_operations"]) == ["electron.fuses", "js.application"]
+        assert ops["analyze_javascript_application"] == ["js.application"]
+        assert ops["inspect_electron_fuses"] == ["electron.fuses"]
+        live = {"analyze_javascript_application", "inspect_electron_fuses"}
+        assert all(ops[t] == ["artifact.inspect"] for t in set(ENABLED_TOOLS) - live)
+        assert sorted(entry["usable_operations"]) == ["artifact.inspect", "electron.fuses", "js.application"]
         described = mgr.providers["rea"].describe()
-        assert (described["policy_allowed_tool_count"], described["callable_tool_count"]) == (2, 0)
-        reasons = {t["name"]: t["policy_reason"] for t in entry["tools"] if t["policy_allowed"]}
-        assert all("adapter-only" in r for r in reasons.values())
+        assert (described["policy_allowed_tool_count"], described["callable_tool_count"]) == (len(ENABLED_TOOLS), 0)
+        states = {t["name"]: t["access_state"] for t in entry["tools"] if t["policy_allowed"]}
+        # the mock config sets no REA_WABT_BIN_DIRECTORY: allowed, but missing its prerequisite
+        assert states.pop("inspect_wasm_artifact") == "missing_prerequisite"
+        assert set(states.values()) == {"adapter_only"}
+        assert entry["tool_states"]["adapter_only"] == len(ENABLED_TOOLS) - 1
+        assert entry["counts"]["available_tools"] == len(ENABLED_TOOLS) - 1
     finally:
         await mgr.close()
 
@@ -111,12 +117,19 @@ async def test_aliases_and_adapter_only_tools_cannot_bypass_policy(config_factor
     mgr = await started(config_factory(workspace, [mock_engine("eng"), rea_mock()], server={"tool_mode": "namespaced"}))
     try:
         app = NexusServer(mgr)
-        with pytest.raises(PolicyViolation):  # mutate tool through its namespaced alias
+        # a namespaced alias resolves only for a tool tools/list advertised: a blocked or
+        # adapter-only tool has no alias at all (and nexus_call_provider_tool still refuses it)
+        with pytest.raises(NotFound):  # mutate tool through its namespaced alias
             await app.dispatch("eng__patch_bytes", {"address": "0x401000", "data": "90"})
-        with pytest.raises(PolicyViolation):  # lifecycle tool through its alias
+        with pytest.raises(NotFound):  # lifecycle tool through its alias
             await app.dispatch("eng__open_database", {"file_path": "C:/x"})
-        with pytest.raises(PolicyViolation):  # an allowed REA tool is still adapter-only for callers
+        with pytest.raises(NotFound):  # an allowed REA tool is still adapter-only for callers
             await app.dispatch("rea__inspect_electron_fuses", {"path": "C:/x"})
+        with pytest.raises(PolicyViolation):
+            await app.dispatch(
+                "nexus_call_provider_tool",
+                {"provider_id": "eng", "tool_name": "patch_bytes", "arguments": {"address": "0x401000"}},
+            )
         with pytest.raises(PolicyViolation):
             await app.dispatch(
                 "nexus_call_provider_tool",
@@ -739,6 +752,10 @@ def test_ui_consumes_every_preserved_backend_field():
         "unreadable_snapshots",
         "instances",
         # policy and security
+        "access_profile",
+        "access_state",
+        "tool_states",
+        "available_tools",
         "read_only",
         "code_execution",
         "dynamic_analysis",
@@ -830,4 +847,6 @@ async def test_backend_still_produces_every_field_the_ui_reads(config_factory, w
     ):
         assert f'"{field}"' in blob, field
     rea = provider(state["primary"], "rea")
-    assert rea["counts"]["policy_allowed_tools"] == 2 and rea["counts"]["callable_tools"] == 0
+    assert rea["counts"]["policy_allowed_tools"] == 10 and rea["counts"]["callable_tools"] == 0
+    for field in ("access_state", "tool_states", "access_profile", "profile_allowed", "available_tools"):
+        assert f'"{field}"' in blob, field

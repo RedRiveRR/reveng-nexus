@@ -126,11 +126,19 @@ def test_execute_needs_explicit_provider_opt_in():
     assert not opted.decide(provider, "execute_python", cls, internal=True).allowed
 
 
-def test_mutation_allowed_only_when_read_only_disabled():
+def test_mutation_allowed_only_when_read_only_disabled_and_verified():
     provider = _provider()
     cls = _engine().classify(provider, "rename_function")
+    assert cls.source == "heuristic"
     assert not _engine().decide(provider, "rename_function", cls).allowed
-    assert _engine(read_only=False).decide(provider, "rename_function", cls).allowed
+    # writable policy alone is not enough: a verb is no proof of which write the operator allowed
+    denied = _engine(read_only=False).decide(provider, "rename_function", cls)
+    assert not denied.allowed and "tool_overrides" in denied.reason
+    reviewed = _provider(tool_overrides={"rename_function": "mutate"})
+    cls = _engine().classify(reviewed, "rename_function")
+    assert cls.source == "override"
+    assert not _engine().decide(reviewed, "rename_function", cls).allowed  # still read-only
+    assert _engine(read_only=False).decide(reviewed, "rename_function", cls).allowed
 
 
 def test_upstream_manifests_close_the_0_1_name_filter_gaps():
@@ -200,8 +208,15 @@ def test_global_patterns_always_win():
 
 def test_tool_overrides_cannot_unblock_adapter_hard_blocks():
     engine = _engine()
+    from reveng_nexus.security import PROTECTION_BYPASS_PATTERNS, matches_patterns
+
     manifest = ADAPTERS["frida_mobile"].manifest
-    hard = next(name for name, cls in manifest.items() if cls == "blocked")
+    # a manifest hard block (not a protection-bypass name, which is blocked by pattern even earlier)
+    hard = next(
+        name
+        for name, cls in manifest.items()
+        if cls == "blocked" and not matches_patterns(name, PROTECTION_BYPASS_PATTERNS)
+    )
     provider = _provider(tool_overrides={hard: "read"})
     cls = engine.classify(provider, hard, manifest=manifest)
     assert (cls.tool_class, cls.source) == ("blocked", "manifest")

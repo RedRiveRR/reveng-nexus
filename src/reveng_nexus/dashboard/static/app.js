@@ -64,7 +64,8 @@ function copyBtn(value) {
 // ---------- status vocabulary ----------
 const TONE = { ready: "ok", live: "ok", ok: "ok", callable: "ok", enforced: "ok", degraded: "warn", stale: "warn", cancelled: "warn",
   unavailable: "bad", failed: "bad", error: "bad", blocked: "bad", exception: "bad", timeout: "bad", provider_error: "bad",
-  stopped: "off", disabled: "off", unknown: "off", "adapter-only": "info", exposed: "info", historical: "violet" };
+  stopped: "off", disabled: "off", unknown: "off", "adapter-only": "info", exposed: "info", historical: "violet",
+  "blocked (profile)": "warn", "missing prerequisite": "warn", "catalogue mismatch": "bad" };
 function mark(text, tone) { return h("span", { class: `mark ${tone || TONE[text] || "off"}`, text }); }
 const VERIF_TONE = { live_analysis_verified: "ok", connection_verified: "info", mock_tested: "violet", unit_tested: "violet",
   reviewed_not_tested: "off", blocked: "bad", not_integrated: "off", unrecorded: "off" };
@@ -160,7 +161,13 @@ function providerStatus(entry) {
   if (entry.live && entry.live.error) return "unavailable";
   return "unknown";
 }
-function toolStatus(t) { return t.callable ? "callable" : t.policy_allowed ? "adapter-only" : "blocked"; }
+// The gateway's own access state (access.py); older snapshots (schema 1) fall back to the two flags.
+const ACCESS_LABEL = { exposed: "exposed", callable: "callable", adapter_only: "adapter-only", missing_prerequisite: "missing prerequisite",
+  blocked_by_profile: "blocked (profile)", blocked_by_policy: "blocked", catalogue_mismatch: "catalogue mismatch", unknown: "unknown" };
+function toolStatus(t) {
+  if (t.access_state) return ACCESS_LABEL[t.access_state] || t.access_state;
+  return t.callable ? "callable" : t.policy_allowed ? "adapter-only" : "blocked";
+}
 function allTools() {
   const p = primary();
   if (!p) return [];
@@ -188,7 +195,8 @@ function totals() {
 }
 function explainTool(t) {
   if (t.kind === "nexus") return firstSentence(t.description);
-  if (t.status === "callable") return t.exposed ? "Callable; also listed to MCP clients as its own tool" : "Callable through nexus_call_provider_tool (checked per call)";
+  if (t.status === "exposed") return "Callable; also listed to MCP clients as its own tool";
+  if (t.status === "callable") return "Callable through nexus_call_provider_tool (checked per call)";
   if (t.status === "adapter-only") return `Used only inside ${(t.operations || []).join(", ") || "its adapter"}; refused for direct calls`;
   return firstSentence(t.reason);
 }
@@ -292,7 +300,7 @@ function renderHeader() {
 // ---------- overview ----------
 function policyPhrase(pol) {
   if (!pol) return "unknown";
-  return [pol.read_only ? "read-only" : "WRITES ALLOWED", pol.code_execution ? "code execution ON" : "no code execution",
+  return [`profile ${pol.access_profile || "balanced"}`, pol.read_only ? "read-only" : "WRITES ALLOWED", pol.code_execution ? "code execution ON" : "no code execution",
     pol.dynamic_analysis ? "dynamic analysis ON" : "no dynamic analysis", pol.remote_ai ? "remote AI ON" : "no remote AI"].join(" · ");
 }
 function viewOverview() {
@@ -342,7 +350,7 @@ function viewOverview() {
   const detailed = more("Detailed metrics", "every count, with its exact definition", () => {
     if (!t) return empty("Unavailable", "The counts come from a running gateway's snapshot.");
     const defs = st.definitions || {};
-    const keys = ["upstream_tools_discovered", "policy_allowed_tools", "callable_tools", "exposed_tools", "blocked_tools", "operations_declared", "operations_usable", "nexus_tools"];
+    const keys = ["upstream_tools_discovered", "policy_allowed_tools", "available_tools", "callable_tools", "exposed_tools", "blocked_tools", "operations_declared", "operations_usable", "nexus_tools"];
     return [table("metrics", [
       { key: "l", label: "Metric", value: (k) => (defs[k] || {}).label || k },
       { key: "v", label: "Value", value: (k) => t[k] ?? -1, render: (k) => fmtNum(t[k]), num: true },
@@ -422,7 +430,7 @@ function viewProvider(id) {
       ])),
       panel("Capabilities", c ? h("p", { class: "faint", text: `${c.operations_usable} of ${c.operations_declared} declared operations usable now.` }) : null, opsTable(live && live.operations)),
       panel(panelHead("Tools", tools.length ? h("a", { href: "#/catalog/tools", onclick: () => { S.filters.tools = { provider: cfg.id }; }, text: "Open in Tools view" }) : null),
-        c ? stats([["discovered", c.upstream_tools_discovered], ["allowed", c.policy_allowed_tools], ["callable", c.callable_tools], ["blocked", c.blocked_tools], ["exposed", c.exposed_tools]])
+        c ? stats([["discovered", c.upstream_tools_discovered], ["allowed", c.policy_allowed_tools], ["available", c.available_tools ?? c.callable_tools], ["callable", c.callable_tools], ["blocked", c.blocked_tools], ["exposed", c.exposed_tools]])
           : h("p", { class: "muted", text: cfg.enabled ? "No live counts: not running in the gateway that wrote the snapshot." : "Disabled in the configuration." }),
         tools.length ? [h("div", { class: "filters" }, searchBox(`Search ${cfg.id} tools`, f.q, (q) => (f.q = q)), h("span", { class: "count-note", text: `${shownTools.length} of ${tools.length}` })),
           table("ptools", [
@@ -472,7 +480,7 @@ function viewTools(args) {
   const openRow = (t) => (location.hash = `#/catalog/tools/${encodeURIComponent(t.provider)}/${encodeURIComponent(t.name)}`);
   page("Tools", "Every nexus_* tool and every upstream tool the gateway discovered, with the gateway's own decision. Nothing here can be invoked.",
     filterBar([searchBox("Search tools", f.q, (v) => (f.q = v)), select("Provider", f.provider, uniq((t) => [t.provider]), set("provider")),
-      select("Access", f.status, ["callable", "adapter-only", "blocked", "exposed"], set("status"))],
+      select("Access", f.status, ["exposed", "callable", "adapter-only", "missing prerequisite", "blocked (profile)", "blocked", "catalogue mismatch", "unknown"], set("status"))],
       [select("Operation", f.op, uniq((t) => t.operations || []), set("op")), select("Policy class", f.cls, uniq((t) => [t.tool_class]), set("cls")),
         select("Verification", f.verif, uniq((t) => [(t.verification || {}).state]), set("verif")),
         h("button", { class: "btn small", type: "button", onclick: () => { S.filters.tools = null; route(true); } }, "Clear all")],
@@ -580,13 +588,15 @@ function classCounts() {
   const m = {};
   for (const prov of (primary() || {}).providers || []) for (const t of prov.tools || []) {
     const k = t.tool_class; m[k] = m[k] || { allowed: 0, blocked: 0, adapter: 0 };
-    if (!t.policy_allowed) m[k].blocked++; else if (t.callable) m[k].allowed++; else m[k].adapter++;
+    const avail = t.available ?? t.policy_allowed;
+    if (!avail) m[k].blocked++; else if (t.callable) m[k].allowed++; else m[k].adapter++;
   }
   return m;
 }
 function viewSecurity() {
   const p = primary(), cfg = S.state.configured, eff = p ? p.policy : null, pol = eff || cfg;
   const controls = [
+    { name: "Access profile", ok: pol.access_profile !== "full_access", state: pol.access_profile || "balanced", why: "restricted: verified reads only; balanced: reads; full_access: also verified mutating tools. Never opens code execution, dynamic analysis or remote providers." },
     { name: "Read-only", ok: pol.read_only === true, state: pol.read_only ? "enforced" : "OFF", why: "Tools that would change an analysis database or artefact are blocked." },
     { name: "Code execution", ok: pol.code_execution === false, state: pol.code_execution ? "enabled" : "disabled", why: "Tools that run supplied code (scripts, eval) are blocked for every provider." },
     { name: "Dynamic analysis", ok: pol.dynamic_analysis === false, state: pol.dynamic_analysis ? "enabled" : "disabled", why: "Nothing attaches to, launches or instruments live processes or devices." },
@@ -633,11 +643,12 @@ function viewSecurity() {
         { key: "b", label: "Blocked", value: (r) => r.counts.blocked_tools, num: true },
         { key: "bc", label: "Blocked by class", value: (r) => classBreakdown(r.tools || []).filter((x) => x.status === "blocked").map((x) => `${x.count} ${x.tool_class}`).join(", "), cls: "explain", sortable: false },
       ], provs.filter((x) => x.started)) : empty("No running providers", "Needs a gateway snapshot.")),
-      more("REA two-operation allowlist", "adapter-only; every other REA tool blocked", () => rea ? [
+      more("REA reviewed allowlist", "adapter-only; 207 tools classified, file-scoped reads enabled per profile", () => rea ? [
         kv([["Upstream tools discovered", fmtNum(rea.counts.upstream_tools_discovered)], ["Allowed for the adapter", fmtNum(rea.counts.policy_allowed_tools)], ["Callable by callers", fmtNum(rea.counts.callable_tools)],
+          ["Available through operations", fmtNum(rea.counts.available_tools ?? 0)],
           ["Adapter-only", rea.adapter_only ? "yes" : "NO"], ["Operations usable", `${rea.counts.operations_usable}/${rea.counts.operations_declared}`]]),
         h("h3", { text: "Allowed upstream tool → operation → Nexus tool" }),
-        h("ul", { class: "plain" }, (rea.tools || []).filter((x) => x.policy_allowed).map((x) => h("li", null, h("code", { text: x.name }), " → ", (x.used_by_operations || []).join(", ") || "no operation", " → ",
+        h("ul", { class: "plain" }, (rea.tools || []).filter((x) => (x.used_by_operations || []).length).map((x) => h("li", null, h("code", { text: x.name }), " ", mark(toolStatus(x)), " → ", (x.used_by_operations || []).join(", ") || "no operation", " → ",
           (x.used_by_operations || []).flatMap((o) => opToNexus[o] || []).join(", ") || "—"))),
         h("p", { class: "faint", text: "Overrides cannot reopen the blocked tools, raw passthrough is refused, and the process's last argument is fixed to 'mcp' by config validation." }),
       ] : empty("REA not running", "No REA data in the current snapshot (disabled or not started).")),
@@ -812,10 +823,11 @@ const ACCESS_TERMS = [
   ["adapter-only", "Allowed by the policy, but only for the provider's own adapter inside its nexus_* operations (REA). Refused for direct calls."],
   ["blocked", "Denied by the policy; shown for transparency and never executable."],
   ["exposed", "Listed to MCP clients as its own tool: every nexus_* tool, and raw provider tools only in tool_mode 'namespaced'."],
+  ["access profile", "restricted: callers reach only reads classified by a pinned manifest or tool_overrides; balanced (default): reads, including ones classified from upstream annotations or names; full_access: read_only off, but a mutating tool still needs a verified classification. No profile opens code execution, dynamic analysis or remote providers; those keep their explicit gates."],
 ];
 const FINDINGS = [
   ["Ghidra: 66 callable, not 41", "Older notes recorded \"41 callable\" for re-mcp-ghidra. That was the length of the providers check list, shortened to 40 names plus a \"...\" marker, not a count. Replaying the same 134-tool catalogue through the 2026-10-13 policy code gives 66 allowed, the same as today (60 read by trusted annotation + 6 by the pinned manifest; 68 blocked). providers check now prints explicit counts.", "docs/DASHBOARD.md, \"Finding: 41 callable versus 66\""],
-  ["REA: discovered, adapter-allowed, callable, usable", "REA lists 207 upstream tools; the policy allows exactly 2 (analyze_javascript_application, inspect_electron_fuses) for its adapter; 0 are callable by callers because REA is adapter-only; both declared operations (js.application, electron.fuses) are usable.", "docs/DASHBOARD.md, \"REA: 207 discovered, 2 allowed, 0 callable\""],
+  ["REA: discovered, adapter-allowed, callable, usable", "REA lists 207 upstream tools, all classified at the pin. Ten file-scoped reads can be enabled: 2 verified live (js.application, electron.fuses; every profile) and 8 reviewed at the pin behind nexus_inspect_artifact (balanced and full_access; WASM also needs REA_WABT_BIN_DIRECTORY). 0 are callable by callers because REA is adapter-only.", "docs/DASHBOARD.md, \"REA: 207 discovered, 10 enabled, 0 callable\""],
 ];
 function viewDefinitions() {
   const st = S.state, defs = st.definitions || {};
@@ -828,7 +840,8 @@ function viewDefinitions() {
   const other = Object.keys(defs).filter((k) => !known.has(k));
   const groups = [
     ...DEF_CATEGORIES.map(([title, keys]) => [title, keys.filter((k) => defs[k]).map((k) => item(defs[k].label, defs[k].definition, `Source: ${defs[k].source} (key ${k}).`))]),
-    ["Policy and access", [...ACCESS_TERMS.map(([t, d]) => item(t, d)), ...Object.entries(st.tool_classes || {}).map(([k, v]) => item(`policy class: ${k}`, v))]],
+    ["Policy and access", [...ACCESS_TERMS.map(([t, d]) => item(t, d)), ...Object.entries(st.tool_states || {}).map(([k, v]) => item(`access state: ${ACCESS_LABEL[k] || k}`, v)),
+      ...Object.entries(st.tool_classes || {}).map(([k, v]) => item(`policy class: ${k}`, v))]],
     ["Freshness", Object.entries(st.freshness_legend || {}).map(([k, v]) => item(k, v))],
     ["Verification", Object.entries(st.verification_states || {}).map(([k, v]) => item(k.replaceAll("_", " "), v, "Documented in docs/PROVIDER_MATRIX.md; never inferred from health."))],
     ["Findings", FINDINGS.map(([t, d, src]) => item(t, d, `Source: ${src}.`))],

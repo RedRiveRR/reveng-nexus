@@ -44,7 +44,8 @@ DOCUMENTED: dict[str, dict[str, Any]] = {
     },
     "rea": {
         "state": "live_analysis_verified",
-        "scope": "js.application and electron.fuses only; every other REA tool is blocked",
+        "scope": "live: js.application and electron.fuses; artifact.inspect (8 analyses) mock_tested only, "
+        "reviewed at the pin; session, device, debugger and code-running tools unreachable",
         "last_recorded": "2026-10-16",
         "blocker": None,
     },

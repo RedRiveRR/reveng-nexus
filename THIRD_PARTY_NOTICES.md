@@ -10,6 +10,12 @@ installed by the operator (usually by `uvx`/`npx` resolving a pinned package at 
 MCP from the operator's own checkout, REA from a pinned local npm install).
 Their licences apply to those installations.
 
+Interface data only: `tests/mock_servers/mock_rea.py` and `src/reveng_nexus/adapters/rea_catalogue.py`
+record REA's 207 tool names, and the mock reproduces the input JSON Schemas of ten REA tools as
+exported from the pinned `rea-agents` 6.5.0 contracts (descriptions removed), so tests can check
+Nexus against the real interface. No REA implementation code is copied. REA is MIT-licensed,
+Copyright (c) 2026 morluto; the MIT permission notice is in REA's `LICENSE`.
+
 Licences were checked at the pinned revisions on 2026-10-13 (REA and Node.js on 2026-10-15). This is an integration record,
 not legal advice; re-check the exact versions you deploy.
 

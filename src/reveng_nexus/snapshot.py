@@ -3,8 +3,9 @@
 The gateway (``reveng-nexus serve``) writes ``<data_dir>/dashboard/gateway-<pid>.json``
 after provider startup and then every few seconds. The dashboard only *reads* these files:
 it never starts providers, never talks to the gateway and never re-derives a policy
-decision. Every ``allowed``/``callable`` value below was computed by the gateway's own
-``PolicyEngine`` for its live catalogue.
+decision. Every ``allowed``/``callable``/``exposed``/``access_state`` value below was computed
+by the gateway's own ``PolicyEngine`` and ``access.py`` (the functions MCP ``tools/list`` uses)
+for its live catalogue.
 
 Writing is best-effort and isolated: a failure is counted and logged to stderr, never
 raised into the MCP server, and nothing is written to stdout (the stdio transport).
@@ -28,12 +29,14 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .access import TOOL_STATES, provider_state, public_names, tool_access
+from .config import ACCESS_PROFILES
 from .policy import _UNRELAXABLE, TOOL_CLASS_DESCRIPTIONS
 from .redaction import SENSITIVE_KEY, redact_text
 from .security import DEFAULT_BLOCKED_TOOL_PATTERNS
 from .verification import documented_state
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: access_profile, per-tool access_state, tool_states counts
 SNAPSHOT_DIRNAME = "dashboard"
 HEARTBEAT_SECONDS = 10.0
 HEALTH_REFRESH_SECONDS = 300.0
@@ -65,6 +68,7 @@ NEXUS_TOOL_OPERATIONS: dict[str, list[str]] = {
     "nexus_get_class_source": ["apk.class_source"],
     "nexus_analyze_javascript_app": ["js.application"],
     "nexus_get_electron_fuses": ["electron.fuses"],
+    "nexus_inspect_artifact": ["artifact.inspect"],
     "nexus_dynamic_analysis_status": ["dynamic.status"],
     "nexus_record_finding": ["local"],
     "nexus_get_findings": ["local"],
@@ -119,34 +123,45 @@ def sanitize(value: Any, homes: list[str] | None = None, *, _depth: int = 0) -> 
 
 
 # -- snapshot -----------------------------------------------------------------------
-def _tool_rows(provider: Any, tool_mode: str, bindings: dict[str, list[str]]) -> list[dict[str, Any]]:
-    adapter = getattr(provider, "adapter", None)
-    adapter_only = bool(adapter is not None and adapter.adapter_only)
-    namespaced = tool_mode == "namespaced" and provider.config.expose_tools and not adapter_only
+def count_states_rows(tools: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {state: 0 for state in TOOL_STATES}
+    for tool in tools:
+        counts[tool["access_state"]] += 1
+    return counts
+
+
+def _tool_rows(
+    provider: Any, names: dict[tuple[str, str], str], bindings: dict[str, list[str]]
+) -> list[dict[str, Any]]:
     rows = []
     for info in provider._tools.values():
+        access = tool_access(provider, info, names)
         rows.append(
             {
                 "name": info.name,
-                "public_name": info.public_name,
+                "public_name": access.public_name,
                 "description": info.description[:_MAX_DESCRIPTION],
                 "input_schema": info.input_schema,
                 "annotations": info.annotations,
                 "tool_class": info.classification.tool_class,
                 "class_meaning": TOOL_CLASS_DESCRIPTIONS.get(info.classification.tool_class, ""),
                 "classification_source": info.classification.source,
-                "policy_allowed": info.decision.allowed,
-                "callable": info.callable,
-                "exposed_to_clients": bool(namespaced and info.callable),
+                "classification_verified": info.classification.verified,
+                "access_state": access.state,
+                "policy_allowed": access.policy_allowed,
+                "profile_allowed": access.profile_allowed,
+                "available": access.available,
+                "callable": access.callable,
+                "exposed_to_clients": access.exposed,
                 "adapter_only": info.adapter_only,
-                "policy_reason": info.to_dict(include_schema=False)["policy_reason"],
+                "policy_reason": access.reason,
                 "used_by_operations": sorted(op for op, tools in bindings.items() if info.name in tools),
             }
         )
     return sorted(rows, key=lambda r: r["name"])
 
 
-def _provider_entry(manager: Any, summary: dict[str, Any], tool_mode: str) -> dict[str, Any]:
+def _provider_entry(manager: Any, summary: dict[str, Any], names: dict[tuple[str, str], str]) -> dict[str, Any]:
     pid = summary["id"]
     provider = manager.providers.get(pid)
     started = bool(provider is not None and provider.started)
@@ -157,9 +172,10 @@ def _provider_entry(manager: Any, summary: dict[str, Any], tool_mode: str) -> di
         except Exception as exc:  # noqa: BLE001 - one provider must not break the snapshot
             capabilities = {"_error": {"available": False, "reason": str(exc)}}
     bindings = {op: list(c.get("tools") or []) for op, c in capabilities.items() if isinstance(c, dict)}
-    tools = _tool_rows(provider, tool_mode, bindings) if started and provider is not None else []
+    tools = _tool_rows(provider, names, bindings) if started and provider is not None else []
     usable = sorted(op for op, c in capabilities.items() if isinstance(c, dict) and c.get("available"))
-    summary = {k: v for k, v in summary.items() if k != "log_file"}  # absolute path, not needed
+    summary = {k: v for k, v in summary.items() if k not in {"log_file", "access"}}  # path not needed
+    access_state, access_reason = provider_state(manager, pid)
     health = manager.last_health.get(pid)
     return {
         **summary,
@@ -172,10 +188,14 @@ def _provider_entry(manager: Any, summary: dict[str, Any], tool_mode: str) -> di
             "callable_tools": sum(1 for t in tools if t["callable"]),
             "exposed_tools": sum(1 for t in tools if t["exposed_to_clients"]),
             "blocked_tools": sum(1 for t in tools if not t["policy_allowed"]),
+            "available_tools": sum(1 for t in tools if t["available"]),
             "operations_declared": len(capabilities),
             "operations_usable": len(usable),
         },
         "usable_operations": usable,
+        "access_state": access_state,
+        "access_reason": access_reason,
+        "tool_states": count_states_rows(tools),
         "tools": tools,
         "verification": documented_state(pid),
     }
@@ -190,7 +210,8 @@ def build_snapshot(
     cfg = manager.config
     mode: str = tool_mode or cfg.tool_mode
     policy = cfg.policy
-    providers = [_provider_entry(manager, s, mode) for s in manager.provider_summaries()]
+    names = public_names(manager.providers.values(), mode)
+    providers = [_provider_entry(manager, s, names) for s in manager.provider_summaries()]
     totals = {
         key: sum(p["counts"][key] for p in providers)
         for key in (
@@ -199,9 +220,11 @@ def build_snapshot(
             "callable_tools",
             "exposed_tools",
             "blocked_tools",
+            "available_tools",
             "operations_usable",
         )
     }
+    totals["tool_states"] = {state: sum(p["tool_states"][state] for p in providers) for state in TOOL_STATES}
     nexus_tools = [
         {
             "name": name,
@@ -234,6 +257,9 @@ def build_snapshot(
             "config_warnings": list(cfg.warnings),
         },
         "policy": {
+            "access_profile": policy.access_profile,
+            "profile_source": policy.profile_source,
+            "access_profiles": list(ACCESS_PROFILES),
             "read_only": policy.read_only,
             "code_execution": policy.allow_code_execution,
             "code_execution_providers": list(policy.code_execution_providers),

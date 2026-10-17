@@ -20,6 +20,7 @@ from typing import Any
 
 import anyio
 
+from .access import exposure_map, provider_access, public_names, tool_access
 from .artifacts import WorkspaceGuard, identify
 from .audit import AuditLog
 from .config import NexusConfig, ProviderConfig
@@ -100,12 +101,7 @@ class ProviderManager:
 
     @property
     def routes(self) -> dict[str, Any]:
-        out = {}
-        for provider in self.providers.values():
-            for info in provider._tools.values():
-                if info.callable:
-                    out[info.public_name] = info
-        return out
+        return {name: info for name, (_provider, info) in exposure_map(self).items()}
 
     # -- lifecycle ----------------------------------------------------------------
     def _skip_reason(self, cfg: ProviderConfig) -> str | None:
@@ -242,6 +238,14 @@ class ProviderManager:
             row["capabilities"] = list(cfg.capabilities)
             row["error"] = self.provider_errors.get(cfg.id)
             row["skipped"] = self.skipped.get(cfg.id)
+            row["access"] = provider_access(self, cfg.id)
+            if provider is not None and provider.started:
+                # the describe() counts, made consistent with exposure (namespaced mode, collisions)
+                counts = row["access"]["tool_states"]
+                row["policy_allowed_tool_count"] = counts["policy_allowed"]
+                row["available_tool_count"] = counts["available"]
+                row["callable_tool_count"] = counts["exposed"] + counts["callable"]
+                row["exposed_tool_count"] = counts["exposed"]
             if cfg.adapter:
                 from .adapters import ADAPTERS
 
@@ -336,16 +340,26 @@ class ProviderManager:
         self, query: str = "", provider_id: str | None = None, include_blocked: bool = False, limit: int = 50
     ) -> list[dict[str, Any]]:
         terms = [t.casefold() for t in query.split() if t]
+        names = public_names(self.providers.values(), self.config.tool_mode)
         out = []
         for provider in self.providers.values():
             if provider_id and provider.id != provider_id:
                 continue
             for info in await provider.list_tools():
-                if not include_blocked and not info.callable:
+                access = tool_access(provider, info, names)
+                if not include_blocked and not access.callable:
                     continue
                 hay = f"{info.name} {info.description}".casefold()
                 if all(t in hay for t in terms):
-                    out.append(info.to_dict())
+                    row = info.to_dict()
+                    row.update(
+                        public_name=access.public_name,
+                        callable=access.callable,
+                        exposed=access.exposed,
+                        access_state=access.state,
+                        policy_reason=access.reason,
+                    )
+                    out.append(row)
         return out[: max(1, min(limit, 200))]
 
     # -- targets ---------------------------------------------------------------------

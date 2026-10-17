@@ -89,32 +89,85 @@ def fuse_sample(workspace: Path) -> Path:
 # -- pin, manifest and classification (pure unit) ---------------------------------------------------
 
 
-def test_pin_and_static_allowlist():
+def test_pin_and_catalogue_classification():
+    from reveng_nexus.adapters.rea_catalogue import ANALYSES, CATALOGUE, ENABLED_TOOLS, LIVE_VERIFIED
+
     assert REA.pin.revision == "3b79af28e80785afce9f5998d8f03289402a1847"
     assert REA.pin.package_version == "6.5.0"
-    assert REA.manifest == {"analyze_javascript_application": "read", "inspect_electron_fuses": "read"}
     assert (REA.unlisted_tool_class, REA.adapter_only, REA.trust_annotations) == ("blocked", True, False)
     assert (REA.engine, REA.engine_family) == ("rea", "rea")
     names = mock_rea.NAMES
     assert len(names) == CATALOGUE_SIZE == 207
     assert hashlib.sha256("\n".join(sorted(names)).encode()).hexdigest() == CATALOGUE_SHA256
+    # every pinned tool is classified exactly once, and nothing outside the pin is
+    assert sorted(CATALOGUE) == sorted(names) and REA.manifest == {n: CATALOGUE[n].tool_class for n in names}
+    classes = {
+        c: sum(1 for t in CATALOGUE.values() if t.tool_class == c)
+        for c in ("read", "mutate", "lifecycle", "execute", "dynamic")
+    }
+    assert classes == {"read": 125, "mutate": 16, "lifecycle": 8, "execute": 15, "dynamic": 43}
+    # only file-scoped reads can be enabled: Nexus confines them to the staged copy
+    for tool in ENABLED_TOOLS:
+        assert (CATALOGUE[tool].tool_class, CATALOGUE[tool].scope) == ("read", "file"), tool
+    assert set(LIVE_VERIFIED) == {t for t, p in ENABLED_TOOLS.items() if p == "restricted"}
+    assert len(ENABLED_TOOLS) == 10 and all(a.verification == "source_reviewed" for a in ANALYSES.values())
+    # REA's effect audit marks these as running foreign code: never anything but execute
+    for tool in ("gdb_console", "cutter_command", "capture_process_scenario", "instrument_with_frida"):
+        assert CATALOGUE[tool].tool_class == "execute"
+
+
+def test_enabled_analyses_match_the_pinned_input_schemas():
+    """Each analysis sends only argument names the pinned REA schema declares, and never a path option."""
+    from reveng_nexus.adapters.rea_catalogue import ANALYSES
+
+    for spec in ANALYSES.values():
+        upstream = mock_rea.ANALYSIS_SCHEMAS[spec.tool]["properties"]
+        assert spec.path_argument in upstream
+        for option in (*spec.options, *spec.fixed):
+            assert option in upstream, (spec.tool, option)
+            assert "path" not in option, (spec.tool, option)
+        # upstream path-taking extras (glue_paths, candidate_paths) are never forwarded
+        assert not any("path" in o for o in spec.options)
 
 
 @pytest.mark.parametrize(
-    "tool",
-    ["capture_process_scenario", "gdb_console", "instrument_with_frida", "push_adb_file", "extract_artifact",
-     "open_binary", "procedure_pseudo_code", "set_comment", "export_evidence_bundle", "capture_web_screenshot",
-     "a_future_tool_not_in_the_pin"],
+    ("tool", "pinned_class"),
+    [("capture_process_scenario", "execute"), ("gdb_console", "execute"), ("instrument_with_frida", "execute"),
+     ("push_adb_file", "dynamic"), ("capture_web_screenshot", "dynamic"), ("open_binary", "lifecycle"),
+     ("a_future_tool_not_in_the_pin", "blocked")],
 )  # fmt: skip
-def test_overrides_cannot_reopen_unlisted_rea_tools(tool):
+def test_overrides_cannot_relax_gated_rea_tools(tool, pinned_class):
     from reveng_nexus.config import NexusConfig, PolicyConfig, ProviderConfig
     from reveng_nexus.policy import PolicyEngine
 
-    engine = PolicyEngine(NexusConfig(providers=(), policy=PolicyConfig(read_only=False), read_only=False))
+    engine = PolicyEngine(
+        NexusConfig(providers=(), policy=PolicyConfig(access_profile="full_access", read_only=False), read_only=False)
+    )
     provider = ProviderConfig(id="rea", name="rea", command="x", adapter="rea", tool_overrides={tool: "read"})
     cls = engine.classify(provider, tool, manifest=REA.manifest, unlisted_class=REA.unlisted_tool_class)
-    assert cls.tool_class == "blocked"
+    assert cls.tool_class == pinned_class
     assert not engine.decide(provider, tool, cls).allowed
+
+
+async def test_overrides_cannot_enable_unreviewed_rea_tools(config_factory, workspace, tmp_path):
+    """A mutate or session read reclassified as read by an operator stays unreachable: the adapter gate
+    is a reviewed allowlist by tool name, not by class, and it refuses even the adapter's own calls."""
+    log = tmp_path / "calls.jsonl"
+    overrides = {"set_comment": "read", "procedure_pseudo_code": "read", "extract_artifact": "read"}
+    provider = rea_mock(env={"MOCK_CALL_LOG": str(log)}, tool_overrides=overrides)
+    mgr = await started(config_factory(workspace, [provider], policy={"access_profile": "full_access"}))
+    try:
+        from reveng_nexus.access import provider_tool_access
+
+        rea = mgr.providers["rea"]
+        access = provider_tool_access(mgr, rea)
+        for tool in overrides:
+            assert access[tool].state == "blocked_by_policy" and not access[tool].available
+            with pytest.raises(PolicyViolation, match="not enabled in Nexus"):
+                await rea.call_tool(tool, {}, internal=True)
+        assert calls(log) == []
+    finally:
+        await mgr.close()
 
 
 def test_path_scrub_replaces_only_the_local_paths_nexus_passed():
@@ -162,16 +215,130 @@ def test_path_scrub_replaces_only_the_local_paths_nexus_passed():
 # -- catalogue, exposure and passthrough -------------------------------------------------------------
 
 
-async def test_only_the_two_allowlisted_tools_are_allowed(config_factory, workspace):
-    mgr = await started(config_factory(workspace, [rea_mock()]))
+@pytest.mark.parametrize(
+    ("profile", "env", "available"),
+    [
+        ("restricted", {}, {"analyze_javascript_application", "inspect_electron_fuses"}),
+        ("balanced", {}, "all_but_wasm"),
+        ("balanced", {"REA_WABT_BIN_DIRECTORY": "/opt/wabt/bin"}, "all"),
+        ("full_access", {"REA_WABT_BIN_DIRECTORY": "/opt/wabt/bin"}, "all"),
+    ],
+)
+async def test_enabled_rea_tools_follow_the_access_profile(config_factory, workspace, profile, env, available):
+    from reveng_nexus.access import provider_tool_access
+    from reveng_nexus.adapters.rea_catalogue import ENABLED_TOOLS, LIVE_VERIFIED
+
+    mgr = await started(config_factory(workspace, [rea_mock(env=env)], policy={"access_profile": profile}))
     try:
-        tools = {t.name: t for t in await mgr.providers["rea"].list_tools()}
-        assert len(tools) == 207
-        allowed = sorted(n for n, t in tools.items() if t.decision.allowed)
-        assert allowed == ["analyze_javascript_application", "inspect_electron_fuses"]
-        assert all(t.classification.tool_class == "blocked" for n, t in tools.items() if n not in allowed)
+        access = provider_tool_access(mgr, mgr.providers["rea"])
+        assert len(access) == 207
+        expected = (
+            set(ENABLED_TOOLS)
+            if available == "all"
+            else set(ENABLED_TOOLS) - {"inspect_wasm_artifact"}
+            if available == "all_but_wasm"
+            else available
+        )
+        assert {n for n, a in access.items() if a.available} == expected
+        assert all(a.state == "adapter_only" for n, a in access.items() if n in expected)
+        assert not any(a.callable or a.exposed for a in access.values())  # adapter-only in every profile
+        if profile == "restricted":
+            assert access["inspect_go_binary"].state == "blocked_by_profile"
+            go = access["inspect_go_binary"]
+            assert not go.policy_allowed and not go.profile_allowed  # a wider profile would allow it
+        if available == "all_but_wasm":
+            wasm = access["inspect_wasm_artifact"]
+            assert wasm.state == "missing_prerequisite" and "REA_WABT_BIN_DIRECTORY" in wasm.reason
+        # never reachable, whatever the profile, and never reported as if a wider profile would help
+        for tool in ("gdb_console", "open_binary", "set_comment", "list_adb_devices", "procedure_pseudo_code"):
+            assert not access[tool].available
+            assert access[tool].state == "blocked_by_policy" and access[tool].profile_allowed, tool
+        profile_blocked = {n for n, a in access.items() if a.state == "blocked_by_profile"}
+        assert profile_blocked == (set(ENABLED_TOOLS) - set(LIVE_VERIFIED) if profile == "restricted" else set())
         caps = mgr.providers["rea"].list_capabilities()
         assert caps["js.application"]["available"] and caps["electron.fuses"]["available"]
+        assert caps["artifact.inspect"]["available"] == (profile != "restricted")
+    finally:
+        await mgr.close()
+
+
+@pytest.mark.parametrize(
+    ("analysis", "options", "sample"),
+    [
+        ("go_binary", {}, "elf"),
+        ("rust_binary", {}, "elf"),
+        ("pe_resources", {"max_entries": 64}, "pe"),
+        ("managed_artifact", {"detail": "summary"}, "pe"),
+        ("managed_members", {"type_names": ["Nexus.Fixture"]}, "pe"),
+        ("managed_native_boundaries", {}, "pe"),
+        ("sqlite_database", {"table": "t", "row_limit": 5}, "elf"),
+        ("wasm_artifact", {"detail": "summary"}, "elf"),
+    ],
+)
+async def test_inspect_artifact_sends_only_the_staged_copy(
+    config_factory, workspace, elf_sample, pe_sample, tmp_path, analysis, options, sample
+):
+    log = tmp_path / "calls.jsonl"
+    env = {"MOCK_CALL_LOG": str(log), "REA_WABT_BIN_DIRECTORY": "/opt/wabt/bin"}
+    mgr = await started(config_factory(workspace, [rea_mock(env=env)]))
+    try:
+        path = elf_sample if sample == "elf" else pe_sample
+        before = path.read_bytes()
+        target = await target_of(mgr, path)
+        out = await mgr.perform(
+            "artifact.inspect", target, {"analysis": analysis, "options": options}, provider_id="rea"
+        )
+        res = out["result"]
+        assert (res.operation, res.provider_id, res.engine_family) == ("artifact.inspect", "rea", "rea")
+        assert res.normalized["analysis"] == analysis and res.normalized["verification"] == "source_reviewed"
+        assert any("not been verified live" in w for w in res.warnings)
+        call = calls(log)[-1]
+        assert call["path_is_absolute"] and Path(call["path"]).resolve() != path.resolve()
+        assert call["arg_keys"] == sorted({"path", *options})
+        assert str(workspace) not in json.dumps(res.normalized)
+        record = mgr.evidence.get_evidence_record(out["evidence"]["evidence_id"], include_raw=True)
+        assert record["target_id"] == target.sha256 and record["operation"] == "artifact.inspect"
+        assert path.read_bytes() == before
+    finally:
+        await mgr.close()
+
+
+@pytest.mark.parametrize(
+    ("analysis", "options", "match"),
+    [
+        ("wasm_artifact", {"glue_paths": ["/etc/passwd"]}, "invalid options"),
+        ("sqlite_database", {"path": "/etc/passwd"}, "invalid options"),
+        ("pe_resources", {"max_entries": 0}, "invalid options"),
+        ("procedure_pseudo_code", {}, "unknown analysis"),
+    ],
+)
+async def test_inspect_artifact_refuses_paths_and_unknown_analyses(
+    config_factory, workspace, elf_sample, tmp_path, analysis, options, match
+):
+    from reveng_nexus.errors import ArgumentError
+
+    log = tmp_path / "calls.jsonl"
+    env = {"MOCK_CALL_LOG": str(log), "REA_WABT_BIN_DIRECTORY": "/opt/wabt/bin"}
+    mgr = await started(config_factory(workspace, [rea_mock(env=env)]))
+    try:
+        target = await target_of(mgr, elf_sample)
+        with pytest.raises(ArgumentError, match=match):
+            await mgr.perform("artifact.inspect", target, {"analysis": analysis, "options": options}, provider_id="rea")
+        assert calls(log) == []
+    finally:
+        await mgr.close()
+
+
+async def test_restricted_profile_keeps_inspect_artifact_unavailable(config_factory, workspace, elf_sample, tmp_path):
+    log = tmp_path / "calls.jsonl"
+    provider = rea_mock(env={"MOCK_CALL_LOG": str(log)})
+    mgr = await started(config_factory(workspace, [provider], policy={"access_profile": "restricted"}))
+    try:
+        target = await target_of(mgr, elf_sample)
+        with pytest.raises(CapabilityUnavailable) as info:
+            await mgr.perform("artifact.inspect", target, {"analysis": "go_binary"}, provider_id="rea")
+        assert "access_profile balanced" in json.dumps(info.value.to_dict())
+        assert calls(log) == []
     finally:
         await mgr.close()
 
@@ -308,9 +475,22 @@ async def test_upstream_drift_disables_both_operations(config_factory, workspace
         caps = rea.list_capabilities()
         assert not caps["js.application"]["available"] and not caps["electron.fuses"]["available"]
         assert "differs from the pin" in caps["electron.fuses"]["reason"]
+        assert (
+            not caps["artifact.inspect"]["available"] and "differs from the pin" in caps["artifact.inspect"]["reason"]
+        )
         assert (await rea.health_check()).status != "ready"
         with pytest.raises(CapabilityUnavailable):
             await mgr.perform("electron.fuses", await target_of(mgr, fuse_sample), {}, provider_id="rea")
+        with pytest.raises(CapabilityUnavailable):
+            await mgr.perform(
+                "artifact.inspect", await target_of(mgr, fuse_sample), {"analysis": "go_binary"}, provider_id="rea"
+            )
+        with pytest.raises(PolicyViolation, match="differs from the pin"):
+            await rea.call_tool("inspect_electron_fuses", {"path": "x"}, internal=True)
+        from reveng_nexus.access import provider_access, provider_tool_access
+
+        assert {a.state for a in provider_tool_access(mgr, rea).values()} == {"catalogue_mismatch"}
+        assert provider_access(mgr, "rea")["state"] == "catalogue_mismatch"
         assert calls(log) == []  # nothing reached the drifted server
     finally:
         await mgr.close()
@@ -393,5 +573,27 @@ async def test_list_tools_marks_rea_tools_not_callable(config_factory, workspace
         assert allowed.to_dict()["callable"] is False and "adapter-only" in allowed.to_dict()["policy_reason"]
         assert rea.describe()["callable_tool_count"] == 0
         assert rea.list_capabilities()["electron.fuses"]["available"]
+    finally:
+        await mgr.close()
+
+
+async def test_upstream_read_only_hints_never_classify_or_enable_rea_tools(config_factory, workspace):
+    """Six REA tools declare readOnlyHint: true at the pin (gdb_session_status among them, a
+    debugger-session tool). The hint must not change their class or make them reachable."""
+    from reveng_nexus.access import provider_tool_access
+    from reveng_nexus.adapters.rea_catalogue import CATALOGUE
+
+    mgr = await started(config_factory(workspace, [rea_mock()], policy={"access_profile": "full_access"}))
+    try:
+        rea = mgr.providers["rea"]
+        access = provider_tool_access(mgr, rea)
+        hinted = {n for n, t in rea._tools.items() if t.annotations.get("readOnlyHint") is True}
+        assert hinted == set(mock_rea.READ_ONLY_HINTED)
+        for name in hinted:
+            info = rea._tools[name]
+            assert info.classification.source == "manifest", name  # never "annotations"
+            assert info.classification.tool_class == CATALOGUE[name].tool_class, name
+            assert not access[name].available and not access[name].callable, name
+        assert rea._tools["gdb_session_status"].classification.tool_class == "dynamic"
     finally:
         await mgr.close()

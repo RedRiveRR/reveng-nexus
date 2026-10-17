@@ -73,14 +73,25 @@ def _va_to_offset(address: int, meta: dict[str, Any]) -> tuple[int, int] | None:
 
 
 def _symbol_table_warnings(meta: dict[str, Any]) -> list[str]:
-    """An empty list from a missing or unusable symbol table is unknown, not empty (Mach-O)."""
+    """An empty list from a missing or unusable symbol table is unknown, not empty."""
     if meta.get("format") == "macho_universal":
         return ["universal Mach-O: symbols are decoded per architecture slice (binary.metadata) and not merged here"]
     state = meta.get("symbol_table")
+    if meta.get("error") and state is None:
+        # The ELF/PE/APK parser raised at intake (hostile or truncated bytes); Mach-O reports its
+        # own symbol_table state below.
+        return [
+            f"the {meta.get('format', 'file')} could not be decoded ({str(meta['error'])[:200]}): "
+            "functions, imports and exports are unknown, not empty"
+        ]
     if state == "not_decoded":
         return ["the Mach-O header could not be decoded: functions, imports and exports are unknown, not empty"]
     if state == "absent":
         return ["no symbol table (LC_SYMTAB) in this file: functions, imports and exports are unknown, not empty"]
+    if state == "incomplete":
+        return [
+            "the Mach-O load commands could not all be decoded: functions, imports and exports are unknown, not empty"
+        ]
     if state == "out_of_bounds":
         return ["the symbol table points outside the file and was not decoded: results are unknown, not empty"]
     if state == "partial":
@@ -186,7 +197,11 @@ class BuiltinStaticProvider(AnalysisProvider):
                 "exports": len(meta.get("exports", []) or []),
             }
             return self._result(
-                operation, target, normalized, claim=f"{meta.get('format_detail') or fmt} {meta.get('arch')}"
+                operation,
+                target,
+                normalized,
+                warnings=_symbol_table_warnings(meta) if meta.get("error") else [],
+                claim=f"{meta.get('format_detail') or fmt} {meta.get('arch')}",
             )
 
         if operation == "binary.functions":

@@ -81,18 +81,22 @@ def _parse_thin(blob: bytes, offset: int = 0) -> dict[str, Any]:
     symtab: tuple[int, int, int, int] | None = None
     encrypted = False
     truncated = False
+    # True when the walk stopped before ncmds commands (truncation, a malformed cmdsize, the
+    # command cap): a symbol table after that point was never seen, so its absence is unknown.
+    incomplete = ncmds > _MAX_COMMANDS
     entry_offset = None
     for _ in range(min(ncmds, _MAX_COMMANDS)):
         if cursor + 8 > len(blob):
-            truncated = True
+            truncated = incomplete = True
             break
         cmd, cmdsize = struct.unpack_from(endian + "II", blob, cursor)
         if cmdsize < 8:
+            incomplete = True  # cannot advance past a command shorter than its own header
             break
         name = _LC_NAMES.get(cmd, f"0x{cmd:x}")
         if cursor + max(cmdsize, _MIN_CMD_SIZE.get(name, 8)) > len(blob):
             # The command runs past the end of the file: keep what was decoded, flag the rest.
-            truncated = True
+            truncated = incomplete = True
             break
         commands.append(name)
         if cmdsize < _MIN_CMD_SIZE.get(name, 8):
@@ -130,6 +134,8 @@ def _parse_thin(blob: bytes, offset: int = 0) -> dict[str, Any]:
     text = next((s for s in segments if s["name"] == "__TEXT"), None)
     image_base = text["vaddr"] if text else None
     symbols = _symbols(blob, endian, is64, offset, symtab, sections, libraries)
+    if symtab is None and incomplete:
+        symbols["symbol_table"] = "incomplete"
     return {
         "arch": arch,
         "bits": bits,
@@ -272,6 +278,11 @@ def inspect_macho(path: Path, blob: bytes) -> dict[str, Any]:
         notes.append("The Mach-O header could not be decoded: symbols are unknown, not empty.")
     elif status == "absent":
         notes.append("No LC_SYMTAB: functions, imports and exports are unknown, not empty.")
+    elif status == "incomplete":
+        notes.append(
+            "Load commands could not all be decoded (malformed or truncated) before any LC_SYMTAB: "
+            "functions, imports and exports are unknown, not empty."
+        )
     elif status == "out_of_bounds":
         notes.append("LC_SYMTAB points outside the file: symbols were not decoded (unknown, not empty).")
     elif status == "partial":

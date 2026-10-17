@@ -20,6 +20,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from ..access import TOOL_STATES
 from ..config import NexusConfig
 from ..policy import TOOL_CLASS_DESCRIPTIONS
 from ..snapshot import HEARTBEAT_SECONDS, SNAPSHOT_DIRNAME, SNAPSHOT_NAME, sanitize, sanitize_text
@@ -46,15 +47,23 @@ METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
     "callable_tools": {
         "label": "Callable through Nexus",
         "definition": "Allowed tools a caller may invoke directly (nexus_call_provider_tool or namespaced tools): "
-        "allowed and not adapter-only. Every call is still re-checked with its actual arguments.",
-        "source": "gateway snapshot (ToolInfo.callable)",
+        "allowed by policy and profile, not adapter-only, not withheld by the adapter. Every call is still "
+        "re-checked with its actual arguments.",
+        "source": "gateway snapshot (access.tool_access: callable)",
     },
     "exposed_tools": {
         "label": "Exposed to MCP clients",
-        "definition": "Raw provider tools listed to Claude Code as their own MCP tools. Only in tool_mode "
-        "'namespaced' with expose_tools; in 'compact' mode (default) this is 0 and raw tools are reached "
-        "through nexus_call_provider_tool.",
-        "source": "gateway snapshot (tool_mode, expose_tools, callable)",
+        "definition": "Raw provider tools listed to Claude Code as their own MCP tools: exactly the names the "
+        "gateway's tools/list returns. Only in tool_mode 'namespaced' with expose_tools; in 'compact' mode "
+        "(default) this is 0 and raw tools are reached through nexus_call_provider_tool.",
+        "source": "gateway snapshot (access.exposure_map, the same function tools/list uses)",
+    },
+    "available_tools": {
+        "label": "Available",
+        "definition": "Tools usable right now, directly (callable/exposed) or through a nexus_* operation "
+        "(adapter-only). Excludes tools blocked by profile or policy, missing a prerequisite, or on a "
+        "drifted upstream.",
+        "source": "gateway snapshot (access_state)",
     },
     "blocked_tools": {
         "label": "Blocked",
@@ -79,6 +88,18 @@ METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
         "source": "gateway snapshot (server.TOOL_SPECS)",
     },
 }
+
+TOOL_STATE_DESCRIPTIONS: dict[str, str] = {
+    "exposed": "callable and listed as its own MCP tool (tool_mode: namespaced)",
+    "callable": "a caller may invoke it with nexus_call_provider_tool",
+    "adapter_only": "allowed, reachable only through the adapter's nexus_* operations",
+    "missing_prerequisite": "allowed, but a helper it needs is not configured for this provider",
+    "blocked_by_profile": "withheld by the access profile; a wider profile would allow it",
+    "blocked_by_policy": "its class, a deny-list, an explicit gate or the adapter forbids it",
+    "catalogue_mismatch": "the live upstream differs from the adapter's pin; nothing is used",
+    "unknown": "not classified; blocked until an operator classifies it",
+}
+assert set(TOOL_STATE_DESCRIPTIONS) == set(TOOL_STATES)
 
 LEGACY_CANCEL_NOTE = (
     "recorded before the 2026-10-16 fix: a provider start cut short by the gateway's own shutdown "
@@ -175,6 +196,7 @@ class DashboardData:
             {
                 "config_path": cfg.config_path,
                 "tool_mode": cfg.tool_mode,
+                "access_profile": policy.access_profile,
                 "read_only": policy.read_only,
                 "code_execution": policy.allow_code_execution,
                 "dynamic_analysis": policy.dynamic.enabled,
@@ -207,7 +229,14 @@ class DashboardData:
         mismatches: list[str] = []
         if primary is not None:
             eff = primary["policy"]
-            for key in ("read_only", "code_execution", "dynamic_analysis", "remote_ai", "remote_providers"):
+            for key in (
+                "access_profile",
+                "read_only",
+                "code_execution",
+                "dynamic_analysis",
+                "remote_ai",
+                "remote_providers",
+            ):
                 if eff.get(key) != configured.get(key):
                     mismatches.append(
                         f"{key}: configured {configured.get(key)!r}, gateway reports {eff.get(key)!r} "
@@ -235,6 +264,7 @@ class DashboardData:
             "freshness_legend": FRESHNESS,
             "verification_states": STATES,
             "tool_classes": TOOL_CLASS_DESCRIPTIONS,
+            "tool_states": TOOL_STATE_DESCRIPTIONS,
             "architecture": self.architecture(primary, configured),
         }
 
@@ -286,6 +316,7 @@ class DashboardData:
                 "outputs": "PolicyDecision (allowed, class, reason)",
                 "dependencies": [],
                 "restrictions": [
+                    f"access_profile={policy.get('access_profile')}",
                     f"read_only={policy.get('read_only')}",
                     f"code_execution={policy.get('code_execution')}",
                     f"dynamic_analysis={policy.get('dynamic_analysis')}",

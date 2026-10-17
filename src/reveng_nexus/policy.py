@@ -9,16 +9,33 @@ called. Classification sources, strongest first:
 4. a verb heuristic (``security.heuristic_tool_class``).
 
 Deny patterns (global and per-provider) always win. Unknown tools are blocked.
+
+Sources 1-2 are *verified* (an operator or a reviewed pin decided); 3-4 are *derived* from what the
+upstream says about itself. The access profile (``policy.access_profile``) decides how far derived
+classifications are trusted:
+
+* restricted: a caller may invoke only reads with a verified classification;
+* balanced (default): derived reads are callable too (the 0.2 behaviour);
+* full_access: read_only defaults to off.
+
+In every profile a mutating tool needs a verified classification before it may run: an annotation
+or a verb is never sufficient proof that a write is the one the operator meant to allow. Code
+execution, dynamic analysis and lifecycle tools keep their own explicit gates; no profile opens them.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .config import NexusConfig, ProviderConfig
 from .errors import PolicyViolation
-from .security import DEFAULT_BLOCKED_TOOL_PATTERNS, heuristic_tool_class, matches_patterns
+from .security import (
+    DEFAULT_BLOCKED_TOOL_PATTERNS,
+    PROTECTION_BYPASS_PATTERNS,
+    heuristic_tool_class,
+    matches_patterns,
+)
 
 TOOL_CLASS_DESCRIPTIONS = {
     "read": "observes analysis state without changing it",
@@ -37,12 +54,18 @@ _TARGET_ARGS = ("target", "package", "package_name", "bundle_id", "identifier", 
 # "lifecycle" tools take filesystem paths (open_idb path/idb_out, open_database file_path,
 # load_apk apkPath) that the workspace guard never sees, so they cannot become "read" either.
 _UNRELAXABLE = frozenset({"blocked", "execute", "dynamic", "lifecycle"})
+# Classification sources an operator or a reviewed upstream pin stands behind.
+VERIFIED_SOURCES = frozenset({"manifest", "override"})
 
 
 @dataclass(frozen=True, slots=True)
 class ToolClassification:
     tool_class: str
     source: str  # override | manifest | annotations | heuristic | pattern
+
+    @property
+    def verified(self) -> bool:
+        return self.source in VERIFIED_SOURCES
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,14 +74,20 @@ class PolicyDecision:
     tool_class: str
     source: str
     reason: str
+    # Why a denial happened: "profile" (the access profile withholds it) or "policy" (class, gates,
+    # deny-lists, arguments). Empty when allowed.
+    denied_by: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "allowed": self.allowed,
             "tool_class": self.tool_class,
             "classification_source": self.source,
             "reason": self.reason,
         }
+        if self.denied_by:
+            out["denied_by"] = self.denied_by
+        return out
 
 
 def _declared_arguments(schema: dict[str, Any] | None) -> frozenset[str] | None:
@@ -93,8 +122,12 @@ class PolicyEngine:
         trust_annotations_default: bool = False,
         unlisted_class: str | None = None,
     ) -> ToolClassification:
-        patterns = (*self.policy.global_blocked_tool_patterns, *provider.blocked_tool_patterns)
-        if patterns and matches_patterns(tool_name, patterns):
+        patterns = (
+            *PROTECTION_BYPASS_PATTERNS,
+            *self.policy.global_blocked_tool_patterns,
+            *provider.blocked_tool_patterns,
+        )
+        if matches_patterns(tool_name, patterns):
             return ToolClassification("blocked", "pattern")
 
         heuristic = heuristic_tool_class(tool_name)
@@ -147,9 +180,10 @@ class PolicyEngine:
     ) -> PolicyDecision:
         cls, src = classification.tool_class, classification.source
         declared = _declared_arguments(input_schema)
+        profile = self.policy.access_profile
 
-        def deny(reason: str) -> PolicyDecision:
-            return PolicyDecision(False, cls, src, reason)
+        def deny(reason: str, by: str = "policy") -> PolicyDecision:
+            return PolicyDecision(False, cls, src, reason, by)
 
         def allow(reason: str) -> PolicyDecision:
             return PolicyDecision(True, cls, src, reason)
@@ -157,11 +191,19 @@ class PolicyEngine:
         if cls == "blocked":
             return deny("tool is on a deny-list or hard-blocked by the adapter")
         if provider.kind == "dynamic" or cls == "dynamic":
-            return self._decide_dynamic(provider, tool_name, cls, src, arguments, declared, internal)
+            decision = self._decide_dynamic(provider, tool_name, cls, src, arguments, declared, internal)
+            # dynamic gates are explicit operator settings, never the profile
+            return decision if decision.allowed else replace(decision, denied_by="policy")
         extra = _undeclared(arguments, declared)
         if extra and not internal and cls != "unknown":
             return deny(f"arguments not declared by the tool's input schema: {extra}")
         if cls == "read":
+            if profile == "restricted" and not internal and not classification.verified:
+                return deny(
+                    f"access_profile restricted: only reads classified by a pinned adapter manifest or an "
+                    f"operator tool_overrides entry are callable; this one was classified by {src}",
+                    "profile",
+                )
             return allow("read-only observation")
         if cls == "lifecycle":
             if internal:
@@ -172,8 +214,16 @@ class PolicyEngine:
             )
         if cls == "mutate":
             if self.policy.read_only:
-                return deny("read-only policy blocks tools that modify analysis state")
-            return allow("read_only is disabled in policy")
+                # "profile" only when full_access would actually allow it (a verified classification)
+                by = "profile" if profile != "full_access" and classification.verified else "policy"
+                return deny("read-only policy blocks tools that modify analysis state", by)
+            if not classification.verified:
+                # Broader access must not rest on an upstream's own claims (a destructiveHint, a verb).
+                return deny(
+                    f"mutating tool classified only by {src}; classify it with tool_overrides (or a pinned "
+                    "manifest) after reviewing it before it may run"
+                )
+            return allow(f"read_only is disabled (access_profile {profile})")
         if cls == "execute":
             if (
                 self.policy.allow_code_execution

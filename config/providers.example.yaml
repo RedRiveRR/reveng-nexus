@@ -20,7 +20,16 @@ workspace:
   follow_symlinks: false
 
 policy:
-  read_only: true               # block tools that modify analysis databases
+  # restricted  : callers reach only reads classified by a pinned adapter manifest or tool_overrides;
+  #               nexus_* operations still work. Cannot be combined with the gates below.
+  # balanced    : (default) reads, including ones classified from upstream annotations or tool names.
+  # full_access : read_only defaults to false, but a mutating tool still needs a pinned manifest or
+  #               tool_overrides classification. Opens nothing else: the gates below stay explicit.
+  # Per-provider effects (e.g. which REA analyses each profile enables): docs/SECURITY.md.
+  access_profile: balanced
+  # read_only follows the profile (true unless full_access). Setting it may only tighten:
+  # read_only: false under restricted/balanced is an error; read_only: true under full_access keeps writes off.
+  # read_only: true
   allow_code_execution: false   # tools that run arbitrary code (execute_python, pyghidra, run_script)
   code_execution_providers: []  # must list provider ids explicitly if the above is enabled
   allow_remote_ai: false        # required (with model.allow_remote) for non-loopback model endpoints
@@ -211,10 +220,16 @@ providers:
     priority: 50
     timeout_seconds: 120
 
-  # morluto/rea (npm rea-agents 6.5.0) — static JavaScript/Electron analysis only. Runs on a
-  # dedicated Node 22.19+/24.11+ (the system Node may be outside REA's engine range) from a pinned
-  # local install, never via npx. Nexus allows exactly two tools (analyze_javascript_application,
-  # inspect_electron_fuses); REA's other 205 tools are blocked and raw passthrough is refused.
+  # morluto/rea (npm rea-agents 6.5.0) — static file analysis only. Runs on a dedicated Node
+  # 22.19+/24.11+ (the system Node may be outside REA's engine range) from a pinned local install,
+  # never via npx. All 207 REA tools are classified at the pin (adapters/rea_catalogue.py); Nexus
+  # enables only file-scoped reads it can confine to the staged target copy:
+  #   every profile        : analyze_javascript_application, inspect_electron_fuses (verified live)
+  #   balanced, full_access: nexus_inspect_artifact go_binary, rust_binary, pe_resources,
+  #                          managed_artifact, managed_members, managed_native_boundaries,
+  #                          sqlite_database, wasm_artifact (reviewed at the pin, not run live)
+  # Session, device, debugger, browser, extraction and code-running tools stay unreachable under
+  # every profile, and raw passthrough is refused.
   # HOME/TEMP point into a Nexus-owned directory so REA never reads or writes the user profile.
   # Remove the provider by deleting this block; Claude Code settings are never involved.
   - id: rea
@@ -233,7 +248,9 @@ providers:
       TEMP: '${LOCALAPPDATA}\RevEngNexus\data\rea-tmp'
       TMP: '${LOCALAPPDATA}\RevEngNexus\data\rea-tmp'
       REA_LOG_LEVEL: warn
-    capabilities: [js.application, electron.fuses]
+      # Optional helpers (absolute paths). Without one, its analysis reports missing_prerequisite.
+      # REA_WABT_BIN_DIRECTORY: 'C:\Tools\wabt-1.0.42\bin'   # wasm_artifact (WABT 1.0.42)
+    capabilities: [js.application, electron.fuses, artifact.inspect]
     priority: 50
     timeout_seconds: 300
     startup_timeout_seconds: 120
