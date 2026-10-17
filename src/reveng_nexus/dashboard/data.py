@@ -320,7 +320,7 @@ class DashboardData:
                     f"read_only={policy.get('read_only')}",
                     f"code_execution={policy.get('code_execution')}",
                     f"dynamic_analysis={policy.get('dynamic_analysis')}",
-                    f"never relaxable: {', '.join(policy.get('unrelaxable_classes') or [])}",
+                    f"never relaxable: {', '.join(policy.get('unrelaxable_classes') or [])}; pinned mutate: mutate or blocked only",
                 ],
             },
             {

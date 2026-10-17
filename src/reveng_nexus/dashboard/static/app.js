@@ -557,7 +557,8 @@ function openTool(t) {
       ["Public name", h("span", null, h("code", { text: t.public }), " ", copyBtn(t.public))]]), h("div", { class: "stack" }, flowFor(t))),
     sec("Input schema", schemaView(t.schema)),
     sec("Security classification", kv([["Policy class", h("code", { text: t.tool_class })], t.class_meaning ? ["Meaning", t.class_meaning] : null,
-      t.source ? ["Classification source", t.source] : null, unrelaxable.includes(t.tool_class) ? ["Restriction", "This class can never be relaxed by an operator override."] : null,
+      t.source ? ["Classification source", t.source] : null, unrelaxable.includes(t.tool_class) ? ["Restriction", "This class can never be relaxed by an operator override."]
+        : t.tool_class === "mutate" && t.source === "manifest" ? ["Restriction", "Pinned as mutate by the adapter: an operator override can only make it blocked."] : null,
       t.annotations && Object.keys(t.annotations).length ? ["Upstream annotations", h("span", { class: "mono", text: JSON.stringify(t.annotations) })] : null])),
     sec("Verification", t.kind === "provider" ? kv([["Provider state", verifMark(v)], ["Scope", v.scope || "—"], ["Prerequisite / blocker", v.blocker || "none"], ["Last recorded", v.last_recorded || "—"],
       ["Per-tool coverage", "Not recorded per tool; the provider-level record above applies."]]) : h("p", { class: "muted", text: "Nexus tools are covered by the gateway's own test suite (tests/test_server.py)." })),
@@ -622,7 +623,7 @@ function viewSecurity() {
       panel("What is permitted and what is blocked", p ? kv([["Callable by callers", cats("allowed")], ["Used only inside adapters", cats("adapter")], ["Blocked", cats("blocked")]])
         : h("p", { class: "muted", text: "Needs a gateway snapshot." }), h("p", { class: "faint", text: "Upstream tools per policy class, as decided by the gateway." })),
       more("Hard security blocks", "classes that can never be relaxed, mutation-shaped names", () => eff ? [
-        h("p", { class: "muted", text: "An operator tool_override may tighten any class but never relax these:" }),
+        h("p", { class: "muted", text: "An operator tool_override may tighten any class but never relax the classes listed below. A mutate class pinned by the adapter (manifest or unlisted-tool class) can only stay mutate or become blocked; a mutate guessed from the tool name alone can be reclassified." }),
         h("div", { class: "tags" }, (eff.unrelaxable_classes || []).map((c) => tag(c, true))),
         h("h3", { text: "Mutation-shaped names (blocked under read-only even with a read-only hint)" }),
         h("div", { class: "tags" }, (eff.default_blocked_tool_patterns || []).map((c) => tag(c, true))),
