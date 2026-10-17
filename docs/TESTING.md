@@ -234,8 +234,9 @@ Security review follow-up on PR #1 (2026-10-17, same Linux container):
 | ruff check, ruff format --check (87 files), mypy (45 files), compileall, `--check-config` on the example, `node --check app.js`, `git diff --check` | clean |
 
 No test process was left after any run (non-zombie check, rechecked for up to 10 s). Not run:
-Windows, macOS, real REA. The dashboard's "never relaxable" list still shows the four
-unconditional classes only; the pinned-`mutate` rule is enforced but not listed there.
+Windows, macOS, real REA. The dashboard lists the four unconditional classes and explains
+that adapter-pinned `mutate` can only stay `mutate` or become `blocked`; name-based
+`mutate` guesses remain operator-reclassifiable. The per-tool view also shows this restriction.
 
 Skips: live Ghidra x2, live REA x1 (opt-in variables unset), NTFS ADS x1, UNC x4 (Windows
 concepts). The Windows suite and the live Ghidra/REA tests have **not** been re-run for these
