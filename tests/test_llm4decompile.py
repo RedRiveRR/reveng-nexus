@@ -176,3 +176,23 @@ async def test_ai_unavailable_is_explained(config_factory, workspace, elf_sample
             await Orchestrator(mgr).ai_decompile(target, name="main")
     finally:
         await mgr.close()
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [("", "non-empty"), ("  \n\t ", "non-empty"), ("x" * 48_001, "exceeds 48000")],
+)
+async def test_empty_or_oversized_input_is_refused_before_any_request(
+    config_factory, workspace, elf_sample, fake, text, match
+):
+    from reveng_nexus.errors import ArgumentError
+
+    mgr, target = await _setup(config_factory, workspace, elf_sample, [llm_provider(fake.url)])
+    try:
+        with pytest.raises(ArgumentError, match=match):
+            await mgr.providers["llm4d"].perform(
+                "ai.decompile", target, {"input_kind": "pseudocode", "input_text": text}
+            )
+        assert fake.prompts == []  # nothing was sent to the model endpoint
+    finally:
+        await mgr.close()

@@ -45,7 +45,7 @@ was observed live with re-mcp-ghidra and a wrong `GHIDRA_INSTALL_DIR`.
 
 | Provider id | Upstream | Pinned revision / package | Licence | Integration method | Verification state | Blocker |
 |---|---|---|---|---|---|---|
-| `builtin` | RevEng Nexus | repo 0.2.0; pyelftools 0.32, pefile 2024.8.26, capstone 5.0.9 | MIT (deps: Public domain / MIT / BSD-3) | in-process | `live_analysis_verified` only for the generated fixtures and operations that `tests/test_builtin_fixtures.py` and `tests/test_builtin_provider.py` assert: ELF metadata, functions, strings, disassembly; PE metadata, imports, strings; Mach-O metadata, strings, entry disassembly and `LC_SYMTAB` symbols (functions = defined symbols in instruction sections, imports = undefined external symbols with their dylib, exports = defined external symbols; sizes unknown; an absent or out-of-bounds table is reported as unknown, not empty); APK manifest, components, strings | — |
+| `builtin` | RevEng Nexus | repo 0.2.0; pyelftools 0.32, pefile 2024.8.26, capstone 5.0.9 | MIT (deps: Public domain / MIT / BSD-3) | in-process | `live_analysis_verified` only for the generated fixtures and operations that `tests/test_builtin_fixtures.py` and `tests/test_builtin_provider.py` assert: ELF metadata, functions, strings, disassembly; PE metadata, imports, strings; Mach-O metadata, strings, entry disassembly and `LC_SYMTAB` symbols (functions = defined symbols in instruction sections, imports = undefined external symbols with their dylib, exports = defined external symbols; sizes unknown; an absent or out-of-bounds table, or load commands that stop before any `LC_SYMTAB`, is reported as unknown, not empty); APK manifest, components, strings. An ELF or PE whose parser fails on hostile or truncated bytes yields empty lists with an explicit "could not be decoded … unknown, not empty" warning, never a clean "0 functions"; an ELF without `PT_LOAD` keeps base 0 but says so in `image_base_source` | — |
 | `ghidra_remcp` | [jtsylve/re-mcp](https://github.com/jtsylve/re-mcp), Ghidra backend | `7b38aa9`; PyPI `re-mcp-ghidra==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | `live_analysis_verified` (automated live tests, `tests/integration/test_ghidra_live.py`, passed 2026-10-15; re-run passed 2026-10-16, also on the reinstalled integration machine) for `binary.metadata` (bits, image base, function count; no entry point reported), `binary.functions` (names, addresses, sizes), `binary.decompile`, `binary.disassemble`, `binary.xrefs` in both directions, `binary.cfg` (call destinations as `external_targets`, not successors), `binary.strings`, `binary.imports` (empty on the static fixture), `binary.exports`; all on one generated static x86-64 ELF | — |
 | `ghidra_mcpy` | [nightwing-us/mcpyghidra](https://github.com/nightwing-us/mcpyghidra) | `f1e130c` (v0.8.0); PyPI `mcpyghidra==0.8.0` | Apache-2.0 (+ NOTICE) | launch → JSON readiness → Streamable HTTP, one server per target | `live_analysis_verified` (automated live tests, passed 2026-10-15; re-run passed 2026-10-16, also on the reinstalled integration machine) for `binary.decompile`, `binary.metadata` (upstream's `entry_point` is its first external entry, so Nexus reports the entry as unknown), `binary.functions` (no sizes upstream), `binary.disassemble`, `binary.xrefs` in both directions, `binary.cfg`, `binary.strings`, `binary.imports` (empty on the fixture), `binary.exports`; all on one generated static x86-64 ELF | — |
 | `re_mcp_ida` | jtsylve/re-mcp, IDA backend | `7b38aa9`; PyPI `re-mcp-ida==3.0.3` | MIT OR Apache-2.0 | stdio MCP child via `uvx` | `mock_tested` for the shared call path only (its mock imitates the Ghidra backend); the IDA response shapes (xref `from`/`to`, `pseudocode`, `disasm`, no image base) are `unit_tested` against the pinned source (`tests/test_interop_d.py`) | `blocked`: licensed IDA 9+ (none installed) |
@@ -55,14 +55,14 @@ was observed live with re-mcp-ghidra and a wrong `GHIDRA_INSTALL_DIR`.
 | `jadx` | [Qtty/jadx-mcp-server](https://github.com/Qtty/jadx-mcp-server) | `4e6d890` (pom 1.0.0) | **no LICENSE file**: no redistribution rights | stdio Python MCP → JVM daemon `127.0.0.1:8765` | `mock_tested` (mock fixtures built from the pinned upstream source, see [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md); never run against the real engine) | `blocked`: Maven build of the daemon (Maven absent; JDK 25 present); `JADX_MCP_HOME` unset |
 | `frida_mobile` | [monkeywave/frida-mobile-mcp](https://github.com/monkeywave/frida-mobile-mcp) | `b2da55d`; npm `frida-mobile-mcp@0.2.3` | MIT | stdio npm child, **dynamic**, never started while policy is off | `mock_tested` (2026-10-15: mock built from the pinned source, see [ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md); never run against real Frida or a device) | `blocked`: no authorised test device; no frida/adb; policy disabled by design |
 | `llm4decompile` | [albertan017/LLM4Decompile](https://github.com/albertan017/LLM4Decompile) | `85b364b` | code MIT; **weights: DeepSeek License Agreement** | OpenAI-compatible `/v1/completions` you serve | `mock_tested` (local mock HTTP endpoint; not MCP) | `blocked`: no served checkpoint (nothing listening on 8000/8080/11434/1234); weights deliberately not downloaded |
-| `rea` | [morluto/rea](https://github.com/morluto/rea), npm `rea-agents` | `3b79af2` (tag `rea-agents-6.5.0`); npm `rea-agents@6.5.0` | MIT | stdio MCP child (`node rea.mjs mcp`) on a dedicated Node 24.21.0; **adapter-only**, two static tools allowed | `live_analysis_verified` (2026-10-15; live test re-run passed 2026-10-16 on the reinstalled integration machine) **for `js.application` and `electron.fuses` only** + `mock_tested` | — (disabled in the example config; the other 205 REA tools are blocked by design) |
+| `rea` | [morluto/rea](https://github.com/morluto/rea), npm `rea-agents` | `3b79af2` (tag `rea-agents-6.5.0`); npm `rea-agents@6.5.0` | MIT | stdio MCP child (`node rea.mjs mcp`) on a dedicated Node 24.21.0; **adapter-only**; all 207 tools classified, 10 file-scoped reads enabled per access profile | `live_analysis_verified` (2026-10-15; live test re-run passed 2026-10-16 on the reinstalled integration machine) **for `js.application` and `electron.fuses` only**; `mock_tested` (2026-10-17, implementation reviewed at the pin, never run live) for the eight `artifact.inspect` analyses | — (disabled in the example config; session, device, debugger, browser, extraction and code-running tools are unreachable by design) |
 | — | [symgraph/GhidrAssist](https://github.com/symgraph/GhidrAssist) | `db0bb3d` | MIT | none; Ghidra plugin acting as an MCP *client* of Nexus' loopback HTTP endpoint | `not_integrated` as a provider (by design); client path untested | Ghidra GUI session for the client test |
 | — | [ram-elgov/awesome-llm-reverse-engineering](https://github.com/ram-elgov/awesome-llm-reverse-engineering) | `55366aa` | README states "MIT" | research reading list | `not_integrated` (not a runtime component) | — |
 
 Unimplemented on purpose: reviewed IDAPython templates for `ida_official` (decision
 pending), any Frida protection-bypass/memory-write/custom-script pass-through, automatic
-model-weight download, an authenticated non-loopback HTTP mode, and any REA tool beyond
-the two static parsers (REA's dynamic, debugger, extraction and deep-engine tools stay blocked).
+model-weight download, an authenticated non-loopback HTTP mode, and any REA tool beyond the
+ten file-scoped reads (REA's dynamic, debugger, extraction and deep-engine tools stay unreachable).
 
 **Integration vs. redistribution.** Running an upstream as a separate process says nothing
 about the right to copy it. Binary Ninja MCP is GPL-3.0 and jadx-mcp-server has no licence,
@@ -238,6 +238,9 @@ oldest: awesome-llm-reverse-engineering 2025-07-28). The eleventh, REA, was adde
   detach and process reaping. No Frida, frida-server, npx, device or app was used.
 
 ### REA (`rea`, static JavaScript/Electron only)
+
+(The heading keeps its anchor; since 2026-10-17 the adapter also offers the reviewed static file
+analyses below.)
 - **Pin:** npm `rea-agents` 6.5.0 (dist-tag `latest`, published 2026-10-14 via GitHub
   Actions trusted publishing), integrity
   `sha512-C6BG7LyrAdR74mSjertM6PrxJkcNZ2bfQNOJornPo9erDEp2tyPRVYPnV5Yodr+1RqewCQla68WulXlVnveD+A==`
@@ -260,8 +263,50 @@ oldest: awesome-llm-reverse-engineering 2025-07-28). The eleventh, REA, was adde
 - **Observed contract (2026-10-15):** `serverInfo` rea/6.5.0, protocol 2025-11-25, 207 tools
   (SHA-256 of the sorted names `821ff86b6022644383456368e470cb72c92db8471785c41821bd0c99eeecde99`).
   Upstream has no read-only mode and no path containment; its annotations are self-declared
-  (every tool reports `readOnlyHint: false`) and are not trusted.
-- **Allowlist:** exactly two tools, reviewed at the pin as in-process static parsers of one
+  and are not trusted. (Correction, 2026-10-17, from source at the pin: REA registers each
+  contract's annotations as derived from its effect audit, `src/server/toolRegistrationOptions.ts:33`
+  and `src/contracts/toolEffects.ts:714-773`, which gives six tools `readOnlyHint: true`:
+  `evaluate_reconstruction_coverage`, `list_unknowns`, `verify_unknown_resolution`,
+  `get_evidence_bundle`, `gdb_session_status`, `frida_session_status`. The earlier note that every
+  tool reports `false` is not supported by the source; re-check it against a live `tools/list`.)
+- **Catalogue classification (2026-10-17):** all 207 tools are classified in
+  `adapters/rea_catalogue.py` from REA's own effect audit (`src/contracts/toolEffects.ts`
+  `TOOL_EFFECTS`: mutatesTarget, writesFilesystem, launchesProcess, accessesNetwork,
+  executesForeignCode, mutatesDevice), each tool's input schema and contract kind (exported from
+  the pinned npm contracts with integrity verified, contracts only, no server or target run), and,
+  for enabled tools, the implementation. Result: 125 `read` (30 file-scoped, 87 on an REA session
+  or Evidence ids, 7 helper probes, 1 needing several caller paths), 16 `mutate`, 8 `lifecycle`,
+  15 `execute` (REA marks them `executesForeignCode`), 43 `dynamic` (ADB, Frida, debugger
+  sessions, CDP/Inspector runtimes, native UI, a browser launched for module resolution).
+- **Enabled per access profile** (allowlist by tool name; `tool_overrides` cannot widen it and it
+  also refuses the adapter's own calls):
+  - every profile: the two tools verified live (below);
+  - balanced and full_access: `nexus_inspect_artifact` (operation `artifact.inspect`) with
+    `go_binary` (`inspect_go_binary`), `rust_binary` (`inspect_rust_binary`), `pe_resources`
+    (`inspect_pe_resources`): one `readStableArtifact` read (regular file, no symlink) and
+    in-process parsing, no process, no writes; `managed_artifact`, `managed_members`,
+    `managed_native_boundaries` (`inspect_managed_*`): in-process, no process or writes, but the
+    file is read twice (`BinaryTargetResolver` opens it rejecting symlinks; the snapshot read in
+    `application/RegularFileRead.ts:97` follows symlinks by default; Nexus always passes a regular
+    staged copy); `sqlite_database` (`inspect_sqlite_database`): a snapshot in REA's private
+    runtime root read by REA's own `node:sqlite` worker, views and virtual tables never executed;
+    REA also reads `<file>-wal` and `<file>-journal` next to the database
+    (`src/sqlite/SqliteDatabaseSnapshot.ts:189-263`), which Nexus does not stage, so a WAL-mode
+    database is analysed without its WAL; requires Node `^24.15.0 || >=26.0.0`
+    (`src/application/sqlite/SqliteDatabaseCapability.ts:25`; the pinned Node 24.21.0 qualifies);
+    `wasm_artifact` (`inspect_wasm_artifact`): a snapshot `module.wasm` checked by WABT's
+    `wasm-validate`, `wasm-objdump` and `wasm2wat` from `REA_WABT_BIN_DIRECTORY` (unset:
+    `missing_prerequisite`; `glue_paths`/`candidate_paths` are never sent). Reviewed at the pin
+    and `mock_tested` against the real input schemas; **not run live** (running REA was not
+    permitted in the 2026-10-17 cloud session), so results carry a warning saying so.
+  - Not enabled although file-scoped (`review_pending`): pwntools layout and recorded-crash
+    bridges, objdump, plist, keyed archives, EVM, firmware regions (binwalk/unblob), pcap/packet
+    captures (tshark), signal recordings (sigrok), Android/JADX (5), apktool, Flutter (2), HAR
+    captures, source-map tracing. Each needs its own implementation review before it is added.
+  - Never, in any profile: session reads (Nexus does not manage REA's `open_binary` sessions),
+    mutate, lifecycle, execute and dynamic tools; they take paths, session ids, devices or
+    commands that Nexus cannot confine, and REA is adapter-only.
+- **Allowlist (live-verified):** two tools, reviewed at the pin as in-process static parsers of one
   regular file that never execute it:
   - `analyze_javascript_application` → operation `js.application`, MCP tool
     `nexus_analyze_javascript_app`. An ASAR archive is parsed as inert text in REA's own Node
@@ -269,8 +314,8 @@ oldest: awesome-llm-reverse-engineering 2025-07-28). The eleventh, REA, was adde
     `analysis_timeout_ms` (the provider timeout minus 10 s, at most 300 s).
   - `inspect_electron_fuses` → operation `electron.fuses`, MCP tool `nexus_get_electron_fuses`;
     a byte-level read of the executable's fuse wire.
-  Every other tool, current or future, is `blocked` (the adapter's unlisted-tool class), and
-  `tool_overrides` cannot reopen one.
+  Every future tool is `blocked` (the adapter's unlisted-tool class), and `tool_overrides`
+  cannot reopen one.
 - **Adapter-only:** REA has no raw passthrough. `nexus_call_provider_tool` is refused for it
   and its tools are not exposed in namespaced mode, so REA only ever receives the
   hash-verified staged copy that Nexus passes, never a caller-chosen path.

@@ -13,6 +13,7 @@ import anyio
 import jsonschema
 
 from . import __version__
+from .access import exposure_map, profile_summary
 from .errors import ArgumentError, CapabilityUnavailable, NexusError, NotFound, describe_exception
 from .orchestrator import Orchestrator
 from .registry import ProviderManager
@@ -303,6 +304,20 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": "Electron fuse states (RunAsNode, inspector arguments, ASAR integrity, ...) read from an executable's bytes, with their runtime implications. Never runs the executable.",
         "schema": _obj({"target": _SHA, "case_id": _CASE, "provider_id": _PROVIDER}, ["target"]),
     },
+    "nexus_inspect_artifact": {
+        "read": False,
+        "description": "One named static analysis of an admitted target's bytes: go_binary, rust_binary, pe_resources, managed_artifact, managed_members, managed_native_boundaries, sqlite_database or wasm_artifact. The provider receives only Nexus's staged copy; options never take paths. Which analyses are available depends on the access profile and provider prerequisites (see nexus_list_capabilities). Records evidence.",
+        "schema": _obj(
+            {
+                "target": _SHA,
+                "case_id": _CASE,
+                "analysis": {"type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}$"},
+                "options": {"type": "object", "maxProperties": 16},
+                "provider_id": _PROVIDER,
+            },
+            ["target", "analysis"],
+        ),
+    },
     "nexus_dynamic_analysis_status": {
         "read": True,
         "description": "Whether an authorised dynamic-analysis environment is configured and reachable. Does not instrument anything.",
@@ -529,20 +544,14 @@ class NexusServer:
         if self.manager.config.tool_mode == "namespaced":
             if self._background_start:
                 await self.manager.wait_until_started()
-            for provider in self.manager.providers.values():
-                adapter = getattr(provider, "adapter", None)
-                if not provider.config.expose_tools or (adapter is not None and adapter.adapter_only):
-                    continue
-                for info in await provider.list_tools():
-                    if not info.callable:
-                        continue
-                    tools.append(
-                        self._Tool(
-                            name=info.public_name,
-                            description=f"[{info.provider_id}] {info.description}"[:1200],
-                            input_schema=info.input_schema,
-                        )
+            for name, (_provider, info) in exposure_map(self.manager).items():
+                tools.append(
+                    self._Tool(
+                        name=name,
+                        description=f"[{info.provider_id}] {info.description}"[:1200],
+                        input_schema=info.input_schema,
                     )
+                )
         return self._List(tools=tools)
 
     async def call_tool(self, ctx: Any, params: Any) -> Any:
@@ -572,13 +581,12 @@ class NexusServer:
                 )
             return await handler(arguments)
         if self.manager.config.tool_mode == "namespaced" and "__" in name:
-            provider_id, _, tool_name = name.partition("__")
-            provider = self.manager.providers.get(provider_id)
-            info = provider.tool_info(tool_name) if provider else None
-            if info is None and provider is not None:
-                info = next((t for t in provider._tools.values() if t.public_name == name), None)
-            if info is not None:
-                result = await self.manager.call_provider_tool(provider_id, info.name, arguments)
+            # Only names tools/list advertised resolve; a hidden (expose_tools: false), adapter-only
+            # or blocked tool is not reachable by guessing its namespaced name.
+            exposed = exposure_map(self.manager).get(name)
+            if exposed is not None:
+                provider, info = exposed
+                result = await self.manager.call_provider_tool(provider.id, info.name, arguments)
                 return self._provider_payload(result)
         raise NotFound(f"Unknown tool: {name}. Use nexus_list_tools to discover provider tools.")
 
@@ -645,12 +653,8 @@ class NexusServer:
             "config_path": cfg.config_path,
             "tool_mode": cfg.tool_mode,
             "read_only": cfg.policy.read_only,
-            "policy": {
-                "read_only": cfg.policy.read_only,
-                "code_execution": cfg.policy.allow_code_execution,
-                "dynamic_analysis": cfg.policy.dynamic.enabled,
-                "remote_ai": cfg.policy.allow_remote_ai,
-            },
+            "access_profile": cfg.policy.access_profile,
+            "policy": profile_summary(cfg),
             "workspace": {
                 "allowed_roots": [str(r) for r in self.manager.guard.roots],
                 "target_intake_enabled": self.manager.guard.enabled,
@@ -835,6 +839,11 @@ class NexusServer:
 
     async def _t_get_electron_fuses(self, args: dict[str, Any]) -> Any:
         return await self._operation("electron.fuses", args)
+
+    async def _t_inspect_artifact(self, args: dict[str, Any]) -> Any:
+        return await self._operation(
+            "artifact.inspect", args, {"analysis": args["analysis"], "options": args.get("options") or {}}
+        )
 
     async def _t_dynamic_analysis_status(self, args: dict[str, Any]) -> Any:
         cfg = self.manager.config

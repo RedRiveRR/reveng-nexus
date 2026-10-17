@@ -93,6 +93,16 @@ class McpAdapter:
     # must then declare the same kind, so gating can never be skipped by omitting it.
     provider_kind: str | None = None
 
+    # -- tool gating -------------------------------------------------------------
+    def tool_gate(self, provider: McpProvider, tool: str) -> tuple[str, str] | None:
+        """Why this adapter withholds ``tool`` beyond its policy class, as (access state, reason).
+
+        States are ``access.TOOL_STATES`` (catalogue_mismatch, blocked_by_profile,
+        blocked_by_policy, missing_prerequisite). None: nothing beyond policy. The gate applies to
+        listings, capability status and every call, the adapter's own (internal) calls included.
+        """
+        return None
+
     # -- capability checks ---------------------------------------------------
     def capabilities(self, provider: McpProvider) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
@@ -118,12 +128,22 @@ class McpAdapter:
                     ),
                     "tools": list(required),
                 }
-            if not info.decision.allowed and info.classification.tool_class != "lifecycle":
+            decision = info.decision
+            if not decision.allowed and decision.denied_by == "profile":
+                # The catalogue decision is the caller-facing one. A profile that withholds a raw
+                # read from callers (restricted) still lets the adapter use it inside its operations.
+                decision = provider.runtime.policy.decide(
+                    provider.config, tool, info.classification, internal=True, input_schema=info.input_schema
+                )
+            if not decision.allowed and info.classification.tool_class != "lifecycle":
                 return {
                     "available": False,
-                    "reason": f"{tool!r} blocked: {info.decision.reason}",
+                    "reason": f"{tool!r} blocked: {decision.reason}",
                     "tools": list(required),
                 }
+            gate = self.tool_gate(provider, tool)
+            if gate is not None:
+                return {"available": False, "reason": f"{tool!r}: {gate[1]}", "state": gate[0], "tools": list(required)}
         return {"available": True, "tools": list(required)}
 
     def require(self, provider: McpProvider, operation: str) -> None:

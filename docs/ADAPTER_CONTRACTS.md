@@ -138,9 +138,14 @@ approximation, which is why it is never parsed.
 Unlike the sections above, this contract was observed on the **real** server on 2026-10-15
 (pinned install, generated fixtures) and then reproduced in the mock
 (`tests/mock_servers/mock_rea.py`): `serverInfo` `rea`/`6.5.0`, all 207 tool names in catalogue
-order (`src/contracts/toolContracts.ts:39-76`). Only the two allowlisted tools carry their real
-argument names in the mock; the others have an empty schema, because Nexus blocks them before
-any call.
+order (`src/contracts/toolContracts.ts:39-76`). The two live-verified tools carry their real
+argument names in the mock; since 2026-10-17 the eight `artifact.inspect` tools carry their real
+input schemas too (exported from the pinned npm contracts with `z.toJSONSchema`, descriptions
+removed), and the mock validates each request against them as REA's zod schemas would. The
+others have an empty schema, because Nexus never calls them. Annotations: the six tools whose
+effect audit declares no effects carry `readOnlyHint: true` at the pin (as in the mock since
+2026-10-17); Nexus ignores REA annotations
+(`test_upstream_read_only_hints_never_classify_or_enable_rea_tools`).
 
 Envelope (`src/server/toolResult.ts:152-170`): one text block of compact JSON **and**
 `structuredContent` with the same REA Evidence record (`evidence_id`, `subject.digest.sha256`,
@@ -152,6 +157,17 @@ Envelope (`src/server/toolResult.ts:152-170`): one text block of compact JSON **
 |---|---|---|
 | `analyze_javascript_application` (`js.application`) | `input_path` = staged copy, `format` (`asar` for `.asar`, else `auto`), `integrity_policy: record-and-continue`, `detail: summary`, `analysis_timeout_ms` = min(provider timeout − 10 s, 300 s) | `normalized_result.summary` (`format`, `statistics`, `electron`, `coverage`), `unknowns`, `limitations`, `parent_evidence_id`/`parent_operation`, record `confidence` |
 | `inspect_electron_fuses` (`electron.fuses`) | `path` = staged copy | `normalized_result.slices[].sentinels[].fuses[]` (`index`, `name`, `state`, with slice and wire version), `runtime_implications`, `limitations`, `artifact.format` |
+| `inspect_go_binary`, `inspect_rust_binary`, `inspect_managed_native_boundaries` (`artifact.inspect`) | `path` = staged copy | the whole `normalized_result` (kept as `result`), record `limitations`, `confidence`, `evidence_id`, `operation` |
+| `inspect_pe_resources` (`artifact.inspect`) | `path` + optional `max_entries` (1-65536), `max_file_bytes` (64-512 MiB) | same |
+| `inspect_managed_artifact` / `inspect_managed_members` (`artifact.inspect`) | `path` + optional `detail`; members also `type_names` (1-256 names). `path` is always sent, so REA never falls back to its "previously selected managed target" | same |
+| `inspect_sqlite_database` (`artifact.inspect`) | `path` + optional `table`, `columns`, `schema_scope`, `row_limit` (Nexus caps it at 1000; upstream allows 2^53-1) | same |
+| `inspect_wasm_artifact` (`artifact.inspect`) | `path` + optional `detail`; never `glue_paths` or `candidate_paths` (caller paths) | same; needs `REA_WABT_BIN_DIRECTORY` in the provider env, else `missing_prerequisite` |
+
+Options for `artifact.inspect` are validated against the adapter's own schema (no additional
+properties, no paths) before any call (`test_inspect_artifact_refuses_paths_and_unknown_analyses`),
+and their names are checked against the pinned upstream schemas
+(`test_enabled_analyses_match_the_pinned_input_schemas`). The full 207-tool classification and its
+sources are in `src/reveng_nexus/adapters/rea_catalogue.py` and [PROVIDER_MATRIX.md](PROVIDER_MATRIX.md#rea-rea-static-javascriptelectron-only).
 
 Adapter behaviour: a body that is not an Evidence record with an object `normalized_result`
 is an error; `subject.digest.sha256` must equal the target's SHA-256, otherwise the call fails
@@ -164,7 +180,7 @@ the raw output keeps the original. Target-derived strings that only look like pa
 other drives, UNC names) are kept verbatim
 (`test_path_scrub_replaces_only_the_local_paths_nexus_passed`).
 
-Drift: once connected, both operations are reported unavailable (and `require()` refuses them, so
+Drift: once connected, every operation (and every tool's access state: `catalogue_mismatch`) is reported unavailable (and `require()` refuses them, so
 nothing is sent) unless the catalogue has exactly 207 tools whose sorted names hash to the pinned
 value and `serverInfo.version` is `6.5.0` (`test_upstream_drift_disables_both_operations`). A
 wrongly typed Evidence field is a bounded provider error. What the two tools do at the pin:

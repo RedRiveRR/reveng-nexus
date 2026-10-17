@@ -84,16 +84,22 @@ never used in place of another.
 | Metric | Definition | Source |
 |---|---|---|
 | Upstream tools discovered | tools the provider's MCP server returned from `tools/list` | gateway catalogue |
-| Allowed by policy | discovered tools whose catalogue decision is *allowed*; includes tools an adapter-only provider uses internally | `PolicyDecision.allowed` |
-| Callable through Nexus | allowed **and** not adapter-only: what a caller can invoke via `nexus_call_provider_tool` (every call is re-decided with its arguments) | `ToolInfo.callable` |
-| Exposed to MCP clients | raw provider tools listed to Claude Code as their own tools; only in `tool_mode: namespaced` with `expose_tools`. In the default `compact` mode it is **0** | `tool_mode`, `expose_tools`, `callable` |
-| Blocked | discovered tools the policy denies (mutate under read-only, execute, dynamic, lifecycle for callers, blocked, unknown) | `PolicyDecision.allowed == false` |
+| Allowed by policy | discovered tools whose effective decision is *allowed* (access profile and adapter gate included); includes tools an adapter-only provider uses internally and tools waiting for a prerequisite | `access.tool_access().policy_allowed` |
+| Available | usable now, directly or through a `nexus_*` operation: states `exposed`, `callable`, `adapter_only` | `access.tool_access().available` |
+| Callable through Nexus | allowed, not adapter-only, not withheld by the adapter: what a caller can invoke via `nexus_call_provider_tool` (every call is re-decided with its arguments) | `access.tool_access().callable` |
+| Exposed to MCP clients | raw provider tools listed to Claude Code as their own tools: exactly the names `tools/list` returns (`access.exposure_map`). Only in `tool_mode: namespaced` with `expose_tools`. In the default `compact` mode it is **0** | `access.exposure_map` |
+| Blocked | discovered tools that are not allowed (mutate under read-only, unverified mutate, execute, dynamic, lifecycle for callers, blocked, unknown, profile- or adapter-withheld, drifted) | `policy_allowed == false` |
+| Access states | one per tool: `exposed`, `callable`, `adapter_only`, `missing_prerequisite`, `blocked_by_profile`, `blocked_by_policy`, `catalogue_mismatch`, `unknown` ([SECURITY.md](SECURITY.md#access-profiles)) | `access.tool_access().state`, snapshot `tool_states` |
 | Operations declared / usable | Nexus operations an adapter binds / whose required tools are present and allowed now | `list_capabilities()` |
 | Nexus tools exposed | the gateway's own `nexus_*` tools (always listed) | `server.TOOL_SPECS` |
 
 The same counts are in `nexus_list_providers` (`tool_count`, `policy_allowed_tool_count`,
-`callable_tool_count`, `adapter_only`) and in `providers check` (`tools_total`,
-`tools_policy_allowed_count`, `tools_callable_count`).
+`available_tool_count`, `callable_tool_count`, `exposed_tool_count`, `adapter_only`, and
+`access.tool_states`) and in `providers check` (`tools_total`, `tools_policy_allowed_count`,
+`tools_callable_count`, `tool_states`). Since 2026-10-17 every one of them, MCP `tools/list` and
+namespaced dispatch come from one module, `access.py`; `tests/test_access_profiles.py` checks
+that they agree in every profile and tool mode and that they match actual invocation. The
+snapshot schema is version 2 (adds `access_profile`, per-tool `access_state`, `tool_states`).
 
 Each datum is labelled with its freshness: **live** (recent heartbeat), **stopped** or
 **stale** (last known state), **historical** (the documented verification record from
@@ -127,7 +133,16 @@ healthy; `tests/test_dashboard.py` checks `verification.py` against the matrix.
 * Fix: `providers check` now prints explicit counts and marks a shortened list as
   `"... (+N more)"`; provider listings carry the three distinct counts.
 
-## REA: 207 discovered, 2 allowed, 0 callable, 2/2 operations
+## REA: 207 discovered, 10 enabled, 0 callable
+
+Since 2026-10-17 all 207 tools are classified at the pin and ten file-scoped reads can be enabled:
+the two below in every profile, plus eight `artifact.inspect` analyses (`nexus_inspect_artifact`)
+under balanced and full_access, which were reviewed at the pin but not run live. Under the default
+(balanced) the dashboard therefore shows 10 allowed, 9 available when `REA_WABT_BIN_DIRECTORY` is
+unset (`wasm_artifact` is `missing_prerequisite`), 0 callable, 3/3 operations; under restricted
+2 allowed and 2/3 operations. The history below describes the state before that change.
+
+### 2026-10-16: 207 discovered, 2 allowed, 0 callable, 2/2 operations
 
 Consistent, and now reported explicitly. REA's catalogue has 207 tools. The adapter
 allowlists exactly two, `analyze_javascript_application` (operation `js.application`, Nexus

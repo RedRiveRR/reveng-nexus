@@ -123,7 +123,9 @@ def inspect_elf(path: Path, blob: bytes) -> dict[str, Any]:
         "endianness": "little" if elf.little_endian else "big",
         "entry_point": elf["e_entry"],
         "image_base": image_base,
-        "image_base_source": "lowest PT_LOAD p_vaddr",
+        # Without PT_LOAD (object files) the base stays 0: addresses are unrelocated, and 0 still
+        # rebases them correctly onto an engine's load address. Only the provenance differs.
+        "image_base_source": "lowest PT_LOAD p_vaddr" if load_vaddrs else "no PT_LOAD segment: unrelocated, base 0",
         "is_pie": e_type == "ET_DYN",
         "stripped": not has_symtab,
         "segments": segments,

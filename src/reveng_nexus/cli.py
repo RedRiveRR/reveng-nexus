@@ -37,6 +37,8 @@ def _config_summary(config: NexusConfig) -> dict[str, Any]:
     return {
         "config": config.config_path,
         "tool_mode": config.tool_mode,
+        "access_profile": config.policy.access_profile,
+        "profile_source": config.policy.profile_source,
         "read_only": config.policy.read_only,
         "dynamic_analysis": config.policy.dynamic.enabled,
         "allowed_roots": list(config.allowed_roots),
@@ -72,8 +74,9 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     enabled = [p.id for p in config.providers if p.enabled]
     print(f"Config valid. Providers defined: {len(config.providers)}; enabled: {enabled or 'none'}")
     print(
-        f"Tool mode: {config.tool_mode}; read-only: {config.policy.read_only}; "
-        f"dynamic analysis: {config.policy.dynamic.enabled}"
+        f"Access profile: {config.policy.access_profile} ({config.policy.profile_source}); "
+        f"tool mode: {config.tool_mode}; read-only: {config.policy.read_only}; "
+        f"code execution: {config.policy.allow_code_execution}; dynamic analysis: {config.policy.dynamic.enabled}"
     )
     print(f"Workspace roots: {list(config.allowed_roots) or 'none (target intake disabled)'}")
     print(f"Data directory: {config.data_dir}")
@@ -211,21 +214,27 @@ def cmd_providers_check(args: argparse.Namespace) -> int:
     for pid in ["builtin", *[s for s in selected if s != "builtin"]]:
 
         async def run(manager, pid=pid):
+            from .access import count_states, provider_access, provider_tool_access
+
             provider = manager.providers.get(pid)
             health = (await manager.health()).get(pid, {})
-            tools = await provider.list_tools() if provider is not None and provider.started else []
-            caps = provider.list_capabilities() if provider is not None and provider.started else {}
+            started = provider is not None and provider.started
+            access = provider_tool_access(manager, provider) if started else {}
+            caps = provider.list_capabilities() if started else {}
             return {
                 "health": health,
                 "error": manager.provider_errors.get(pid),
                 "skipped": manager.skipped.get(pid),
-                "tools_total": len(tools),
+                "access_profile": manager.config.policy.access_profile,
+                "provider_state": provider_access(manager, pid)["state"],
+                "tools_total": len(access),
                 # Explicit counts: the name list below is shortened without --verbose, so its
                 # length is not a count (a 40-name list plus a marker once read as "41 callable").
-                "tools_policy_allowed_count": sum(1 for t in tools if t.decision.allowed),
-                "tools_callable_count": sum(1 for t in tools if t.callable),
-                "tools_callable": sorted(t.name for t in tools if t.callable),
-                "tools_blocked": {t.name: t.decision.reason for t in tools if not t.decision.allowed},
+                "tools_policy_allowed_count": sum(1 for a in access.values() if a.policy_allowed),
+                "tools_callable_count": sum(1 for a in access.values() if a.callable),
+                "tool_states": count_states(access.values()),
+                "tools_callable": sorted(n for n, a in access.items() if a.callable),
+                "tools_blocked": {n: f"{a.state}: {a.reason}" for n, a in access.items() if not a.available},
                 "capabilities": caps,
             }
 

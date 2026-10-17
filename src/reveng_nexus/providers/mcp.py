@@ -25,6 +25,7 @@ from ..config import expand_env
 from ..errors import ConfigError, PolicyViolation, ProviderCallError, ProviderUnavailable
 from ..netguard import format_host, is_loopback_host, parse_http_url
 from ..redaction import redact_text
+from ._stdio_guard import encode_environment
 from .base import AnalysisProvider, OperationResult, ProviderHealth, TargetContext, ToolInfo
 
 _MAX_RESTARTS = 2
@@ -35,6 +36,58 @@ _RESTART_RESET_SECONDS = 600.0
 _MAX_TOOL_PAGES = 100  # pagination guard; the whole listing also shares one deadline
 
 _PASSTHROUGH_ENV = ("JAVA_HOME", "GHIDRA_INSTALL_DIR", "IDADIR", "ANDROID_HOME", "ANDROID_SDK_ROOT")
+
+
+# Started in front of every stdio server on POSIX; see its module docstring.
+STDIO_GUARD = Path(__file__).with_name("_stdio_guard.py")
+
+
+def _stdio_launch(
+    command: list[str], env: dict[str, str], *, posix: bool | None = None
+) -> tuple[list[str], dict[str, str]]:
+    """The argv and environment that launch a stdio server whose environment must be ``env``.
+
+    POSIX: through ``_stdio_guard.py``, which reaps the server's descendants when the server exits
+    (the MCP SDK only kills the process group of a server that fails to exit). The server's own
+    argv follows ``--`` unchanged. ``env`` travels only encoded (``encode_environment``): the guard
+    gets nothing but the transfer variables (plus the SDK's fixed defaults), so a provider variable
+    that happens to use the transfer prefix cannot be mistaken for, or overwritten by, a transfer
+    chunk, and the guard's interpreter, which alters its own environment at start-up, never
+    passes it on. Raises ValueError when the encoded copy (about 4/3 of the environment's size)
+    would not fit the system's argument/environment limit. Windows: unchanged; the SDK's Job
+    Object reaps the tree.
+    """
+    if not (os.name != "nt" if posix is None else posix):
+        return list(command), env
+    argv = [sys.executable, "-I", str(STDIO_GUARD), "--", *command]
+    launch_env = encode_environment(env)
+    needed = _exec_space(argv, launch_env) + _SDK_DEFAULTS_ALLOWANCE
+    limit = _arg_max()
+    if limit is not None and needed > limit:
+        raise ValueError(
+            f"launching it through the stdio guard needs about {needed} bytes of argument/environment "
+            f"space (the environment is passed encoded, about 4/3 of its size), over the system "
+            f"limit of {limit}; reduce the provider's environment"
+        )
+    return argv, launch_env
+
+
+# Room for the environment the SDK merges in (HOME, LOGNAME, PATH, SHELL, TERM, USER).
+_SDK_DEFAULTS_ALLOWANCE = 8 * 1024
+
+
+def _exec_space(argv: list[str], env: dict[str, str]) -> int:
+    """Bytes execve() needs for ``argv`` and ``env``: each string, its NUL and its pointer."""
+    strings = [os.fsencode(a) for a in argv] + [os.fsencode(k) + b"=" + os.fsencode(v) for k, v in env.items()]
+    return sum(len(item) + 1 + 8 for item in strings)
+
+
+def _arg_max() -> int | None:
+    try:
+        limit = os.sysconf("SC_ARG_MAX")
+    except (AttributeError, ValueError, OSError):
+        return None
+    return limit if limit > 0 else None
 
 
 def _resolve_command(command: str) -> list[str]:
@@ -150,10 +203,14 @@ class _ProcessTree:
     mechanism the MCP SDK uses for stdio servers — so terminating or closing the job reaps
     the whole tree, even if Nexus itself dies. On POSIX the child leads its own process
     group, which is signalled as a unit.
+
+    Signalling failures other than "group already gone" are kept in ``errors`` (for the
+    provider log) instead of raising out of cleanup.
     """
 
     def __init__(self) -> None:
         self.job: Any = None
+        self.errors: list[str] = []
 
     @staticmethod
     def popen_kwargs() -> dict[str, Any]:
@@ -202,15 +259,21 @@ class _ProcessTree:
         else:
             self._signal_group(proc, "SIGKILL")
 
-    @staticmethod
-    def _signal_group(proc: asyncio.subprocess.Process, name: str) -> None:
-        if sys.platform != "win32":
-            import signal
+    def _signal_group(self, proc: asyncio.subprocess.Process, name: str) -> None:
+        if sys.platform == "win32":
+            return
+        import signal
 
-            try:
-                os.killpg(os.getpgid(proc.pid), getattr(signal, name))
-            except (ProcessLookupError, PermissionError):
-                pass
+        # popen_kwargs() started the child with start_new_session, so it leads a group whose id is
+        # its PID. Address the group by that id: os.getpgid() fails once the leader has exited and
+        # been reaped (the "launcher exited" path), while POSIX does not reuse a PID that is still
+        # a process-group id, so the group's surviving members are reached either way.
+        try:
+            os.killpg(proc.pid, getattr(signal, name))
+        except ProcessLookupError:
+            pass  # the whole group has already exited
+        except PermissionError as exc:
+            self.errors.append(f"cannot send {name} to process group {proc.pid}: {exc}")
 
     def close(self) -> None:
         if self.job is not None:
@@ -347,13 +410,17 @@ class McpProvider(AnalysisProvider):
 
     def _stdio_connect(self):
         from mcp import Client
-        from mcp.client.stdio import StdioServerParameters, stdio_client
+        from mcp.client.stdio import StdioServerParameters, get_default_environment, stdio_client
 
-        env = self._env()
-        command = self._command()
+        # The SDK merges its default environment under ``env``; the server gets exactly that merge.
+        server_env = get_default_environment() | self._env()
+        try:
+            launch, env = _stdio_launch([*self._command(), *self._expand_args()], server_env)
+        except ValueError as exc:
+            raise ProviderUnavailable(f"{self.id}: {exc}") from exc
         params = StdioServerParameters(
-            command=command[0],
-            args=[*command[1:], *self._expand_args()],
+            command=launch[0],
+            args=launch[1:],
             env=env,
             cwd=self._expanded(self.config.cwd, "cwd"),
         )
@@ -478,6 +545,8 @@ class McpProvider(AnalysisProvider):
                 else:
                     tree.terminate(proc)  # the launcher exited; reap anything it left behind
                 tree.close()
+                for message in tree.errors:
+                    errlog.write(f"=== {provider.id}: {message} ===\n")
                 # Let the drain reach EOF so asyncio can close the pipe transports cleanly.
                 if drain is not None:
                     try:

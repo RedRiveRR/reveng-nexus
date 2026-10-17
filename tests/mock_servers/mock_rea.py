@@ -4,8 +4,9 @@ Reproduces what the pinned REA (npm rea-agents 6.5.0, morluto/rea 3b79af28) show
 on 2026-10-15 through a real ``tools/list`` and two real calls on generated fixtures:
 
 * serverInfo ``rea`` / ``6.5.0``; all 207 tool names in catalogue order (src/contracts/
-  toolContracts.ts:39-76). Only the two allowlisted tools carry their real argument names; the
-  others get an empty object schema (Nexus blocks them before any call).
+  toolContracts.ts:39-76). The ten tools Nexus can enable carry their real input schemas (the
+  eight nexus_inspect_artifact ones as exported from the pinned contracts) and are validated
+  against them like REA's zod schemas; the others get an empty object schema (never called).
 * Success (src/server/toolResult.ts:152-170): one text block of compact JSON **and**
   ``structuredContent`` with the same REA Evidence record (``evidence_id``, ``subject.digest
   .sha256``, ``provider``, ``operation``, ``normalized_result``, ``limitations``, ...), plus
@@ -41,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+import jsonschema
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool, ToolAnnotations
@@ -280,14 +282,119 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         "additionalProperties": False,
     },
 }
-# Upstream annotations derived from its effect flags (toolEffects.ts:714); Nexus never trusts them.
+# Real input schemas of the analyses behind nexus_inspect_artifact, as zod's JSON Schema export of the
+# pinned contracts (rea-agents 6.5.0 dist/contracts, z.toJSONSchema(io=input)); descriptions dropped.
+ANALYSIS_SCHEMAS: dict[str, dict[str, Any]] = {
+    "inspect_go_binary": {
+        "type": "object",
+        "properties": {"path": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+    "inspect_rust_binary": {
+        "type": "object",
+        "properties": {"path": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+    "inspect_pe_resources": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"},
+            "max_file_bytes": {"default": 67108864, "type": "integer", "minimum": 64, "maximum": 536870912},
+            "max_entries": {"default": 16384, "type": "integer", "minimum": 1, "maximum": 65536},
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+    "inspect_managed_artifact": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"},
+            "detail": {"type": "string", "enum": ["complete", "summary"]},
+        },
+        "additionalProperties": False,
+    },
+    "inspect_managed_members": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"},
+            "detail": {"type": "string", "enum": ["complete", "summary"]},
+            "type_names": {
+                "minItems": 1,
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "uniqueItems": True,
+            },
+        },
+        "additionalProperties": False,
+    },
+    "inspect_managed_native_boundaries": {
+        "type": "object",
+        "properties": {"path": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"}},
+        "additionalProperties": False,
+    },
+    "inspect_sqlite_database": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"},
+            "table": {"type": "string"},
+            "columns": {"minItems": 1, "type": "array", "items": {"type": "string"}},
+            "schema_scope": {"type": "string", "enum": ["inventory", "selected_table", "database"]},
+            "row_limit": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+        "dependentRequired": {"row_limit": ["table"], "columns": ["table"]},
+        "if": {"properties": {"schema_scope": {"const": "selected_table"}}, "required": ["schema_scope"]},
+        "then": {"required": ["table"]},
+    },
+    "inspect_wasm_artifact": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"},
+            "glue_paths": {
+                "default": [],
+                "maxItems": 16,
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"},
+            },
+            "candidate_paths": {
+                "default": [],
+                "maxItems": 16,
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "pattern": "^[^\\x00]*$"},
+            },
+            "detail": {"type": "string", "enum": ["complete", "summary"]},
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+}
+SCHEMAS.update(ANALYSIS_SCHEMAS)
+
+# Upstream annotations are derived from each tool's effect audit (toolEffects.ts:714-773) and
+# registered unchanged (server/toolRegistrationOptions.ts:33). At the pin, these six tools declare no
+# effects at all and so carry readOnlyHint: true; every other tool's is false. Only readOnlyHint is
+# reproduced per tool; the other hints are simplified. Nexus never trusts any of them for REA.
+READ_ONLY_HINTED = frozenset(
+    {
+        "evaluate_reconstruction_coverage",
+        "list_unknowns",
+        "verify_unknown_resolution",
+        "get_evidence_bundle",
+        "gdb_session_status",
+        "frida_session_status",
+    }
+)
 _ANN = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
+_ANN_RO = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 TOOLS = [
     Tool(
         name=n,
         description=f"mock {n}",
         input_schema=SCHEMAS.get(n, {"type": "object", "properties": {}}),
-        annotations=_ANN,
+        annotations=_ANN_RO if n in READ_ONLY_HINTED else _ANN,
     )
     for n in NAMES
 ]
@@ -396,6 +503,19 @@ def _javascript(path: str) -> dict:
     return record
 
 
+def _analysis(name: str, args: dict[str, Any]) -> dict:
+    """A fixed Evidence record for one nexus_inspect_artifact analysis (values are not REA's analysis)."""
+    path = args["path"]
+    data = Path(path).read_bytes()
+    normalized = {
+        "artifact": {"path": path, "bytes": len(data)},
+        "mock_tool": name,
+        "options": {k: v for k, v in args.items() if k != "path"},
+        "limitations": [f"mock {name}: fixed values"],
+    }
+    return _evidence(name, path, data, normalized, {"id": f"mock-{name}", "version": "1"})
+
+
 def _ok(record: dict) -> CallToolResult:
     text = json.dumps(record, separators=(",", ":"))
     return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=record, _meta=_META)
@@ -452,6 +572,12 @@ async def on_call_tool(ctx, params) -> CallToolResult:
         return _ok(_fuses(args["path"]))
     if name == "analyze_javascript_application":
         return _ok(_javascript(args["input_path"]))
+    if name in ANALYSIS_SCHEMAS:
+        # REA validates every request with the tool's zod schema before running it.
+        problems = list(jsonschema.Draft202012Validator(ANALYSIS_SCHEMAS[name]).iter_errors(args))
+        if problems:
+            return _err("invalid_request", f"mock: {name} input rejected: {problems[0].message}")
+        return _ok(_analysis(name, args))
     return _err("invalid_request", f"mock: {name} is not simulated")
 
 

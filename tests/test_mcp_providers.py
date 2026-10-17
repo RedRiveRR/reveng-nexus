@@ -476,3 +476,37 @@ async def test_failed_reconnects_count_against_the_restart_budget(config_factory
         assert attempts == 2
     finally:
         await mgr.close()
+
+
+def test_launched_mock_accepts_connections_as_soon_as_it_announces_readiness(tmp_path, elf_sample):
+    """The readiness line must mean "accepting connections": Nexus connects right after reading it
+    (providers/mcp.py _launched_connect), with no retry. A mock that announced readiness before
+    listening made every launched-HTTP test fail with ConnectError on fast Linux hosts."""
+    import socket
+    import subprocess
+    import sys
+
+    from conftest import MOCK_LAUNCHED
+
+    proc = subprocess.Popen(
+        [sys.executable, MOCK_LAUNCHED, str(elf_sample), "--port", "0", "--project-dir", str(tmp_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        ready = None
+        for line in proc.stdout:  # log noise first, like the real server
+            if line.lstrip().startswith("{"):
+                ready = json.loads(line)
+                break
+        assert ready is not None and ready["status"] == "ready", "no readiness line"
+        # Immediately, without sleeping or retrying: a listening socket accepts at once, while an
+        # unbound port is refused (Linux) or retried by the OS past this timeout (Windows).
+        with socket.create_connection((ready["host"], ready["port"]), timeout=0.5):
+            pass
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)

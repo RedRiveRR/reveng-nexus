@@ -151,6 +151,9 @@ async def main() -> None:
         app = delayed
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind((args.host, int(args.port)))
+    # Listen before announcing readiness: Nexus connects as soon as it reads the line below, so a
+    # "ready" socket that is not yet listening is refused (uv.serve would only listen later).
+    sock.listen(128)
     port = sock.getsockname()[1]
     config = uvicorn.Config(app, host=args.host, port=port, log_level="warning", lifespan="on")
     uv = uvicorn.Server(config)

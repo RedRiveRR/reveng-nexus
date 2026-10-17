@@ -76,7 +76,173 @@ already grown from 154 to 160 tests over that session. This session added 5 test
 diagnostics, `config init --create-dirs`, non-loopback HTTP refusal, DNS-rebinding
 rejection, background provider start), giving 165. Every count below was observed.
 
-## Dashboard and tool-count audit (2026-10-16, uncommitted)
+## Access profiles and REA catalogue (2026-10-17, cloud Linux, uncommitted)
+
+Run in a Claude Code cloud container, **not** on the Windows integration machine: Linux, Python
+3.13.16, Node 22.22.0, a venv outside the repository (`pip install -e ".[dev]"`), commands run with
+`PYTHONDONTWRITEBYTECODE=1`, `-p no:cacheprovider` and `--basetemp` outside the repository. No
+Ghidra, IDA, Binary Ninja, JADX, Frida, device or model exists there, and running the real REA
+package was not permitted in that session, so every live test was skipped and the new REA analyses
+are mock-tested only.
+
+New: `tests/test_access_profiles.py` (74 tests: profile precedence and unknown keys, the profile x
+class x classification-source matrix, protection-bypass hard block, agreement of MCP `tools/list`,
+namespaced dispatch, `nexus_list_tools`, provider summaries, `describe()` and snapshots with each
+other and with actual invocation in every profile and tool mode, hidden tools, name collisions,
+provider states, and a real stdio MCP session against `reveng-nexus serve` per profile); REA
+catalogue/profile/`artifact.inspect` tests in `test_rea_mocked.py`; updated expectations in
+`test_dashboard.py`, `test_security.py`, `test_frida_mocked.py`.
+
+| Command | Result |
+|---|---|
+| `pytest -q -rs` on unmodified `9a29445` (baseline, same container) | 520 passed, **9 failed**, 8 skipped |
+| `pytest -q -rs` with the change | **608 passed, 9 failed, 8 skipped**, 5 min 29 s; the 9 failures are exactly the baseline's |
+| `tests/test_access_profiles.py` | 74 passed (includes the stdio MCP sessions) |
+| ruff check, ruff format --check (83 files), mypy (44 files), `node --check app.js`, `--check-config` on the example, `git diff --check` | clean |
+
+The 9 failures were present before and after the access-profile change. On 2026-10-17 they were
+traced as follows (same container):
+
+* 8 launched-HTTP failures: `test_raw_call_is_answered_by_its_own_targets_server[1]`, `[2]`,
+  `test_raw_call_never_falls_back_to_another_targets_session`,
+  `test_per_target_provider_with_no_usable_operations_is_degraded`
+  (`tests/test_audit_regressions.py`), `test_launched_http_provider_per_target`,
+  `test_launched_server_process_tree_is_reaped`,
+  `test_launched_http_handshake_uses_the_launch_startup_timeout` (`tests/test_mcp_providers.py`) and
+  `test_compare_same_family_wrappers` (`tests/test_routing_orchestrator.py`, which needs that
+  provider). Every one logged `failed to connect: ConnectError` (traceback or audit log): the mock
+  printed its readiness line before the pre-bound socket was listening, and Nexus connects as soon
+  as it reads that line. **Fixed in the harness**: `tests/mock_servers/mock_launched.py` now
+  listens before announcing readiness; regression test
+  `test_launched_mock_accepts_connections_as_soon_as_it_announces_readiness` (failed 3/3 before,
+  passed 5/5 after, refused connection before).
+* `test_rea_mocked.py::test_shutdown_reaps_the_whole_process_tree`: **a real POSIX containment
+  defect, not an environment artefact.** A probe replaying the test read `/proc`: 10 s after
+  `ProviderManager.close()` the mock's grandchild was alive (state `S`), reparented to PID 1 and
+  still in the stdio child's process group. The MCP SDK's `_stop_server_process`
+  (`mcp/client/stdio.py:249-268`, mcp 2.3) kills the process tree only when the server fails to
+  exit within 2 s of stdin closing; a server that exits promptly (the mock, REA) leaves its
+  workers running. On Windows the SDK's Job Object reaps them unconditionally, which is why the
+  test passes there. Not fixed at the time: Nexus does not see the stdio child's pid, so a fix
+  needed a design decision. **Fixed later the same day** (POSIX stdio guard, below).
+
+Results after the 2026-10-17 harness, parser and coverage work (same container):
+
+| Command | Result |
+|---|---|
+| `pytest -q -rs` | **631 passed, 1 failed** (`test_shutdown_reaps_the_whole_process_tree`, above), 8 skipped, 640 collected, 6 min 16 s |
+| ruff check, ruff format --check (83 files), mypy (44 files), `node --check app.js`, `--check-config` on the example, `git diff --check` | clean |
+
+Results after the 2026-10-17 process-lifecycle work (same Linux container; macOS and Windows not
+run):
+
+* **POSIX stdio servers** now start through `providers/_stdio_guard.py` (stdlib only, no shell),
+  which runs the server in its own process group and empties that group (SIGTERM, then SIGKILL
+  after 1 s) when the server exits or when the SDK's SIGTERM reaches the guard. Windows launch is
+  unchanged (the SDK's Job Object).
+* **`_ProcessTree._signal_group`** addressed the launched server's group through
+  `os.getpgid(pid)`, which fails once the launcher has exited and been reaped, so the
+  "launcher exited" cleanup left its workers running. It now uses the group id it created
+  (`start_new_session`, so the id is the launcher's pid); a permission error is written to the
+  provider log instead of being swallowed.
+* New `tests/test_process_lifecycle.py` (15 tests including parameters; mock `mock_servers/mock_tree.py`): graceful,
+  SIGTERM-ignoring and hanging servers with a child and a grandchild, repeated close, a 300 KB
+  MCP round trip, argv/cwd/stdio byte preservation (the environment check covered only one
+  variable and missed the `LC_CTYPE` change; see the review follow-up below), exit-status propagation, a missing
+  executable, signal forwarding (guard exits within 2 s) and the unchanged Windows command.
+  Before the fix, 3 of the 6 Nexus-level tests failed (leaked grandchild after the launcher
+  exited; no error reporting; graceful stdio leak); the guard tests could not run without the guard.
+
+| Command | Result |
+|---|---|
+| `test_process_lifecycle.py` + `test_shutdown_reaps_the_whole_process_tree` | 16 passed (was failing) |
+| lifecycle, REA, MCP-provider and audit-regression files, 3 repeats | 107 passed, 4 skipped each time; no test process left behind |
+| `pytest -q -rs` | **647 passed, 0 failed**, 8 skipped (live Ghidra ×2, live REA, NTFS ADS, UNC ×4), 655 collected, 6 min 30 s |
+| ruff check, ruff format --check (86 files), mypy (45 files), `--check-config` on the example, `git diff --check` | clean |
+
+Not covered: real REA (or any real server) behind the guard; macOS; descendants that leave the
+server's process group (`setsid`); Nexus itself being SIGKILLed while a server ignores EOF.
+
+Review follow-up (2026-10-17, same Linux container; macOS and Windows not run). An independent
+review of the guard found, and probes confirmed:
+
+* **Environment not preserved.** The guard's interpreter coerces a C locale (PEP 538) and wrote
+  `LC_CTYPE=C.UTF-8` into the environment the server inherited (`/usr/bin/env` through the guard
+  with `env -i PATH=… HOME=…`). Interpreter flags (`-X utf8=0`, `-E` with `PYTHONCOERCECLOCALE=0`)
+  do not prevent it. Fixed by design: `_stdio_launch` encodes the environment the server must get
+  (the SDK's defaults merged with what Nexus built) into `REVENG_NEXUS_GUARD_ENV_*` variables,
+  byte for byte and chunked under Linux's 128 KiB per-variable limit; the guard decodes it and
+  starts the server with exactly that, so neither coercion nor the markers reach the server.
+* **Forwarded SIGTERM always waited the 1 s grace.** The handler's `Popen.poll()` cannot reap
+  while the main flow holds the wait lock in `Popen.wait()`, so the dead server stayed a zombie
+  group member. Also, in this container PID 1 does not reap orphaned zombies, so killed
+  descendants keep `killpg(pgid, 0)` succeeding. Fixed: the handler only sends SIGTERM and arms
+  a SIGKILL timer; the main flow reaps, then checks the group with `/proc` on Linux (zombies do
+  not count). Signal handlers no longer write output.
+* **Inherited ignored signals** (SIGHUP under `nohup`) were reset for the server. They now stay
+  ignored; an ignored SIGTERM is still acted on by the guard, the SDK's escalation path.
+* The forwarded-signal test could leave the stubborn server running if it failed (only the guard
+  was killed). Guard tests now record the server's process group (`mock_servers/guard_harness.py`
+  runs the real guard `main()`) and kill both groups on every exit path.
+
+New or changed tests (lifecycle file now 28 tests including parameters): exact environment for
+`/usr/bin/env` with a minimal environment (LC_CTYPE absent, `LC_CTYPE=C` kept, `LANG`/`LC_ALL=C`),
+end-to-end environment of a Nexus-managed server (Linux `/proc/self/environ`), SIGKILL only for
+descendants that ignore SIGTERM (otherwise cleanup within 0.6 s of the server's exit), a signal
+during start-up, SIGTERM/SIGINT/SIGHUP with a promptly exiting server (guard exits within 0.6 s,
+nothing written to stderr), inherited ignored SIGHUP/SIGINT, inherited ignored SIGTERM (still
+bounded under 2 s), the stubborn tree (exit 137 within 2 s, both groups empty).
+
+| Command | Result |
+|---|---|
+| new tests against the previous guard (temporary copy, API shimmed) | 11 failed, 17 passed |
+| `test_process_lifecycle.py` + `test_shutdown_reaps_the_whole_process_tree`, 3 repeats | 29 passed each time |
+| lifecycle tests with all 4 CPUs busy | 28 passed |
+| two deliberately failing tests with live trees (temporary file, deleted) | every guard, server, child and grandchild PID gone afterwards |
+| lifecycle, REA, MCP-provider and audit-regression files | 120 passed, 4 skipped |
+| `pytest -q -rs` | **660 passed, 0 failed**, 8 skipped (as above), 668 collected, 6 min 27 s |
+| ruff check, ruff format --check (87 files), mypy (45 files), compileall, `--check-config` on the example, `git diff --check` | clean |
+
+After every run no test process was left (non-zombie check, rechecked for up to 5 s). Still not
+covered: macOS (EPERM/zombie handling is from the SDK's documentation, untested), Windows, real
+REA behind the guard.
+
+Security review follow-up on PR #1 (2026-10-17, same Linux container):
+
+* **Override downgrade of pinned mutating tools.** `PolicyEngine.classify()` protected only
+  `blocked`/`execute`/`dynamic`/`lifecycle` from overrides, so `tool_overrides: {save_database:
+  read}` turned a manifest-pinned `mutate` into a callable read under read-only policy. A pinned
+  `mutate` (manifest, or the adapter's class for unlisted tools) now accepts only `mutate` or
+  `blocked`; a name-only `mutate` guess stays operator-correctable. Before the fix 47 of the new
+  tests failed (every override was accepted in place of the pinned class); the tightening and
+  ordinary-override tests passed before and after.
+* **Guard transfer-prefix collisions.** `_stdio_launch` passed the guard the plain environment
+  plus the transfer chunks, so a provider variable such as `REVENG_NEXUS_GUARD_ENV_x` made the
+  guard refuse to start ("incomplete chunks") and `REVENG_NEXUS_GUARD_ENV_0` was overwritten in
+  the guard's environment. The guard now gets only the chunks (plus the SDK's fixed defaults);
+  the provider's variables, prefixed or not, travel inside the encoded copy. This also drops the
+  duplicate plain copy: the guard's environment is about 4/3 of the server's instead of 7/3. A
+  launch whose encoded copy would exceed `SC_ARG_MAX` is refused before anything starts, with a
+  message naming both sizes (before: an opaque `OSError: [Errno 7] Argument list too long`).
+  Before the fix 5 of the new or changed tests failed.
+
+| Command | Result |
+|---|---|
+| access-profile, security, config, Frida, adapter, server and dashboard files | 387 passed |
+| environment/launch subset of `test_process_lifecycle.py`, 3 repeats | 8 passed each time |
+| `pytest -q -rs` | **716 passed, 0 failed**, 8 skipped (as above), 724 collected, 6 min 37 s |
+| ruff check, ruff format --check (87 files), mypy (45 files), compileall, `--check-config` on the example, `node --check app.js`, `git diff --check` | clean |
+
+No test process was left after any run (non-zombie check, rechecked for up to 10 s). Not run:
+Windows, macOS, real REA. The dashboard lists the four unconditional classes and explains
+that adapter-pinned `mutate` can only stay `mutate` or become `blocked`; name-based
+`mutate` guesses remain operator-reclassifiable. The per-tool view also shows this restriction.
+
+Skips: live Ghidra x2, live REA x1 (opt-in variables unset), NTFS ADS x1, UNC x4 (Windows
+concepts). The Windows suite and the live Ghidra/REA tests have **not** been re-run for these
+changes.
+
+## Dashboard and tool-count audit (2026-10-16; committed in `82f6955` and `9a29445`)
 
 On the reinstalled integration machine, working tree on top of `2bbef45`, one pytest process
 at a time:
@@ -104,6 +270,10 @@ Results after the review:
 | `tests/integration/test_ghidra_live.py` (live) | **2 passed**, 74 s |
 | `tests/integration/test_rea_live.py` (live) | **1 passed**, 14 s |
 | ruff, format (80 files), mypy (42 files), compileall, both `--check-config`, `node --check`, `git diff --check` | clean |
+
+This measurement predates the final commit: `9a29445` added three more tests to
+`tests/test_dashboard.py`, so that commit collects 537 tests (observed on Linux on 2026-10-17:
+520 passed, 9 failed, 8 skipped; the failures are explained in the 2026-10-17 section).
 
 Two intermediate full runs failed once each and were investigated: (1) the new concurrency
 test caught a transient Windows sharing violation on read (fixed by the reader retry above);
@@ -513,7 +683,7 @@ Defects found and fixed during live verification, each now covered by a test:
 | Frida Mobile MCP against real Frida | no authorised test device (dynamic analysis is disabled by design); only `mock_tested` (since 2026-10-15) against a mock built from the pinned source |
 | LLM4Decompile with real weights | no GPU or served checkpoint; weights deliberately not downloaded |
 | GhidrAssist → Nexus over HTTP | no Ghidra GUI session; only Nexus' HTTP endpoint is tested |
-| Linux/macOS | only Windows was available; POSIX branches (process groups) are unexercised |
+| macOS | never run; POSIX process-group code is exercised on Linux only (cloud container, 2026-10-17) |
 | Symlink refusal | needs Developer Mode/admin on this host (junction/symlink code path is skipped, not failed) |
 | ida-mcp-rs, Binary Ninja and JADX against the real upstream | only `mock_tested` (since 2026-10-14): the mock fixtures follow the pinned upstream source ([ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)), which is a reading of code, not a live run; live use is blocked (no IDA licence, Binary Ninja or Maven) |
 | Mach-O beyond `LC_SYMTAB` | symbols come from `LC_SYMTAB` only (generated fixtures, unit-tested); function sizes are unknown by format; dyld export tries, chained fixups and `LC_DYSYMTAB` indirect symbols are not decoded; no real-world Mach-O was tried |

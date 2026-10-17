@@ -262,3 +262,59 @@ async def test_builtin_flags_undecodable_and_universal_macho_symbols(config_fact
         assert any("decoded per architecture slice" in w for w in funcs.warnings)
     finally:
         await mgr.close()
+
+
+@pytest.mark.parametrize("kind", ["elf", "pe"])
+async def test_builtin_never_reports_an_undecodable_elf_or_pe_as_empty(config_factory, workspace, elf_sample, kind):
+    """A file whose parser failed at intake (pyelftools/pefile raised on hostile bytes) yields no
+    symbols. That is unknown, not "0 functions/imports/exports": the result must say so, as it
+    already does for an undecodable Mach-O."""
+    if kind == "elf":
+        bad = workspace / "nexus_truncated.elf"
+        bad.write_bytes(elf_sample.read_bytes()[:65])  # ELF header cut inside the program headers
+    else:
+        bad = workspace / "nexus_bad.exe"
+        bad.write_bytes(b"MZ" + b"\x00" * 58 + struct.pack("<I", 0x7FFFFFF0))  # e_lfanew far past EOF
+    meta = identify(bad).metadata
+    assert meta["format"] == kind and meta.get("error"), meta  # the parse really failed
+    mgr = ProviderManager(config_factory(workspace))
+    await mgr.start()
+    try:
+        target = mgr.target_context((await mgr.intake(str(bad)))["target"]["sha256"])
+        for operation, key in (
+            ("binary.functions", "functions"),
+            ("binary.imports", "imports"),
+            ("binary.exports", "exports"),
+        ):
+            res = (await mgr.perform(operation, target, {}, provider_id="builtin"))["result"]
+            assert res.normalized[key] == [] and res.normalized["total"] == 0
+            assert any("could not be decoded" in w and "unknown, not empty" in w for w in res.warnings), (
+                operation,
+                res.warnings,
+            )
+        meta_res = (await mgr.perform("binary.metadata", target, {}, provider_id="builtin"))["result"]
+        assert any("could not be decoded" in w for w in meta_res.warnings), meta_res.warnings
+    finally:
+        await mgr.close()
+
+
+@pytest.mark.parametrize("damage", ["cmdsize_below_8", "cut_inside_load_commands"])
+def test_macho_incomplete_load_commands_are_not_reported_as_no_symbol_table(tmp_path, damage):
+    """When the load-command walk stops early, an LC_SYMTAB after the damage was never seen: the
+    result must not claim the file has no symbol table ("absent"), only that it is unknown."""
+    blob = bytearray(build_thin_with_symbols())
+    assert inspect_file_bytes(tmp_path, bytes(blob))["symbol_table"] == "decoded"  # LC_SYMTAB present
+    if damage == "cmdsize_below_8":
+        struct.pack_into("<I", blob, 32 + 4, 4)  # first load command: cmdsize 4, too short to advance
+    else:
+        blob = blob[: 32 + 0x50]  # cut through the first segment command
+    meta = inspect_file_bytes(tmp_path, bytes(blob))
+    assert meta["symbol_table"] == "incomplete" and meta["functions"] == []
+    assert not any("No LC_SYMTAB" in n for n in meta["notes"])
+    assert any("could not all be decoded" in n and "unknown, not empty" in n for n in meta["notes"])
+
+
+def inspect_file_bytes(tmp_path, data: bytes):
+    path = tmp_path / "probe.macho"
+    path.write_bytes(data)
+    return inspect_file(path)

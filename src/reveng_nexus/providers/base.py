@@ -37,6 +37,8 @@ OPERATIONS: dict[str, str] = {
     "dynamic.status": "dynamic-analysis environment status (read-only)",
     "js.application": "static JavaScript/Electron application analysis of an ASAR archive (parsed as inert text)",
     "electron.fuses": "Electron fuse configuration read from an executable's bytes",
+    "artifact.inspect": "one named static analysis of an artifact's bytes (Go/Rust metadata, PE resources, .NET, "
+    "SQLite, WASM); the target is never run",
     "ai.decompile": "model-generated source reconstruction (always unverified)",
 }
 
@@ -240,6 +242,7 @@ class AnalysisProvider(ABC):
             )
         # Re-decide with the actual arguments (dynamic tools check device/target allowlists).
         adapter = getattr(self, "adapter", None)
+        gate = adapter.tool_gate(self, name) if adapter is not None else None
         if not internal and adapter is not None and adapter.adapter_only:
             from ..policy import PolicyDecision
 
@@ -248,6 +251,17 @@ class AnalysisProvider(ABC):
                 info.classification.tool_class,
                 info.classification.source,
                 f"{adapter.name} is reachable only through nexus_* operations (adapter-only provider)",
+                "policy",
+            )
+        elif gate is not None:
+            from ..policy import PolicyDecision
+
+            decision = PolicyDecision(
+                False,
+                info.classification.tool_class,
+                info.classification.source,
+                gate[1],
+                "profile" if gate[0] == "blocked_by_profile" else "policy",
             )
         else:
             decision = self.runtime.policy.decide(
@@ -317,7 +331,11 @@ class AnalysisProvider(ABC):
 
     # -- reporting ------------------------------------------------------------
     def describe(self) -> dict[str, Any]:
+        from ..access import public_names, tool_access
+
         cfg = self.config
+        names = public_names([self], self.runtime.config.tool_mode)
+        access = [tool_access(self, info, names) for info in self._tools.values()]
         return {
             "id": cfg.id,
             "name": cfg.name,
@@ -335,9 +353,10 @@ class AnalysisProvider(ABC):
             # Three different counts (docs/DASHBOARD.md "Metric definitions"): tools the upstream
             # listed, tools the policy allows at all (adapter-internal use included), and raw tools a
             # caller may invoke directly. An adapter-only provider (REA) has allowed > callable == 0.
+            # Computed by access.py, the same function the snapshot, CLI and tools/list use.
             "tool_count": len(self._tools),
-            "policy_allowed_tool_count": sum(1 for t in self._tools.values() if t.decision.allowed),
-            "callable_tool_count": sum(1 for t in self._tools.values() if t.callable),
+            "policy_allowed_tool_count": sum(1 for a in access if a.policy_allowed),
+            "callable_tool_count": sum(1 for a in access if a.callable),
             "adapter_only": bool(getattr(getattr(self, "adapter", None), "adapter_only", False)),
             "stats": dict(self.stats),
             "last_error": self.last_error,

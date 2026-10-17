@@ -47,6 +47,12 @@ Items are ticked only when the behaviour **and** its tests exist (see `docs/TEST
 
 ## Phase 4: operational hardening
 
+- [x] Access profiles (`restricted` / `balanced` / `full_access`) with precedence rules, unknown-key
+  validation and one access/exposure module shared by MCP `tools/list`, dispatch, listings, CLI and
+  dashboard (2026-10-17, `tests/test_access_profiles.py`)
+- [x] REA: all 207 tools classified at the pin; eight reviewed file analyses behind
+  `nexus_inspect_artifact` (mock-tested; live verification still open)
+
 - [ ] Sandboxed worker per untrusted sample (VM/container); Nexus currently provides **no** sandbox
 - [ ] Authenticated HTTP mode (today: loopback only, unauthenticated)
 - [ ] UI for provider health, evidence graph and analysis runs

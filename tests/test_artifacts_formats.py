@@ -163,3 +163,53 @@ def test_sniff_format():
     assert sniff_format(b"\x7fELF\x02") == "elf"
     assert sniff_format(b"PK\x03\x04") == "zip"
     assert sniff_format(b"hello") == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("raw", "error", "match"),
+    [
+        ("", ArgumentError, "non-empty"),
+        ("   ", ArgumentError, "non-empty"),
+        ("{root}/nexus_fixture.elf\x00.txt", ArgumentError, "NUL byte"),
+        ("{root}/does_not_exist.elf", ArgumentError, "does not resolve"),
+    ],
+)
+def test_guard_refuses_empty_nul_and_missing_paths(workspace, elf_sample, raw, error, match):
+    with pytest.raises(error, match=match):
+        guard(workspace).check(raw.format(root=workspace))
+
+
+async def test_target_context_refuses_a_case_the_target_is_not_in(config_factory, workspace, elf_sample):
+    """Evidence is recorded under the context's case: a target must not be analysed under a case
+    it was never admitted to (results would be filed in the wrong investigation)."""
+    from reveng_nexus.registry import ProviderManager
+
+    mgr = ProviderManager(config_factory(workspace))
+    await mgr.start()
+    try:
+        intake = await mgr.intake(str(elf_sample), case_title="first case")
+        sha = intake["target"]["sha256"]
+        assert mgr.target_context(sha, intake["case_id"]).case_id == intake["case_id"]
+        other = mgr.evidence.create_case("unrelated case")["case_id"]
+        with pytest.raises(ArgumentError, match="not part of case"):
+            mgr.target_context(sha, other)
+    finally:
+        await mgr.close()
+
+
+def test_elf_without_pt_load_does_not_claim_a_pt_load_image_base(tmp_path, elf_sample):
+    """An object file (ET_REL) has no program headers. Its base stays 0, which keeps cross-engine
+    rebasing of unrelocated addresses working, but the provenance must not name a PT_LOAD segment."""
+    import struct
+
+    intact = inspect_file(elf_sample)
+    assert intact["image_base_source"] == "lowest PT_LOAD p_vaddr" and intact["image_base"] > 0
+    blob = bytearray(elf_sample.read_bytes())
+    struct.pack_into("<H", blob, 16, 1)  # e_type = ET_REL
+    struct.pack_into("<H", blob, 56, 0)  # e_phnum = 0: no program headers at all
+    obj = tmp_path / "object.o"
+    obj.write_bytes(bytes(blob))
+    meta = inspect_file(obj)
+    assert meta["segments"] == [] and meta["image_base"] == 0
+    assert "PT_LOAD" not in meta["image_base_source"].replace("no PT_LOAD", "")
+    assert "no PT_LOAD" in meta["image_base_source"]

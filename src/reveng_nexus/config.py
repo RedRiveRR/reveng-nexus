@@ -31,6 +31,59 @@ _MCP_TYPES = {"mcp_stdio", "mcp_http", "mcp_launched_http"}
 PROVIDER_KINDS = {"static", "dynamic", "ai"}
 TOOL_CLASSES = {"read", "lifecycle", "mutate", "execute", "dynamic", "blocked"}
 DEPTHS = {"quick", "standard", "deep"}
+# Access profiles, narrowest first (docs/SECURITY.md "Access profiles"). A profile sets defaults and
+# limits; it never opens code execution, dynamic analysis or remote providers by itself.
+ACCESS_PROFILES = ("restricted", "balanced", "full_access")
+
+# Keys each section understands. An unknown key under ``policy`` is an error (a misspelt
+# ``access_profile`` or ``read_only`` must never be ignored silently); elsewhere it is a warning, so
+# older or hand-extended configs still load.
+_TOP_KEYS = frozenset(
+    {
+        "providers", "server", "workspace", "policy", "analysis", "routing", "audit_log", "evidence_db",
+        # 0.1 flat keys, still accepted
+        "tool_mode", "read_only", "allowed_roots", "max_target_size_mb", "global_blocked_tool_patterns", "data_dir",
+    }
+)  # fmt: skip
+_POLICY_KEYS = frozenset(
+    {
+        "access_profile", "read_only", "allow_code_execution", "code_execution_providers",
+        "allow_lifecycle_passthrough", "allow_remote_ai", "allow_remote_providers", "dynamic_analysis",
+        "global_blocked_tool_patterns",
+    }
+)  # fmt: skip
+_DYNAMIC_KEYS = frozenset({"enabled", "authorized_devices", "authorized_targets", "allowed_tools"})
+_SECTION_KEYS = {
+    "server": frozenset({"tool_mode"}),
+    "workspace": frozenset({"allowed_roots", "data_dir", "follow_symlinks", "max_artifact_size_mb"}),
+    "analysis": frozenset(
+        {
+            "default_depth", "operation_timeout_seconds", "max_concurrent_provider_calls",
+            "max_functions_to_decompile", "cross_engine_comparison", "ai_enhancement", "max_failover",
+            "raw_output_limit_kb",
+        }
+    ),
+    "routing": frozenset({"preferred"}),
+}  # fmt: skip
+_PROVIDER_KEYS = frozenset(
+    {
+        "id", "name", "enabled", "type", "transport", "adapter", "engine", "kind", "command", "args", "url",
+        "allow_remote", "env", "cwd", "capabilities", "expose_tools", "blocked_tool_patterns", "tool_overrides",
+        "trust_annotations", "timeout_seconds", "startup_timeout_seconds", "priority", "max_concurrency",
+        "conflict_group", "protocol_mode", "stage_target", "launch", "model", "settings",
+    }
+)  # fmt: skip
+
+
+def _unknown_keys(raw: dict[str, Any], known: frozenset[str]) -> list[str]:
+    return sorted(str(k) for k in raw if k not in known)
+
+
+def _suggest(key: str, known: frozenset[str]) -> str:
+    import difflib
+
+    close = difflib.get_close_matches(key, sorted(known), n=1)
+    return f" (did you mean {close[0]!r}?)" if close else ""
 
 
 def _err(provider_id: str, message: str) -> ConfigError:
@@ -156,6 +209,9 @@ class ProviderConfig:
         provider_id = str(raw.get("id", "")).strip()
         if not _ID_PATTERN.fullmatch(provider_id):
             raise ConfigError(f"Invalid provider id {provider_id!r}; use 2-48 lowercase letters, digits, '_' or '-'.")
+        if "__" in provider_id:
+            # Namespaced tool names are "<provider>__<tool>"; a "__" inside the id makes them ambiguous.
+            raise ConfigError(f"Invalid provider id {provider_id!r}: '__' is reserved as the namespace separator.")
 
         if "type" in raw:
             ptype = str(raw["type"]).strip().lower()
@@ -370,6 +426,10 @@ class DynamicPolicy:
 
 @dataclass(frozen=True, slots=True)
 class PolicyConfig:
+    # restricted | balanced | full_access. "balanced" with read_only=true is the 0.2 behaviour.
+    access_profile: str = "balanced"
+    # explicit (set in YAML) | inferred (from read_only in an older config) | default
+    profile_source: str = "default"
     read_only: bool = True
     allow_code_execution: bool = False
     code_execution_providers: tuple[str, ...] = ()
@@ -434,6 +494,29 @@ class NexusConfig:
         )
 
 
+def _resolve_profile(raw_profile: Any, explicit_read_only: bool | None) -> tuple[str, str, bool]:
+    """Return (profile, source, effective read_only).
+
+    Precedence: an explicit setting may tighten its profile but never loosen it. ``read_only: false``
+    under restricted/balanced is an error; ``read_only: true`` under full_access keeps writes off.
+    Without a profile, older configs keep their meaning: read-only -> balanced, writable -> full_access.
+    """
+    if raw_profile is None:
+        if explicit_read_only is False:
+            return "full_access", "inferred", False
+        return "balanced", ("inferred" if explicit_read_only is not None else "default"), True
+    if not isinstance(raw_profile, str) or raw_profile.strip().lower() not in ACCESS_PROFILES:
+        raise ConfigError(f"policy.access_profile must be one of {list(ACCESS_PROFILES)}, not {raw_profile!r}.")
+    profile = raw_profile.strip().lower()
+    if explicit_read_only is False and profile != "full_access":
+        raise ConfigError(
+            f"policy.read_only: false loosens access_profile: {profile}; only full_access allows "
+            "mutating tools. Remove read_only or change the profile."
+        )
+    read_only = explicit_read_only if explicit_read_only is not None else profile != "full_access"
+    return profile, "explicit", read_only
+
+
 def _resolve_relative(value: str, base: Path) -> str:
     path = Path(value).expanduser()
     return str(path if path.is_absolute() else (base / path).resolve())
@@ -445,6 +528,13 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> NexusC
         raise ConfigError("Config must be a YAML mapping at its root.")
     base = base_dir or Path.cwd()
     warnings: list[str] = []
+    for key in _unknown_keys(raw, _TOP_KEYS):
+        warnings.append(f"unknown top-level key {key!r} ignored{_suggest(key, _TOP_KEYS)}.")
+    for section, known in _SECTION_KEYS.items():
+        value = raw.get(section)
+        if isinstance(value, dict):
+            for key in _unknown_keys(value, known):
+                warnings.append(f"unknown key {section}.{key} ignored{_suggest(key, known)}.")
 
     providers_raw = raw.get("providers", [])
     if not isinstance(providers_raw, list):
@@ -452,6 +542,9 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> NexusC
     if not all(isinstance(item, dict) for item in providers_raw):
         raise ConfigError("Every item in 'providers' must be a mapping.")
     providers = tuple(ProviderConfig.from_dict(item) for item in providers_raw)
+    for item, provider in zip(providers_raw, providers, strict=True):
+        for key in _unknown_keys(item, _PROVIDER_KEYS):
+            warnings.append(f"provider {provider.id!r}: unknown key {key!r} ignored{_suggest(key, _PROVIDER_KEYS)}.")
     ids = [p.id for p in providers]
     if len(ids) != len(set(ids)):
         raise ConfigError("Provider ids must be unique.")
@@ -487,9 +580,23 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> NexusC
     policy_raw = raw.get("policy", {}) or {}
     if not isinstance(policy_raw, dict):
         raise ConfigError("'policy' must be a mapping.")
-    read_only_value = policy_raw.get("read_only", raw.get("read_only", True))
-    if not isinstance(read_only_value, bool):
+    unknown_policy = _unknown_keys(policy_raw, _POLICY_KEYS)
+    if unknown_policy:
+        raise ConfigError(
+            "unknown policy key(s) "
+            + ", ".join(f"{k!r}{_suggest(k, _POLICY_KEYS)}" for k in unknown_policy)
+            + f"; valid keys: {sorted(_POLICY_KEYS)}."
+        )
+    explicit_read_only = policy_raw.get("read_only", raw.get("read_only"))
+    if explicit_read_only is not None and not isinstance(explicit_read_only, bool):
         raise ConfigError("'read_only' must be true or false.")
+    profile, profile_source, read_only_value = _resolve_profile(policy_raw.get("access_profile"), explicit_read_only)
+    if profile_source == "inferred" and profile == "full_access":
+        warnings.append(
+            "policy.read_only is false without policy.access_profile; treated as access_profile: full_access. "
+            "Mutating tools now also need a pinned manifest or tool_overrides classification "
+            "(annotations or tool names are not enough); set access_profile explicitly to silence this."
+        )
     blocked = _str_list(
         policy_raw.get("global_blocked_tool_patterns", raw.get("global_blocked_tool_patterns", [])),
         "'global_blocked_tool_patterns'",
@@ -498,6 +605,13 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> NexusC
     dynamic_raw = policy_raw.get("dynamic_analysis", {}) or {}
     if not isinstance(dynamic_raw, dict):
         raise ConfigError("'policy.dynamic_analysis' must be a mapping.")
+    unknown_dynamic = _unknown_keys(dynamic_raw, _DYNAMIC_KEYS)
+    if unknown_dynamic:
+        raise ConfigError(
+            "unknown policy.dynamic_analysis key(s) "
+            + ", ".join(f"{k!r}{_suggest(k, _DYNAMIC_KEYS)}" for k in unknown_dynamic)
+            + f"; valid keys: {sorted(_DYNAMIC_KEYS)}."
+        )
     dynamic = DynamicPolicy(
         enabled=_bool(dynamic_raw.get("enabled", False), "policy.dynamic_analysis.enabled"),
         authorized_devices=_str_list(dynamic_raw.get("authorized_devices", []), "authorized_devices"),
@@ -515,6 +629,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> NexusC
             "workspace.allowed_roots. Admit targets with nexus_inspect_target instead."
         )
     policy = PolicyConfig(
+        access_profile=profile,
+        profile_source=profile_source,
         read_only=read_only_value,
         allow_code_execution=_bool(policy_raw.get("allow_code_execution", False), "policy.allow_code_execution"),
         code_execution_providers=_str_list(policy_raw.get("code_execution_providers", []), "code_execution_providers"),
@@ -526,6 +642,23 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> NexusC
     )
     if policy.allow_code_execution and not policy.code_execution_providers:
         raise ConfigError("policy.allow_code_execution requires an explicit code_execution_providers list.")
+    if profile == "restricted":
+        # restricted is a promise to the operator; a gate opened next to it is a contradiction, not a tweak
+        opened = [
+            name
+            for name, value in (
+                ("allow_code_execution", policy.allow_code_execution),
+                ("dynamic_analysis.enabled", policy.dynamic.enabled),
+                ("allow_remote_ai", policy.allow_remote_ai),
+                ("allow_remote_providers", policy.allow_remote_providers),
+            )
+            if value
+        ]
+        if opened:
+            raise ConfigError(
+                f"access_profile: restricted cannot be combined with policy.{', policy.'.join(opened)}; "
+                "use balanced or full_access and keep the explicit gate."
+            )
 
     analysis_raw = raw.get("analysis", {}) or {}
     if not isinstance(analysis_raw, dict):
