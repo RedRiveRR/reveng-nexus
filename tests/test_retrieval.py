@@ -243,3 +243,122 @@ def test_target_brief_includes_findings_citing_the_target_and_case_level_finding
     assert [t["target_id"] for t in scoped["targets"]] == [other.sha256]
     with pytest.raises(ArgumentError, match="not part of case"):
         store.case_brief(case_id=store.create_case("Unrelated")["case_id"], target_id=sha)
+
+
+# -- PR #2 remediation: responses stay valid JSON under the output cap -------------------------
+_CAP = 200_000  # server.MAX_RESPONSE_CHARS
+
+
+async def _texts(client, tool: str, args: dict) -> tuple[str, dict]:
+    result = await client.call_tool(tool, args)
+    text = result.content[0].text
+    assert len(text) <= _CAP, (tool, len(text))
+    return text, json.loads(text)  # a cut response would not parse
+
+
+async def test_evidence_pages_are_valid_json_within_the_cap_and_lose_no_record(config_factory, workspace, elf_sample):
+    from reveng_nexus.artifacts import identify as _identify
+
+    mgr = ProviderManager(config_factory(workspace, []))
+    await mgr.start()
+    try:
+        store = mgr.evidence
+        ident = _identify(elf_sample)
+        cid = store.create_case("Big pages")["case_id"]
+        store.upsert_target(ident, cid)
+        sha = ident.sha256
+        expected = [
+            _ev(
+                store,
+                sha,
+                cid,
+                i,
+                normalized={"instructions": [{"address": i * 1000 + j, "op": "mov rax, rbx"} for j in range(120)]},
+            )
+            for i in range(80)
+        ]
+        huge = _ev(store, sha, cid, 999, normalized={"code": "y" * 400_000})  # larger than any page
+        expected.append(huge)
+        app = NexusServer(mgr)
+        async with Client(app.server) as client:
+            # The old budget (compact JSON) let this first page render past the cap.
+            first_text, first = await _texts(
+                client, "nexus_get_evidence", {"case_id": cid, "limit": 500, "include_normalized": True}
+            )
+            assert "response_truncated" not in first and first_text.index('"next_cursor"') < first_text.index(
+                '"evidence"'
+            )
+            seen, args, pages = [], {"case_id": cid, "limit": 500, "include_normalized": True}, 0
+            while True:
+                _text, page = await _texts(client, "nexus_get_evidence", args)
+                assert "response_truncated" not in page  # pages fit by construction, nothing is shortened
+                pages += 1
+                for item in page["evidence"]:
+                    seen.append(item["evidence_id"])
+                    if item["evidence_id"] == huge:
+                        # Returned (not skipped), with its bulky field elided and a way to get it all.
+                        assert item["oversized"]["elided_fields"] == ["normalized"]
+                        assert (
+                            item["normalized"]["elided"] is True
+                            and "nexus_export_report" in item["oversized"]["full_record"]
+                        )
+                if not page["has_more"]:
+                    assert page["next_cursor"] is None
+                    break
+                # The cursor continues right after the last record this response contained.
+                assert page["size_limited"] or len(page["evidence"]) == 500
+                args = {**args, "cursor": page["next_cursor"]}
+            assert pages > 1 and len(seen) == len(set(seen)) and sorted(seen) == sorted(expected)
+            # The oversized record fetched alone is shortened into valid JSON, never cut mid-text.
+            _text, alone = await _texts(client, "nexus_get_evidence", {"evidence_id": huge})
+            assert alone["response_truncated"]["shortened_count"] >= 1
+            assert alone["evidence"]["evidence_id"] == huge
+    finally:
+        await mgr.close()
+
+
+async def test_large_question_listings_page_within_the_cap_and_keep_counts(config_factory, workspace, elf_sample):
+    from reveng_nexus.artifacts import identify as _identify
+
+    mgr = ProviderManager(config_factory(workspace, []))
+    await mgr.start()
+    try:
+        store = mgr.evidence
+        ident = _identify(elf_sample)
+        cid = store.create_case("Many questions")["case_id"]
+        store.upsert_target(ident, cid)
+        sha = ident.sha256
+        cited = [_ev(store, sha, cid, i) for i in range(30)]
+        long_text = "w" * 1500
+        expected = [
+            store.record_question(
+                case_id=cid,
+                target_id=sha,
+                question=f"{i} {long_text}",
+                needed_evidence=long_text,
+                search_boundary=long_text,
+                required=i % 3 == 0,
+                evidence_ids=cited,
+            )["question_id"]
+            for i in range(150)
+        ]
+        app = NexusServer(mgr)
+        async with Client(app.server) as client:
+            seen, offset, limited = [], 0, False
+            while True:
+                text, page = await _texts(
+                    client, "nexus_list_questions", {"case_id": cid, "limit": 200, "offset": offset}
+                )
+                # Counts are complete on every page and come before the (bounded) list.
+                assert page["counts"]["total"] == 150 and page["counts"]["required_unresolved"] == 50
+                assert text.index('"counts"') < text.index('"questions"')
+                limited = limited or page["size_limited"]
+                seen += [q["question_id"] for q in page["questions"]]
+                assert all(len(q["supporting_evidence_ids"]) <= 20 for q in page["questions"])
+                if page["next_offset"] is None:
+                    break
+                assert page["next_offset"] == offset + page["returned"]
+                offset = page["next_offset"]
+            assert limited and seen == expected
+    finally:
+        await mgr.close()

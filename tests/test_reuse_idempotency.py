@@ -968,14 +968,35 @@ async def test_task_group_cancelling_a_mutation_still_blocks_reuse(gateway, elf_
         await _assert_blocked_and_not_reused(client, mgr, sha)
 
 
-async def test_mcp_client_cancellation_of_a_mutation_still_blocks_reuse(gateway, elf_sample, tmp_path):
-    """Protocol level: the client abandons a running nexus_call_provider_tool request; the SDK sends
-    notifications/cancelled and the server cancels the handler's scope ("interrupt" mode)."""
+def _observe_protocol_cancels(monkeypatch):
+    """Record every notifications/cancelled the server-side JSON-RPC dispatcher receives, and
+    whether it named a request still in flight. Uses private names of the pinned MCP SDK (2.3)."""
+    from mcp.shared import jsonrpc_dispatcher as jd
+
+    seen: list[dict[str, object]] = []
+    original = jd.JSONRPCDispatcher._dispatch_notification
+
+    def spy(self, msg, *args, **kwargs):
+        if msg.method == "notifications/cancelled":
+            rid = jd.cancelled_request_id_from_params(msg.params)
+            in_flight = rid is not None and jd.coerce_request_id(rid) in self._in_flight
+            seen.append({"request_id": rid, "in_flight": in_flight})
+        return original(self, msg, *args, **kwargs)
+
+    monkeypatch.setattr(jd.JSONRPCDispatcher, "_dispatch_notification", spy)
+    return seen
+
+
+async def test_mcp_client_cancellation_of_a_mutation_still_blocks_reuse(gateway, elf_sample, tmp_path, monkeypatch):
+    """Protocol level: the client abandons a running nexus_call_provider_tool request over JSON-RPC
+    (legacy mode: in-memory streams, not the SDK's DirectDispatcher, which cancels the handler task
+    directly); the SDK sends notifications/cancelled and the server cancels the handler's scope."""
     import anyio
 
     install = _ghidra_install(tmp_path / "ghidra")
     app, mgr = await gateway([_mutable_engine(install)], policy={"access_profile": "full_access"})
-    async with Client(app.server) as client:
+    protocol_cancels = _observe_protocol_cancels(monkeypatch)
+    async with Client(app.server, mode="legacy") as client:
         sha, _ = await _inspect(client, elf_sample)
         await _cached_decompile(client, sha)
         contacted, cancelled = _parked_engine(mgr.providers["ghidra_a"])
@@ -1000,6 +1021,8 @@ async def test_mcp_client_cancellation_of_a_mutation_still_blocks_reuse(gateway,
             await cancelled.wait()  # the server handler was cancelled by the protocol message
             await block_written.wait()
         assert outcome == {"client_cancelled": True}
+        # The handler was cancelled by a protocol notification for the request it was serving.
+        assert len(protocol_cancels) == 1 and protocol_cancels[0]["in_flight"] is True, protocol_cancels
         await _assert_blocked_and_not_reused(client, mgr, sha)
 
 

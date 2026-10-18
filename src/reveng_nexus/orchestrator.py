@@ -13,7 +13,7 @@ from typing import Any
 
 import anyio
 
-from .compare import Observation, compare_observations
+from .compare import _DECOMPILE_ASPECTS, _DISASM_ASPECTS, _IDENTITY_ASPECTS, Observation, compare_observations
 from .errors import ArgumentError, CapabilityUnavailable, NexusError, describe_exception
 from .providers import TargetContext
 from .registry import ProviderManager
@@ -62,6 +62,47 @@ def translate_address(address: int, from_base: int | None, to_base: int | None) 
     if from_base is None or to_base is None or from_base == to_base:
         return address
     return address - from_base + to_base
+
+
+def _pair_disagrees(disagreement: dict[str, Any], left: str, right: str) -> bool:
+    """Whether a high-severity disagreement is between these two observations (provider ids)."""
+    if disagreement.get("severity") != "high":
+        return False
+    if disagreement.get("providers"):
+        return {left, right} <= set(disagreement["providers"])
+    values = disagreement.get("values") or {}
+    if set(values) == {left, right}:
+        return True  # a pairwise finding about exactly these two observations
+    # A finding over all observations (e.g. function_start): these two must report different values.
+    return left in values and right in values and values[left] != values[right]
+
+
+def _comparison_links(
+    observations: list[Observation], disagreements: list[dict[str, Any]]
+) -> list[tuple[str, str, str]]:
+    """The evidence links a comparison records: only pairs that were compared with each other.
+
+    Decompiled code is compared with decompiled code and instruction listings with instruction
+    listings, so only records of one operation are linked. A pair is 'contradicts' when a
+    high-severity disagreement in that operation's aspects, or in the function's identity
+    (start address), is between exactly these two records; otherwise 'agrees_with' when they come
+    from different engine families (independent agreement), and 'same_subject' when one engine
+    family produced both (consistency, not confirmation). AI output is never linked.
+    """
+    links: list[tuple[str, str, str]] = []
+    for attr, aspects in (("code", _DECOMPILE_ASPECTS), ("instructions", _DISASM_ASPECTS)):
+        members = [o for o in observations if o.evidence_id and o.evidence_kind != "ai_generated" and getattr(o, attr)]
+        relevant = [d for d in disagreements if d.get("aspect") in aspects | _IDENTITY_ASPECTS]
+        for i, left in enumerate(members):
+            for right in members[i + 1 :]:
+                if any(_pair_disagrees(d, left.provider_id, right.provider_id) for d in relevant):
+                    relation = "contradicts"
+                elif left.engine_family != right.engine_family:
+                    relation = "agrees_with"
+                else:
+                    relation = "same_subject"
+                links.append((str(left.evidence_id), str(right.evidence_id), relation))
+    return links
 
 
 def _short(result: dict[str, Any]) -> dict[str, Any]:
@@ -413,19 +454,13 @@ class Orchestrator:
                 evidence_ids=evidence_ids,
             )
         )
-        relation = (
-            "contradicts"
-            if assessment["assessment"] == "disagreement"
-            else ("agrees_with" if assessment["assessment"].startswith("independent") else "same_subject")
-        )
-        engine_evidence = [o.evidence_id for o in observations if o.evidence_id and o.evidence_kind != "ai_generated"]
+        pairs = _comparison_links(observations, assessment["disagreements"])
 
-        def link_all() -> None:
-            for i, left in enumerate(engine_evidence):
-                for right in engine_evidence[i + 1 :]:
-                    mgr.evidence.link(left, right, relation, note=stored["comparison_id"])
+        def link_compared() -> None:
+            for left, right, relation in pairs:
+                mgr.evidence.link(left, right, relation, note=stored["comparison_id"])
 
-        await anyio.to_thread.run_sync(link_all)
+        await anyio.to_thread.run_sync(link_compared)
         return {
             "comparison_id": stored["comparison_id"],
             "subject": subject,

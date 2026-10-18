@@ -231,3 +231,59 @@ async def test_all_failed_decompiles_are_reported_as_missing(make_manager, elf_s
         and missing[0]["capability"] == "binary.decompile"
         and "all 2 decompile attempts failed" in missing[0]["detail"]
     )
+
+
+async def test_a_comparison_links_only_records_it_compared_and_reruns_inherit_only_that_scope(make_manager, elf_sample):
+    """The decompilations disagree (different callees); the instruction listings are compared on
+    their own. Links never cross operations, and only a re-run of a decompilation inherits."""
+    import sqlite3
+
+    from reveng_nexus.errors import ArgumentError as _ArgumentError
+
+    mgr = await make_manager(
+        [
+            mock_engine("ghidra_a", engine="ghidra"),
+            mock_engine("ida_b", engine="ida", flavor="b", env={"MOCK_BASE_SHIFT": "0x1000"}),
+        ]
+    )
+    target = await target_of(mgr, elf_sample)
+    out = await Orchestrator(mgr).compare_function(target, name="main")
+    assert out["by_group"]["decompilation"]["assessment"] == "disagreement"
+    store = mgr.evidence
+    records = {eid: store.get_evidence_record(eid) for eid in out["evidence_ids"]}
+    with sqlite3.connect(store.database_path) as connection:
+        links = connection.execute(
+            "SELECT src_id, dst_id, relation FROM evidence_links WHERE note = ?", (out["comparison_id"],)
+        ).fetchall()
+    assert links, "the comparison recorded its pairs"
+    for src, dst, relation in links:
+        assert records[src]["operation"] == records[dst]["operation"], (src, dst, relation)
+        if records[src]["operation"] == "binary.disassemble":
+            listing_verdict = out["by_group"]["disassembly"]["assessment"]
+            assert relation != "contradicts" or listing_verdict == "disagreement"
+    decompiled = {r["provider_id"]: eid for eid, r in records.items() if r["operation"] == "binary.decompile"}
+    assert (decompiled["ghidra_a"], decompiled["ida_b"], "contradicts") in links or (
+        decompiled["ida_b"],
+        decompiled["ghidra_a"],
+        "contradicts",
+    ) in links
+
+    async def resolves_with(operation: str, params: dict) -> bool:
+        rerun = await mgr.perform(operation, target, params, provider_id="ghidra_a", max_failover=0)
+        q = store.record_question(
+            case_id=target.case_id,
+            target_id=target.sha256,
+            question=operation,
+            evidence_ids=[rerun["evidence"]["evidence_id"]],
+        )
+        try:
+            store.update_question(q["question_id"], expected_revision=1, status="resolved", answer="x")
+            return True
+        except _ArgumentError:
+            return False
+
+    address = records[decompiled["ghidra_a"]]["subject_address"]
+    assert await resolves_with("binary.decompile", {"name": "main"}) is False  # inherits the disagreement
+    # The listings themselves did not disagree, so a listing re-run is not blocked by the decompilations.
+    assert out["by_group"]["disassembly"]["assessment"] != "disagreement", out["by_group"]
+    assert await resolves_with("binary.disassemble", {"address": address}) is True

@@ -55,7 +55,9 @@ QUESTION_INITIAL_STATUSES = {"open", "investigating", "blocked"}
 # reviews (any MCP caller, including the agent that wrote a note, can call it), so a review never
 # turns interpretation into source evidence.
 SOURCE_KINDS = frozenset({"direct_observation", "engine_derived"})
-PAGE_CHAR_BUDGET = 150_000  # serialized characters per evidence page (tool responses are capped at 200,000)
+PAGE_CHAR_BUDGET = 150_000  # rendered characters per evidence page (see render_json; responses are capped below)
+RESPONSE_CHAR_CAP = 200_000  # rendered characters in one tool response (the server's hard limit)
+RESPONSE_MARGIN = 5_000  # headroom kept below the cap for the envelope around a measured list
 BRIEF_HARD_CAP = 100  # critical/high findings a case brief always lists
 QUESTION_LIST_IDS = 20  # evidence ids per role in listings; the full set is in nexus_list_questions(question_id)
 DEFAULT_CASE = "default"
@@ -79,6 +81,18 @@ def _new_id(prefix: str) -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def render_json(value: Any) -> str:
+    """The exact rendering of a tool response (the server writes this); sizes are measured on it."""
+    return json.dumps(value, ensure_ascii=False, indent=1, default=str)
+
+
+def rendered_cost(value: Any, depth: int = 2) -> int:
+    """Characters ``value`` adds to a response as a list item ``depth`` levels deep: its rendering,
+    the extra indentation of each of its lines at that depth, and the separator."""
+    text = render_json(value)
+    return len(text) + (text.count("\n") + 1) * depth + 2
 
 
 def _sql_statements(script: str) -> list[str]:
@@ -305,8 +319,9 @@ MIGRATIONS: dict[int, str] = {
 @dataclass(frozen=True)
 class Idempotency:
     """A client-chosen key for one write. A retry with the same key and the same arguments
-    returns the original result instead of writing again; the same key with different
-    arguments is refused. The key row is written in the same transaction as the record."""
+    writes nothing and returns the record's current state with the original warnings; the same
+    key with different arguments is refused. The key row is written in the same transaction as
+    the record."""
 
     tool: str
     key: str
@@ -999,6 +1014,7 @@ class EvidenceStore:
         cursor: str | None = None,
         view: str = "standard",
         include_normalized: bool = False,
+        budget: int = PAGE_CHAR_BUDGET,
     ) -> dict[str, Any]:
         """Newest-first evidence with a keyset cursor over (created_at, rowid).
 
@@ -1007,8 +1023,10 @@ class EvidenceStore:
         writer with a monotonic clock: a record committed late by a second process with an older
         timestamp can sort behind a cursor already handed out. ``created_at`` is compared as text
         (Nexus writes one ISO-8601 UTC format). A cursor is bound to the filters it was issued for.
-        A page also stops at PAGE_CHAR_BUDGET serialized characters (at least one record), so it
-        fits a tool response; the cursor then continues after the last record returned.
+        A page also stops at ``budget`` rendered characters (render_json, as the response is
+        written; at least one record), so it fits a tool response; the cursor then continues after
+        the last record returned. A record too large for any page is returned alone with its bulky
+        fields elided and an ``oversized`` note, never skipped.
         """
         if view not in {"standard", "summary"}:
             raise ArgumentError("view must be 'standard' or 'summary'")
@@ -1042,8 +1060,11 @@ class EvidenceStore:
                 if not include_normalized:
                     record.pop("normalized", None)
                 item = record
-            cost = len(_json(item))
-            if items and used + cost > PAGE_CHAR_BUDGET:
+            cost = rendered_cost(item)
+            if cost > budget:
+                item = self._elide_oversized(item, budget)
+                cost = rendered_cost(item)
+            if items and used + cost > budget:
                 size_limited = more = True
                 break
             items.append(item)
@@ -1051,6 +1072,30 @@ class EvidenceStore:
         last = rows[len(items) - 1] if items else None
         next_cursor = self._cursor(last["created_at"], last["row_key"], scope) if more and last else None
         return {"items": items, "next_cursor": next_cursor, "has_more": more, "size_limited": size_limited}
+
+    _OVERSIZED_KEEP = frozenset(
+        {"evidence_id", "case_id", "target_id", "provider_id", "tool_name", "operation", "evidence_kind",
+         "status", "created_at", "subject", "subject_type", "subject_address", "subject_name"}
+    )  # fmt: skip
+
+    @classmethod
+    def _elide_oversized(cls, item: dict[str, Any], budget: int) -> dict[str, Any]:
+        """A record too large for any page: keep its identity and provenance, replace its largest
+        fields by size notes until it fits, and say how to get the full record."""
+        out = dict(item)
+        elided: list[str] = []
+        bulky = sorted((k for k in out if k not in cls._OVERSIZED_KEEP), key=lambda k: -len(render_json(out[k])))
+        for key in bulky:
+            if rendered_cost(out) + 600 <= budget:
+                break
+            out[key] = {"elided": True, "chars": len(render_json(out[key]))}
+            elided.append(key)
+        out["oversized"] = {
+            "elided_fields": elided,
+            "full_record": "nexus_export_report(case_id, formats=['json'], include_raw=true) writes it "
+            "to the data directory; nexus_get_evidence(evidence_id) returns it within the response limit",
+        }
+        return out
 
     def list_evidence(
         self,
@@ -1533,7 +1578,11 @@ class EvidenceStore:
             "SELECT l.src_id, l.dst_id, s.evidence_kind AS src_kind, s.status AS src_status, "
             "d.evidence_kind AS dst_kind, d.status AS dst_status FROM evidence_links l "
             "JOIN evidence s ON s.evidence_id = l.src_id JOIN evidence d ON d.evidence_id = l.dst_id "
-            f"WHERE l.relation = 'contradicts' AND (l.src_id IN ({marks}) OR l.dst_id IN ({marks}))",
+            f"WHERE l.relation = 'contradicts' AND (l.src_id IN ({marks}) OR l.dst_id IN ({marks})) "
+            # A comparison compares records of one operation with each other. Older comparisons
+            # linked every compared record pairwise, across operations too; such a link does not
+            # show that the two operations disagreed, so it is not read as a contradiction.
+            "AND NOT (s.operation IS NOT NULL AND d.operation IS NOT NULL AND s.operation <> d.operation)",
             [*support_ids, *support_ids],
         ).fetchall()
         against: dict[str, list[dict[str, Any]]] = {}
@@ -1545,6 +1594,9 @@ class EvidenceStore:
                 against.setdefault(mine, []).append(
                     {"evidence_id": other, "against": mine, "evidence_kind": kind, "status": status}
                 )
+        for sid, inherited in EvidenceStore._inherited_contradictions(connection, support_ids).items():
+            known = {c["evidence_id"] for c in against.get(sid, [])}
+            against.setdefault(sid, []).extend(c for c in inherited if c["evidence_id"] not in known)
         for qid, links in links_by_question.items():
             supports = {
                 link["evidence_id"] for link in links if link["role"] == "supports" and link["status"] != "rejected"
@@ -1552,6 +1604,124 @@ class EvidenceStore:
             # Kept even when the opposing record is itself cited as support: citing both sides of a
             # disagreement must not hide it.
             out[qid] = [c for sid in sorted(supports) for c in against.get(sid, [])]
+        return out
+
+    @staticmethod
+    def _subject_matches(a: Any, b: Any, name_addresses: dict[str, set[int]]) -> bool:
+        """Whether two records of one provider describe the same subject (conservatively).
+
+        Both have an address: the addresses decide (names are not compared). Otherwise the names
+        must be equal and non-empty, and the provider must have reported that name at no more than
+        one address on this target (its own name-to-address mapping); a name it placed at two
+        addresses is ambiguous and never matches. Names are compared exactly, never fuzzily.
+        """
+        if (a["subject_type"] or "") != (b["subject_type"] or ""):
+            return False
+        if a["subject_address"] is not None and b["subject_address"] is not None:
+            return bool(a["subject_address"] == b["subject_address"])
+        name = a["subject_name"] or ""
+        if not name or name != (b["subject_name"] or ""):
+            return False
+        addresses = name_addresses.get(name, set())
+        known = {r["subject_address"] for r in (a, b) if r["subject_address"] is not None}
+        return len(addresses) <= 1 and known <= addresses
+
+    @staticmethod
+    def _inherited_contradictions(
+        connection: sqlite3.Connection, support_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Disagreements recorded against an earlier run of the same result.
+
+        A comparison links the records it compared (one operation, record pairs). A re-run of one
+        side - same case, target, provider and operation, the same subject (see _subject_matches)
+        and the same parameters where both runs recorded them - gets a new evidence id, but the
+        disagreement still applies to it. For each opposing side (provider, operation, subject)
+        only explicit comparison outcomes count, newest first: 'contradicts', or 'agrees_with'
+        from a record with the same engine identity (engine and version) as the support. A
+        'same_subject' link (single source, one engine family, or nothing to compare) is neutral
+        and never clears a disagreement. Links between different operations (from older
+        comparisons that linked every compared record) are ambiguous and are not used.
+        """
+        marks = ",".join("?" * len(support_ids))
+        cols = (
+            "evidence_id, case_id, target_id, provider_id, operation, subject_type, subject_address, "
+            "subject_name, params_hash, engine, engine_version"
+        )
+        supports = connection.execute(
+            f"SELECT {cols} FROM evidence WHERE evidence_id IN ({marks}) AND operation IS NOT NULL "
+            "AND (subject_address IS NOT NULL OR COALESCE(subject_name, '') <> '')",
+            support_ids,
+        ).fetchall()
+        out: dict[str, list[dict[str, Any]]] = {}
+        for s in supports:
+            mapping: dict[str, set[int]] = {}
+            for row in connection.execute(
+                "SELECT DISTINCT subject_name, subject_address FROM evidence WHERE target_id = ? "
+                "AND provider_id = ? AND subject_name IS NOT NULL AND subject_address IS NOT NULL",
+                (s["target_id"], s["provider_id"]),
+            ):
+                mapping.setdefault(row["subject_name"], set()).add(row["subject_address"])
+            runs = [
+                e
+                for e in connection.execute(
+                    f"SELECT {cols} FROM evidence WHERE case_id = ? AND target_id = ? AND provider_id = ? "
+                    "AND operation = ?",
+                    (s["case_id"], s["target_id"], s["provider_id"], s["operation"]),
+                )
+                if EvidenceStore._subject_matches(s, e, mapping)
+                and (e["params_hash"] is None or s["params_hash"] is None or e["params_hash"] == s["params_hash"])
+            ]
+            if not runs:
+                continue
+            by_id = {e["evidence_id"]: e for e in runs}
+            run_marks = ",".join("?" * len(by_id))
+            links = connection.execute(
+                "SELECT l.src_id, l.dst_id, l.relation, l.created_at, l.rowid AS link_row FROM evidence_links l "
+                f"WHERE l.relation IN ('contradicts', 'agrees_with') AND (l.src_id IN ({run_marks}) "
+                f"OR l.dst_id IN ({run_marks}))",
+                [*by_id, *by_id],
+            ).fetchall()
+            other_ids = {link["dst_id"] if link["src_id"] in by_id else link["src_id"] for link in links}
+            others = {
+                o["evidence_id"]: o
+                for o in connection.execute(
+                    f"SELECT {cols}, evidence_kind, status FROM evidence WHERE evidence_id IN "
+                    f"({','.join('?' * len(other_ids))})",
+                    list(other_ids),
+                )
+            } if other_ids else {}  # fmt: skip
+            latest: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+            for link in links:
+                mine_id = link["src_id"] if link["src_id"] in by_id else link["dst_id"]
+                other = others.get(link["dst_id"] if mine_id == link["src_id"] else link["src_id"])
+                mine = by_id[mine_id]
+                if other is None or other["evidence_id"] == s["evidence_id"] or other["operation"] != mine["operation"]:
+                    continue
+                if link["relation"] == "agrees_with" and (mine["engine"], mine["engine_version"]) != (
+                    s["engine"],
+                    s["engine_version"],
+                ):
+                    continue  # an agreement about another engine build says nothing about this output
+                subject = (
+                    f"a:{other['subject_address']}"
+                    if other["subject_address"] is not None
+                    else f"n:{other['subject_name']}"
+                )
+                side = (other["provider_id"], other["operation"], other["subject_type"] or "", subject)
+                stamp = (link["created_at"], link["link_row"])
+                if side not in latest or stamp > latest[side][0]:
+                    latest[side] = (stamp, link["relation"], other, mine_id)
+            for _stamp, relation, other, via in latest.values():
+                if relation == "contradicts":
+                    out.setdefault(s["evidence_id"], []).append(
+                        {
+                            "evidence_id": other["evidence_id"],
+                            "against": s["evidence_id"],
+                            "evidence_kind": other["evidence_kind"],
+                            "status": other["status"],
+                            "via": via,
+                        }
+                    )
         return out
 
     def _question_view(
@@ -1615,6 +1785,18 @@ class EvidenceStore:
             if len(out.get(key) or "") > text_limit:
                 out[key] = out[key][:text_limit] + "…"
                 out.setdefault("truncated_fields", []).append(key)
+        # Id lists inside the resolution basis and stale reasons grow with the evidence; cap them too.
+        if isinstance(out.get("resolution_basis"), dict):
+            basis = dict(out["resolution_basis"])
+            for key, value in list(basis.items()):
+                if isinstance(value, list) and len(value) > QUESTION_LIST_IDS:
+                    basis[key] = value[:QUESTION_LIST_IDS]
+                    basis[f"{key}_count"] = len(value)
+            out["resolution_basis"] = basis
+        reasons = out.get("stale_reasons") or []
+        if reasons and (len(reasons) > 5 or any(len(str(r)) > 300 for r in reasons)):
+            out["stale_reasons"] = [str(r)[:300] + ("…" if len(str(r)) > 300 else "") for r in reasons[:5]]
+            out["stale_reasons_count"] = len(reasons)
         return out
 
     def record_question(
@@ -1932,6 +2114,9 @@ class EvidenceStore:
 
     @staticmethod
     def _question_filters(case_id: str | None, target_id: str | None) -> tuple[list[str], list[Any]]:
+        """Filters for a question scope. A target scope also covers the case-level questions
+        (no target) of the case(s) the target belongs to: they apply to every target of the case,
+        so a target view must neither hide them nor call the work complete while one is open."""
         filters: list[str] = []
         values: list[Any] = []
         if case_id:
@@ -1940,8 +2125,11 @@ class EvidenceStore:
         if target_id:
             if not _TARGET_ID.fullmatch(target_id.lower()):
                 raise ArgumentError("target_id must be a SHA-256 hex digest.")
-            filters.append("target_id = ?")
-            values.append(target_id.lower())
+            filters.append(
+                "(target_id = ? OR (target_id IS NULL AND case_id IN "
+                "(SELECT case_id FROM case_targets WHERE target_id = ?)))"
+            )
+            values += [target_id.lower(), target_id.lower()]
         return filters, values
 
     def question_counts(self, *, case_id: str | None = None, target_id: str | None = None) -> dict[str, Any]:
@@ -1950,11 +2138,48 @@ class EvidenceStore:
         A question whose stored state its evidence no longer supports is counted as ``stale``, and
         a stale or unresolved required question keeps the investigation incomplete.
         """
+        return self._question_totals(self._scoped_views(case_id, target_id))
+
+    def _scoped_views(self, case_id: str | None, target_id: str | None) -> list[dict[str, Any]]:
+        """Every question of a scope as full views, in creation order."""
         filters, values = self._question_filters(case_id, target_id)
         where = f"WHERE {' AND '.join(filters)}" if filters else ""
         with self._connection() as connection:
-            rows = connection.execute(f"SELECT * FROM questions {where}", values).fetchall()
-            views = self._views(connection, rows)
+            rows = connection.execute(f"SELECT * FROM questions {where} ORDER BY created_at, rowid", values).fetchall()
+            return self._views(connection, rows)
+
+    def prioritized_questions(
+        self,
+        *,
+        case_id: str | None = None,
+        target_id: str | None = None,
+        limit: int = 50,
+        unresolved_only: bool = False,
+    ) -> dict[str, Any]:
+        """Questions ranked work-first, with counts over every question of the scope.
+
+        Ranking happens before the limit: required questions that are not validly resolved come
+        first, then other unresolved ones, then resolved ones; creation order breaks ties, so the
+        result is deterministic. ``remaining`` says how many matching questions were left out
+        (nexus_list_questions pages through all of them in creation order).
+        """
+        views = self._scoped_views(case_id, target_id)
+
+        def rank(view: dict[str, Any]) -> int:
+            unresolved = view["status"] != "resolved" or view["stale"] or view["contested"]
+            return 0 if unresolved and view["required"] else (1 if unresolved else 2)
+
+        ranked = sorted(enumerate(views), key=lambda item: (rank(item[1]), item[0]))
+        matching = [view for _, view in ranked if not unresolved_only or rank(view) < 2]
+        size = max(1, min(int(limit), 200))
+        return {
+            "counts": self._question_totals(views),
+            "questions": [self._compact_question(view) for view in matching[:size]],
+            "remaining": max(0, len(matching) - size),
+        }
+
+    @staticmethod
+    def _question_totals(views: list[dict[str, Any]]) -> dict[str, Any]:
         by_status = dict.fromkeys(QUESTION_STATUSES, 0)
         for view in views:
             by_status[view["status"]] += 1
@@ -2123,13 +2348,9 @@ class EvidenceStore:
         if len(significant) > BRIEF_HARD_CAP:
             omitted["significant_findings"] = len(significant) - BRIEF_HARD_CAP
 
-        counts = self.question_counts(case_id=case_id, target_id=target_id)
-        open_rows = [
-            q
-            for q in self.list_questions(case_id=case_id, target_id=target_id, limit=200)
-            if q["status"] != "resolved" or q["stale"] or q["contested"]
-        ]
-        open_rows.sort(key=lambda q: not q["required"])
+        ranked = self.prioritized_questions(case_id=case_id, target_id=target_id, limit=size, unresolved_only=True)
+        counts = ranked["counts"]
+        open_rows = ranked["questions"]
         brief["questions"] = {
             **counts,
             "unresolved_list": [
@@ -2143,11 +2364,11 @@ class EvidenceStore:
                     "stale": q["stale"],
                     "contested": q["contested"],
                 }
-                for q in open_rows[:size]
+                for q in open_rows
             ],
         }
-        if counts["unresolved"] > min(len(open_rows), size):
-            omitted["unresolved_questions"] = counts["unresolved"] - min(len(open_rows), size)
+        if ranked["remaining"]:
+            omitted["unresolved_questions"] = ranked["remaining"]
         brief["omitted"] = omitted
         brief["detail"] = (
             "Counts cover every record. For detail: nexus_get_findings, nexus_list_questions(question_id), "

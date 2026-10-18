@@ -824,3 +824,282 @@ async def test_required_question_bypass_is_refused_over_mcp(config_factory, work
             ]
     finally:
         await mgr.close()
+
+
+# -- PR #2 remediation: contradictions survive re-runs, target scope, ranking ---------------
+def _run(store, sha, cid, provider="ghidra_remcp", address=0x400119, operation="binary.decompile", **extra):
+    """One engine result about a function, as the registry records it (subject columns set)."""
+    return _evidence(
+        store,
+        sha,
+        cid,
+        provider_id=provider,
+        operation=operation,
+        subject_type="function",
+        subject_address=address,
+        subject=f"{address:#x}",
+        **extra,
+    )
+
+
+def _disagreement(store, sha, cid, address=0x400119):
+    ghidra, ida = _run(store, sha, cid, address=address), _run(store, sha, cid, provider="ida_rs", address=address)
+    store.link(ghidra, ida, "contradicts", "cmp_test")
+    return ghidra, ida
+
+
+def _try_resolve(store, sha, cid, support):
+    q = store.record_question(case_id=cid, target_id=sha, question="What does it call?", evidence_ids=[support])
+    try:
+        return store.update_question(q["question_id"], expected_revision=1, status="resolved", answer="x")
+    except ArgumentError as exc:
+        return exc
+
+
+def test_a_compared_disagreement_blocks_resolution_with_either_record(case):
+    store, sha, cid = case
+    ghidra, ida = _disagreement(store, sha, cid)
+    for support in (ghidra, ida):
+        outcome = _try_resolve(store, sha, cid, support)
+        assert isinstance(outcome, ArgumentError) and "contradicting evidence still stands" in str(outcome)
+
+
+def test_a_rerun_with_a_new_evidence_id_keeps_the_disagreement(case):
+    store, sha, cid = case
+    ghidra, ida = _disagreement(store, sha, cid)
+    rerun = _run(store, sha, cid, claim="same function, run again")
+    assert rerun != ghidra
+    outcome = _try_resolve(store, sha, cid, rerun)
+    assert isinstance(outcome, ArgumentError) and ida in str(outcome)
+    q = store.record_question(case_id=cid, target_id=sha, question="Callee?", evidence_ids=[rerun])
+    view = store.get_question(q["question_id"])
+    assert [(c["evidence_id"], c.get("via")) for c in view["linked_contradictions"]] == [(ida, ghidra)]
+    # Dismissing the opposing engine only by review leaves the answer contested, never complete.
+    store.review("evidence", ida, "rejected", "IDA used the wrong base")
+    done = store.update_question(q["question_id"], expected_revision=1, status="resolved", answer="x")
+    assert done["status"] == "resolved" and done["contested"] is True
+    assert store.question_counts(case_id=cid)["complete"] is False
+    assert store.case_brief(case_id=cid)["questions"]["complete"] is False
+
+
+def test_the_disagreement_does_not_spread_to_other_targets_subjects_operations_or_providers(case, workspace):
+    store, sha, cid = case
+    _disagreement(store, sha, cid)
+    other_file = workspace / "second.bin"
+    other_file.write_bytes(b"\x7fELF second target")
+    other = identify(other_file).sha256
+    store.upsert_target(identify(other_file), cid)
+    unrelated = [
+        (sha, _run(store, sha, cid, address=0x400200)),  # another function
+        (sha, _run(store, sha, cid, operation="binary.disassemble")),  # another operation
+        (sha, _run(store, sha, cid, provider="binja")),  # a provider that was not compared
+        (other, _run(store, other, cid)),  # the same address in another binary
+    ]
+    for target, support in unrelated:
+        done = _try_resolve(store, target, cid, support)
+        assert not isinstance(done, ArgumentError), done
+        assert done["contested"] is False and not done.get("linked_contradictions")
+
+
+def test_agreeing_results_are_not_contradictions_and_a_later_agreement_supersedes(case):
+    store, sha, cid = case
+    ghidra, ida = _run(store, sha, cid), _run(store, sha, cid, provider="ida_rs")
+    store.link(ghidra, ida, "agrees_with", "cmp_agree")
+    done = _try_resolve(store, sha, cid, _run(store, sha, cid, claim="rerun after agreement"))
+    assert not isinstance(done, ArgumentError) and done["contested"] is False
+    # A function first compared as a disagreement and later re-compared as an agreement.
+    old_g, _old_i = _disagreement(store, sha, cid, address=0x400300)
+    new_g = _run(store, sha, cid, address=0x400300, claim="re-compared")
+    new_i = _run(store, sha, cid, provider="ida_rs", address=0x400300, claim="re-compared")
+    store.link(new_g, new_i, "agrees_with", "cmp_later")
+    done = _try_resolve(store, sha, cid, _run(store, sha, cid, address=0x400300, claim="third run"))
+    assert not isinstance(done, ArgumentError) and done["contested"] is False
+    # The explicitly compared record itself still carries its own disagreement.
+    assert isinstance(_try_resolve(store, sha, cid, old_g), ArgumentError)
+
+
+def test_target_scope_includes_case_level_required_questions(case):
+    store, sha, cid = case
+    case_level = store.record_question(case_id=cid, question="Is the sample packed?")  # no target
+    target_q = store.record_question(case_id=cid, target_id=sha, question="Callee?")
+    store.update_question(
+        target_q["question_id"],
+        expected_revision=1,
+        status="resolved",
+        answer="x",
+        evidence_ids=[_evidence(store, sha, cid)],
+    )
+    views = {
+        "counts(target)": store.question_counts(target_id=sha),
+        "counts(case, target)": store.question_counts(case_id=cid, target_id=sha),
+        "brief(target)": store.case_brief(target_id=sha)["questions"],
+        "brief(case, target)": store.case_brief(case_id=cid, target_id=sha)["questions"],
+        "plan(target)": NexusServer._checklist(store, None, sha)["question_counts"],
+    }
+    for name, counts in views.items():
+        assert counts["complete"] is False and counts["required_unresolved"] == 1, name
+    brief = store.case_brief(target_id=sha)["questions"]
+    assert [q["question_id"] for q in brief["unresolved_list"]] == [case_level["question_id"]]
+    listed = {q["question_id"] for q in store.list_questions(target_id=sha)}
+    assert listed == {case_level["question_id"], target_q["question_id"]}
+    # Once the case-level question is answered, nothing else keeps the target view incomplete.
+    store.update_question(
+        case_level["question_id"],
+        expected_revision=1,
+        status="resolved",
+        answer="no",
+        evidence_ids=[_evidence(store, sha, cid, operation="binary.metadata", subject="binary")],
+    )
+    assert store.question_counts(target_id=sha)["complete"] is True
+    assert store.case_brief(case_id=cid, target_id=sha)["questions"]["complete"] is True
+    assert NexusServer._checklist(store, None, sha)["question_counts"]["complete"] is True
+
+
+def test_open_required_questions_rank_first_even_beyond_200(case):
+    store, sha, cid = case
+    for i in range(210):
+        store.record_question(case_id=cid, target_id=sha, question=f"optional {i}", required=False)
+    required = [
+        store.record_question(case_id=cid, target_id=sha, question=f"required {i}")["question_id"] for i in range(5)
+    ]
+    plan = NexusServer._checklist(store, cid, sha)
+    assert [q["question_id"] for q in plan["questions"][:5]] == required
+    assert plan["questions_truncated"] is True and plan["questions_remaining"] == 215 - len(plan["questions"])
+    assert plan["question_counts"]["total"] == 215 and plan["question_counts"]["required_unresolved"] == 5
+    brief = store.case_brief(case_id=cid, limit=20)
+    assert [q["question_id"] for q in brief["questions"]["unresolved_list"][:5]] == required
+    assert brief["questions"]["unresolved"] == 215 and brief["omitted"]["unresolved_questions"] == 195
+    # Deterministic, and every question is still reachable through offset paging.
+    assert NexusServer._checklist(store, cid, sha)["questions"] == plan["questions"]
+    seen: list[str] = []
+    while True:
+        page = store.list_questions(case_id=cid, limit=200, offset=len(seen))
+        seen += [q["question_id"] for q in page]
+        if len(page) < 200:
+            break
+    assert len(seen) == len(set(seen)) == 215 and set(required) <= set(seen)
+
+
+def test_report_table_shows_contradictions_linked_against_the_support(case):
+    store, sha, cid = case
+    support = _evidence(store, sha, cid)
+    other = _evidence(store, sha, cid, provider_id="ida_rs")
+    store.link(other, support, "contradicts", "IDA disagrees")
+    store.record_question(case_id=cid, target_id=sha, question="Callee?", evidence_ids=[support])
+    lines = render_markdown(build_bundle(store, cid)).splitlines()
+    row = next(line for line in lines if line.startswith("| Callee?"))
+    assert other in row
+
+
+# -- comparison provenance: tri-state outcomes, scope, subject identity -------------------------
+def _engine_run(
+    store, sha, cid, provider="ghidra_remcp", version="12.1.4", address=0x400119, operation="binary.decompile", **extra
+):
+    """An engine result as the registry records it: provider, operation, subject and engine build."""
+    fields = {
+        "provider_id": provider,
+        "operation": operation,
+        "subject_type": "function",
+        "subject_address": address,
+        "subject": f"{address:#x}",
+        "engine": provider.split("_")[0],
+        "engine_version": version,
+    }
+    fields.update(extra)
+    return _evidence(store, sha, cid, **fields)
+
+
+def _compared(store, sha, cid, left, right, relation):
+    """Persist a comparison and its link as nexus_compare_function records them."""
+    assessment = {"contradicts": "disagreement", "agrees_with": "independent_agreement"}.get(relation, "single_source")
+    cmp_id = store.add_comparison(
+        target_id=sha,
+        case_id=cid,
+        operation="function_comparison",
+        subject="0x400119",
+        assessment=assessment,
+        details={"assessment": assessment},
+        evidence_ids=[left, right],
+    )["comparison_id"]
+    store.link(left, right, relation, note=cmp_id)
+    return cmp_id
+
+
+def _state(store, sha, cid, support):
+    """'blocked' (a standing contradiction refuses the resolution) or 'clear'."""
+    outcome = _try_resolve(store, sha, cid, support)
+    return "blocked" if isinstance(outcome, ArgumentError) else ("contested" if outcome["contested"] else "clear")
+
+
+def test_disagreement_survives_reruns_and_neutral_outcomes_but_not_an_applicable_agreement(case):
+    store, sha, cid = case
+    g1, i1 = _engine_run(store, sha, cid), _engine_run(store, sha, cid, provider="ida_rs", version="9.1")
+    _compared(store, sha, cid, g1, i1, "contradicts")
+    assert _state(store, sha, cid, g1) == "blocked"  # 1. explicit disagreement
+    g2 = _engine_run(store, sha, cid, claim="rerun")
+    assert _state(store, sha, cid, g2) == "blocked"  # 2. a rerun keeps it
+    # 3./4. A later neutral outcome (single source, one engine family or nothing to compare are all
+    # recorded as same_subject) is not an agreement.
+    i2 = _engine_run(store, sha, cid, provider="ida_rs", version="9.1", claim="rerun")
+    _compared(store, sha, cid, g2, i2, "same_subject")
+    assert _state(store, sha, cid, _engine_run(store, sha, cid, claim="third")) == "blocked"
+    # 5. An explicit agreement for the same scope and engine build clears it for later runs.
+    g3 = _engine_run(store, sha, cid, claim="re-compared")
+    i3 = _engine_run(store, sha, cid, provider="ida_rs", version="9.1", claim="re-compared")
+    _compared(store, sha, cid, g3, i3, "agrees_with")
+    assert _state(store, sha, cid, _engine_run(store, sha, cid, claim="after agreement")) == "clear"
+    # 6. A newer disagreement makes it contested (blocked) again.
+    g4 = _engine_run(store, sha, cid, claim="compared again")
+    i4 = _engine_run(store, sha, cid, provider="ida_rs", version="9.1", claim="compared again")
+    _compared(store, sha, cid, g4, i4, "contradicts")
+    assert _state(store, sha, cid, _engine_run(store, sha, cid, claim="after new disagreement")) == "blocked"
+
+
+def test_an_agreement_outside_the_scope_does_not_clear_a_disagreement(case, workspace):
+    store, sha, cid = case
+    g1, i1 = _engine_run(store, sha, cid), _engine_run(store, sha, cid, provider="ida_rs", version="9.1")
+    _compared(store, sha, cid, g1, i1, "contradicts")
+    other_file = workspace / "second.bin"
+    other_file.write_bytes(b"\x7fELF second target")
+    other = identify(other_file).sha256
+    store.upsert_target(identify(other_file), cid)
+    agreements = [
+        (other, {}, {}),  # another target
+        (sha, {"address": 0x400200}, {"address": 0x400200}),  # another function
+        (sha, {"operation": "binary.disassemble"}, {"operation": "binary.disassemble"}),  # another operation
+        (sha, {"version": "11.0"}, {}),  # another engine build of the support's engine
+        (sha, {}, {"provider": "binja"}),  # an engine that was not part of the disagreement
+    ]
+    for target, mine, theirs in agreements:
+        left = _engine_run(store, target, cid, claim="agree", **mine)
+        right = _engine_run(store, target, cid, provider=theirs.pop("provider", "ida_rs"), claim="agree", **theirs)
+        _compared(store, target, cid, left, right, "agrees_with")
+    assert _state(store, sha, cid, _engine_run(store, sha, cid, claim="rerun")) == "blocked"
+
+
+def test_legacy_cross_operation_comparison_links_are_not_contradictions(case):
+    store, sha, cid = case
+    decompiled = _engine_run(store, sha, cid)
+    listing = _engine_run(store, sha, cid, provider="ida_rs", version="9.1", operation="binary.disassemble")
+    _compared(store, sha, cid, decompiled, listing, "contradicts")  # an older comparison linked across operations
+    assert _state(store, sha, cid, decompiled) == "clear"
+    assert _state(store, sha, cid, _engine_run(store, sha, cid, claim="rerun")) == "clear"
+
+
+def test_subject_identity_by_name_needs_the_providers_own_unambiguous_mapping(case):
+    store, sha, cid = case
+    g1 = _engine_run(store, sha, cid, subject_name="check_key")
+    _compared(store, sha, cid, g1, _engine_run(store, sha, cid, provider="ida_rs", version="9.1"), "contradicts")
+    # The engine reported check_key at exactly this address: a run recorded by name only is the same subject.
+    by_name = _engine_run(store, sha, cid, subject_address=None, subject_name="check_key", subject="check_key")
+    assert _state(store, sha, cid, by_name) == "blocked"
+    # A different name, or an address the name was never reported at, is another subject.
+    other_name = _engine_run(store, sha, cid, subject_address=None, subject_name="main", subject="main")
+    assert _state(store, sha, cid, other_name) == "clear"
+    elsewhere = _engine_run(store, sha, cid, address=0x400300, subject_name="check_key")
+    assert _state(store, sha, cid, elsewhere) == "clear"
+    # Now the provider has placed check_key at two addresses: a name-only run is ambiguous.
+    by_name_again = _engine_run(store, sha, cid, subject_address=None, subject_name="check_key", subject="check_key")
+    assert _state(store, sha, cid, by_name_again) == "clear"
+    # Address matches stay exact regardless of the name.
+    assert _state(store, sha, cid, _engine_run(store, sha, cid, subject_name="renamed")) == "blocked"

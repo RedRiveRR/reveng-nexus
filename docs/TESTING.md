@@ -48,7 +48,8 @@ appended Electron fuse wire; not a real Electron build). No binaries are committ
 | Self-approval: an agent note reviewed as verified (or reviewed AI output) cannot resolve a question; source evidence resolves and records its basis; rejecting it makes the question stale; source contradictions dismissed only by review make a resolution `contested` | `test_questions.py` |
 | Ghidra reuse by installation identity (same identity reused without an engine call; wrapper/framework version change alone is not an identity change; in-place upgrade under the same path invalidates; unknown identity disables reuse with a reason; refresh calls the engine); REA by its pinned version (drift disables); operator-attested identity opt-in | `test_reuse_idempotency.py`; live: `tests/integration/test_ghidra_reuse_live.py` (opt-in, `REVENG_NEXUS_LIVE_GHIDRA=1`) |
 | Reuse and idempotency (schema v4): identical request reused with audit and `refresh`, no reuse across parameters/targets/cases, rejected evidence not reused, server-version and code-fingerprint changes prevent reuse, unknown version means no reuse, workflows stay fresh; idempotent replay for all five write tools, changed arguments refused, failed write keeps the key free, concurrent retries write once, lost-response retry of a question update, v3 → v4 migration | `test_reuse_idempotency.py` |
-| Mutation reuse block (2026-10-18): unknown tool names and policy-refused calls do not block; the store-time block check is atomic with the insert; a call that reached the engine blocks reuse whether it succeeds, fails, times out or is cancelled (`move_on_after`, task group, MCP `notifications/cancelled`, one native `Task.cancel()`, a second one while the write is held, a storm from the moment the write is requested): the write runs exactly once, the cancellation is still raised, and the stale cached result is not reused; a block write that fails or cannot be started is audited (`reuse_block_failed`), claims no block and is never a success | `test_reuse_idempotency.py` |
+| Review remediation (2026-10-18): a comparison links only records of one operation, pair by pair (a real `nexus_compare_function` with a decompilation disagreement leaves listings unlinked as contradictions); a disagreement survives a re-run of either side (new evidence id) and is not inherited by other targets, subjects, operations or providers, nor by agreeing results; neutral `same_subject` outcomes never clear it, only an agreement from the same engine build does, and a newer disagreement restores it; name-only runs inherit only through the provider's unambiguous name-to-address mapping; legacy cross-operation links are ignored; target-scoped counts, briefs, listings and plan checklists include the case's case-level questions; required unresolved questions rank first beyond 200 questions; evidence pages and question listings stay valid JSON within the response cap with every record returned exactly once, an oversized record is returned (elided, flagged), never skipped; the report shows contradictions linked against a question's support | `test_questions.py`, `test_retrieval.py` |
+| Mutation reuse block (2026-10-18): unknown tool names and policy-refused calls do not block; the store-time block check is atomic with the insert; a call that reached the engine blocks reuse whether it succeeds, fails, times out or is cancelled (`move_on_after`, task group, MCP `notifications/cancelled` over JSON-RPC (the test asserts the server received it; since the review remediation), one native `Task.cancel()`, a second one while the write is held, a storm from the moment the write is requested): the write runs exactly once, the cancellation is still raised, and the stale cached result is not reused; a block write that fails or cannot be started is audited (`reuse_block_failed`), claims no block and is never a success | `test_reuse_idempotency.py` |
 | Investigation questions (schema v3): revision conflicts incl. concurrent writers, evidence gates (AI/agent-note-only, standing and linked contradictions, partial, blocked), stale states after reviews, scope checks, bounded listings/history/checklist, offset paging, report section, v2 → v3 migration preserving rows, concurrent and failing migrations, MCP tools | `test_questions.py` |
 | Cross-engine comparison: independence, rebasing, disagreement preservation, AI checks, per-group verdicts | `test_compare.py` |
 | Built-in provider operations, hash-change detection, capability errors | `test_builtin_provider.py` |
@@ -66,7 +67,7 @@ appended Electron fuse wire; not a real Electron build). No binaries are committ
 
 ## Test accounting
 
-The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) the final review to 476 ([table](#final-review-2026-10-15-evening)) and the follow-up batch to 497 ([table](#follow-up-batch-2026-10-16)); the pre-commit restart-budget fix added one test (498, [table](#re-verification-on-a-reinstalled-machine-2026-10-16)); the dashboard and tool-count work added 26 (524) and its pre-commit review 10 more (534, [table](#dashboard-and-tool-count-audit-2026-10-16-uncommitted)); PR #1 (`9339d74`) collects 724 and the evidence-workflow feature on top of it 826 ([table](#evidence-workflow-reuse-and-cancellation-safety-2026-10-18-windows-uncommitted)). Environment-gated tests, not failing:
+The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) the final review to 476 ([table](#final-review-2026-10-15-evening)) and the follow-up batch to 497 ([table](#follow-up-batch-2026-10-16)); the pre-commit restart-budget fix added one test (498, [table](#re-verification-on-a-reinstalled-machine-2026-10-16)); the dashboard and tool-count work added 26 (524) and its pre-commit review 10 more (534, [table](#dashboard-and-tool-count-audit-2026-10-16-uncommitted)); PR #1 (`9339d74`) collects 724, the evidence-workflow feature on top of it 826 and its review remediation 840 ([table](#pr-2-review-remediation-2026-10-18-windows-uncommitted); [table](#evidence-workflow-reuse-and-cancellation-safety-2026-10-18-windows-pr-2)). Environment-gated tests, not failing:
 
 - `tests/integration/test_ghidra_live.py` (`test_live_ghidra_providers_end_to_end` and, since
   2026-10-16, `test_live_ghidra_operations_per_provider`) is skipped unless `REVENG_NEXUS_LIVE_GHIDRA=1` and `GHIDRA_INSTALL_DIR` are set.
@@ -86,9 +87,53 @@ already grown from 154 to 160 tests over that session. This session added 5 test
 diagnostics, `config init --create-dirs`, non-loopback HTTP refusal, DNS-rebinding
 rejection, background provider start), giving 165. Every count below was observed.
 
-## Evidence workflow, reuse and cancellation safety (2026-10-18, Windows, uncommitted)
+## PR #2 review remediation (2026-10-18, Windows, uncommitted)
 
-Branch `feature/evidence-workflow` on top of PR #1 (`9339d74`), not yet committed. Windows 11 Pro
+Changes on top of `c0df391` (PR #2) after its independent review; not yet committed. Same machine
+and environment as the next section.
+
+| Defect found in review | Fix |
+|---|---|
+| A re-run of a compared result (new evidence id) dropped the recorded disagreement, so a question could resolve and the case report complete | `evidence.py` `_inherited_contradictions`: a re-run of either side (same case, target, provider, operation and subject; same parameters where both runs recorded them) inherits the disagreement; the most recent comparison between the same two sides decides, so a later agreement supersedes it |
+| Target-scoped counts, briefs, listings and the plan checklist left out case-level questions and could report `complete: true` | `_question_filters`: a target scope also covers the case-level questions of the target's cases |
+| Evidence pages were budgeted on compact JSON but rendered indented; the server then cut responses at 200,000 characters into invalid JSON, with the cursor already past the cut record | one size accounting (`render_json`, `rendered_cost`); the server budgets the page against its real envelope; an oversized record is returned alone, elided and flagged `oversized`; `_dump` never slices text and shortens an oversized response into valid JSON under `response_truncated` |
+| `nexus_list_questions` could exceed the cap, losing counts and `next_offset` | counts and paging first, rows capped (`resolution_basis` ids, `stale_reasons`), the page stops by size (`size_limited`, `next_offset` at the first row not returned) |
+| Case brief and plan checklist read only the first 200 questions before ranking | `prioritized_questions` ranks every question of the scope (required unresolved, other unresolved, resolved; creation order breaks ties) before the limit; `questions_remaining` and `omitted` count the rest |
+| The "MCP cancellation" test ran over the SDK's in-process `DirectDispatcher`, so no `notifications/cancelled` was sent | the test uses `Client(..., mode="legacy")` (JSON-RPC over in-memory streams) and asserts that the server's dispatcher received the notification for the in-flight request; with the default mode the same assertion fails (`[]`) |
+| The Markdown report ignored contradictions linked against a question's support | `report.py` lists them in the Contradicting column |
+
+| Command | Result |
+|---|---|
+| The 9 new tests on `c0df391` (disposable copy, its own `src` imported) | 6 failed for the intended reasons (re-run resolved; target view complete; required questions past 200 missing; linked contradiction missing from the report; both MCP responses 200,067 characters), 3 passed (behaviour that already held: unrelated results and agreements are not contradictions; the explicit disagreement blocks) |
+| `pytest -q -rs` (840 collected, after the provenance follow-up below) | **803 passed, 0 failed, 3 errors, 35 skipped**, 8 min 16 s; the 3 errors are the PR #1 baseline errors described in the next section (before the follow-up: 835 collected, 798 passed, same 3 errors) |
+| Questions, retrieval, report, reuse, evidence, compare, orchestrator, server, dashboard, access-profile and MCP-provider modules | 362 passed |
+| ruff check, ruff format --check, compileall, `--check-config`, `git diff --check` | clean |
+| mypy | the same 10 baseline errors |
+
+Provenance follow-up (same day): `nexus_compare_function` linked every compared record pairwise
+with the overall verdict, across operations; it now links only records of one operation, each pair
+by its own outcome. When deciding whether a disagreement still applies, a `same_subject` link
+(neutral) no longer counts as agreement, an agreement counts only from the support's engine build,
+legacy cross-operation links are ignored, and a run recorded by name inherits from one recorded by
+address when the provider reported that name at exactly that address (never when it reported the
+name at two addresses). New tests (5) failed on the accumulated remediation state before this
+follow-up, each at its intended assertion (a `same_subject` link cleared the disagreement; an
+agreement from another engine build cleared it; a legacy cross-operation link blocked; a name-only
+re-run did not inherit; the comparison linked a decompilation to an instruction listing).
+
+Limits: a disagreement is recorded only by `nexus_compare_function` links; legacy same-operation
+links from an older comparison that disagreed elsewhere still count (conservatively); subjects are
+matched by address or exact name, never fuzzily, so differently named runs without addresses do
+not inherit; a record or response above the cap is shortened, and its
+full content is available through `nexus_export_report(include_raw=true)` on disk, not through a
+paged read. Not run: live REA, live Ghidra on this remediation (it performs no mutation either way),
+Linux and macOS.
+
+## Evidence workflow, reuse and cancellation safety (2026-10-18, Windows, PR #2)
+
+Branch `feature/evidence-workflow`, committed as `c0df391` and opened as PR #2, stacked on PR #1
+(`9339d74`). The results in this section are for `c0df391`; the review remediation made after it
+is recorded in [PR #2 review remediation](#pr-2-review-remediation-2026-10-18-windows-uncommitted). Windows 11 Pro
 10.0.26300, Python 3.12.15, AnyIO 4.15.1, the worktree's `.venv`, `-p no:cacheprovider`. New:
 `test_questions.py`, `test_retrieval.py`, `test_reuse_idempotency.py` and the opt-in
 `tests/integration/test_ghidra_reuse_live.py` (102 tests together); `test_report.py` updated.
@@ -748,7 +793,7 @@ Defects found and fixed during live verification, each now covered by a test:
 | LLM4Decompile with real weights | no GPU or served checkpoint; weights deliberately not downloaded |
 | GhidrAssist → Nexus over HTTP | no Ghidra GUI session; only Nexus' HTTP endpoint is tested |
 | macOS | never run; POSIX process-group code is exercised on Linux only (cloud container, 2026-10-17) |
-| Evidence-workflow feature (2026-10-18) on Linux or macOS, against live REA, and its final code with the wider live Ghidra test or a live Ghidra mutation | run on Windows only; on the final code only the live Ghidra reuse test ran ([section](#evidence-workflow-reuse-and-cancellation-safety-2026-10-18-windows-uncommitted)); mutation invalidation and reuse-block cancellation are tested against a mocked engine |
+| Evidence-workflow feature (2026-10-18) on Linux or macOS, against live REA, and its final code with the wider live Ghidra test or a live Ghidra mutation | run on Windows only; on the final code only the live Ghidra reuse test ran ([section](#evidence-workflow-reuse-and-cancellation-safety-2026-10-18-windows-pr-2)); mutation invalidation and reuse-block cancellation are tested against a mocked engine |
 | Symlink refusal | needs Developer Mode/admin on this host (junction/symlink code path is skipped, not failed) |
 | ida-mcp-rs, Binary Ninja and JADX against the real upstream | only `mock_tested` (since 2026-10-14): the mock fixtures follow the pinned upstream source ([ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)), which is a reading of code, not a live run; live use is blocked (no IDA licence, Binary Ninja or Maven) |
 | Mach-O beyond `LC_SYMTAB` | symbols come from `LC_SYMTAB` only (generated fixtures, unit-tested); function sizes are unknown by format; dyld export tries, chained fixups and `LC_DYSYMTAB` indirect symbols are not decoded; no real-world Mach-O was tried |

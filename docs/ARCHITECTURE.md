@@ -163,15 +163,38 @@ revision it read (compare-and-set under a write lock), so a stale writer gets
 `revision_conflict` instead of overwriting. `resolved` needs an answer and standing support
 that is direct or engine-derived (a review never upgrades other evidence): AI output and agent
 notes alone never resolve a question, and contradicting evidence (cited, or recorded as a
-`contradicts` link against the support) must be rejected first. A stored state that later
-reviews undermine is reported as `stale` and keeps the case incomplete. Listings are bounded
-(ids capped per question, text truncated, offset paging); full detail is per question.
+`contradicts` link against the support) must be rejected first. `nexus_compare_function` links
+only records it compared with each other: records of one operation (decompilation with
+decompilation, instruction listing with listing), pair by pair. A pair is `contradicts` when a
+high-severity disagreement in that operation's aspects or in the function's start address is
+between exactly those two records, `agrees_with` when they come from different engine families
+and do not disagree, and `same_subject` when one engine family produced both. A re-run of one side
+(same case, target, provider, operation and subject, with matching parameters where both runs
+recorded them) gets a new evidence id but inherits that disagreement. Only an explicit
+`agrees_with` between the same two sides, from a record with the support's engine identity
+(engine and version), clears it, and a newer `contradicts` restores it; `same_subject` (single
+source, one engine family, nothing to compare) is neutral and never clears one. Subjects match by
+address when both records have one; otherwise by exact name, only when the provider reported that
+name at no more than one address on the target. Links between different operations, which older
+comparisons created by linking every compared record, are ambiguous and are not read as
+contradictions. A stored state
+that later reviews undermine is reported as `stale` and keeps the case incomplete. A target scope
+(counts, listings, case brief, plan checklist) also covers the case-level questions (no target)
+of the target's cases, so a target view is never complete while one of them is open. Listings are
+bounded (ids capped per question, text truncated, offset paging that also stops by size with
+`size_limited`); the case brief and the plan checklist rank required unresolved questions first
+before applying their limits. Full detail is per question.
 
 Retrieval is sized for agents. `nexus_get_evidence` lists newest first by
 `(created_at, rowid)` and pages with an opaque keyset cursor bound to the query's filters; a
-page holds at most 500 records and at most 150,000 serialized characters (at least one
-record; `size_limited` says when the size cut the page, and the cursor continues after the
-last record returned). With one writer and a monotonic clock, pages never repeat or skip
+page holds at most 500 records and at most 150,000 characters as rendered in the response
+(indentation included; less when the rest of the response needs the room). It holds at least one
+record; `size_limited` says when the size cut the page, and the cursor continues after the last
+record returned. A record too large for any page is returned alone with its bulky fields replaced
+by size notes and an `oversized` note naming how to get it in full (`nexus_export_report` with
+`include_raw`). No tool response is cut mid-text: one that would exceed the 200,000-character
+limit is shortened into valid JSON, its largest strings and lists elided, under a
+`response_truncated` note. With one writer and a monotonic clock, pages never repeat or skip
 records while new evidence arrives (new records sort before the first page); a second
 process committing an older timestamp late can sort behind a cursor already issued.
 `view: summary` returns one short provenance line per record. `nexus_case_brief` gives a delegated agent a bounded summary:
@@ -214,8 +237,10 @@ derive from analysis state Nexus cannot identify (an unsaved change can be lost 
 restart or rebuild). This applies to every such call that reached the engine, whether it
 succeeds, fails, times out or is cancelled by the client (the block write runs as one job in a
 worker thread that the caller waits for through AnyIO scope cancellation and repeated native
-`Task.cancel()` alike, without blocking the event loop; the cancellation propagates once the
-write has finished), but not to a call the policy refused or to
+`Task.cancel()` alike, without blocking the event loop; a native cancellation that arrives
+during the write is raised once the write has finished, even if the engine call had succeeded,
+so that caller sees a cancellation for a change the engine made, while an AnyIO scope
+cancellation is held off during the write and takes effect at the caller's next checkpoint), but not to a call the policy refused or to
 a tool name the provider does not list, since neither reaches the engine. The shield cannot
 help if the database write itself fails or cannot be started (for example a worker pool that is
 already shut down): that is audited (`reuse_block_failed`), no block is claimed, and it is

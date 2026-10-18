@@ -130,6 +130,11 @@ def render_markdown(bundle: dict[str, Any], *, code_excerpt_lines: int = 60) -> 
             if q["evidence_missing"] and q["supporting_evidence_ids"]:
                 support += " (none still stands: **missing**)"
             contra = _id_list(q["contradicting_evidence_ids"], q["contradicting_evidence_count"]) or "—"
+            # Evidence linked as contradicting the support (a comparison), not cited on the question.
+            linked = q.get("linked_contradiction_ids") or []
+            if linked:
+                text = ", ".join(f"`{e}`" for e in linked) + " (linked against its support)"
+                contra = text if contra == "—" else f"{contra}; {text}"
             status = q["status"]
             if q["stale"]:
                 status += " (**stale**: evidence no longer supports it)"
