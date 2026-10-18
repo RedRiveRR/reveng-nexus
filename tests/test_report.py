@@ -2,6 +2,7 @@ import json
 
 from conftest import mock_engine
 
+from reveng_nexus.evidence import SCHEMA_VERSION
 from reveng_nexus.orchestrator import Orchestrator
 from reveng_nexus.registry import ProviderManager
 from reveng_nexus.report import build_bundle, export_report, render_markdown
@@ -44,7 +45,7 @@ async def test_report_export_markdown_and_json(config_factory, workspace, elf_sa
     assert "callees" in md and "Engines disagree" in md
     assert "Engine-derived analysis" in md and "Analyst / agent notes" in md
     assert "not the original source code" in md
-    assert data["case"]["case_id"] == case_id and data["schema_version"] == 2
+    assert data["case"]["case_id"] == case_id and data["schema_version"] == SCHEMA_VERSION
     assert all("absolute_path" not in t for t in data["targets"])
     assert note["evidence_id"] in md
 

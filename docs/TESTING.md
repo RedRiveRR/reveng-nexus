@@ -41,7 +41,15 @@ appended Electron fuse wire; not a real Electron build). No binaries are committ
 | Workspace boundary (outside, relative, `..`, prefix sibling, ADS, symlink, size), hashing, staging | `test_artifacts_formats.py` |
 | ELF/PE/APK parsing, export rules, strings with VAs, malformed inputs | `test_artifacts_formats.py` |
 | Every generated fixture (ELF, PE, Mach-O thin/universal, APK): recognition, metadata, truncation, evidence retention, unchanged original | `test_builtin_fixtures.py` |
-| Evidence persistence, 0.1 → 2 migration, raw outputs, AI provenance rules, findings, reviews, links | `test_evidence.py` |
+| Evidence persistence, 0.1 → current migration, raw outputs, AI provenance rules, findings, reviews, links | `test_evidence.py` |
+| Compact retrieval: keyset paging (complete, stable under inserts, identical timestamps), cursors bound to filters, summary view, batched findings equal to per-finding reads with a bounded query count, case brief (significant findings always listed, omissions counted, empty case, by target), MCP compatibility of `nexus_get_evidence` | `test_retrieval.py` |
+| Final review fixes (2026-10-17): requiredness only increases (resolve → optional → reopen cannot make a case complete; refused with `required_is_monotonic`, history and revisions unchanged; ever-required questions count as required), through the store and the MCP tools; a mutated provider/target never stores reusable results again (mocked stateful engine: lost unsaved state and a read in flight during the mutation), block persists across restarts and is scoped | `test_questions.py`, `test_reuse_idempotency.py` |
+| Second review (2026-10-17): citing both sides of a recorded disagreement does not hide it; an unresolved required question cannot be made optional (history records `required`); the report lists every question past 200; Ghidra identity only for launched servers, absolute paths and the case variant the child sees; JDK `release` and `launch.properties` changes invalidate; a mutating raw call clears reuse markers (reads and refused calls do not) | `test_questions.py`, `test_reuse_idempotency.py` |
+| Self-approval: an agent note reviewed as verified (or reviewed AI output) cannot resolve a question; source evidence resolves and records its basis; rejecting it makes the question stale; source contradictions dismissed only by review make a resolution `contested` | `test_questions.py` |
+| Ghidra reuse by installation identity (same identity reused without an engine call; wrapper/framework version change alone is not an identity change; in-place upgrade under the same path invalidates; unknown identity disables reuse with a reason; refresh calls the engine); REA by its pinned version (drift disables); operator-attested identity opt-in | `test_reuse_idempotency.py`; live: `tests/integration/test_ghidra_reuse_live.py` (opt-in, `REVENG_NEXUS_LIVE_GHIDRA=1`) |
+| Reuse and idempotency (schema v4): identical request reused with audit and `refresh`, no reuse across parameters/targets/cases, rejected evidence not reused, server-version and code-fingerprint changes prevent reuse, unknown version means no reuse, workflows stay fresh; idempotent replay for all five write tools, changed arguments refused, failed write keeps the key free, concurrent retries write once, lost-response retry of a question update, v3 → v4 migration | `test_reuse_idempotency.py` |
+| Mutation reuse block (2026-10-18): unknown tool names and policy-refused calls do not block; the store-time block check is atomic with the insert; a call that reached the engine blocks reuse whether it succeeds, fails, times out or is cancelled (`move_on_after`, task group, MCP `notifications/cancelled`, one native `Task.cancel()`, a second one while the write is held, a storm from the moment the write is requested): the write runs exactly once, the cancellation is still raised, and the stale cached result is not reused; a block write that fails or cannot be started is audited (`reuse_block_failed`), claims no block and is never a success | `test_reuse_idempotency.py` |
+| Investigation questions (schema v3): revision conflicts incl. concurrent writers, evidence gates (AI/agent-note-only, standing and linked contradictions, partial, blocked), stale states after reviews, scope checks, bounded listings/history/checklist, offset paging, report section, v2 → v3 migration preserving rows, concurrent and failing migrations, MCP tools | `test_questions.py` |
 | Cross-engine comparison: independence, rebasing, disagreement preservation, AI checks, per-group verdicts | `test_compare.py` |
 | Built-in provider operations, hash-change detection, capability errors | `test_builtin_provider.py` |
 | MCP provider lifecycle, paginated discovery, catalogue enforcement, audit, staging, timeout, crash and restart, error normalisation, missing executable and env, dynamic skip, launched HTTP, process-tree reaping, minimal child env, stale engine DB rebuild, handshake bounded by the startup (not per-call) timeout and abandoned without a livelock | `test_mcp_providers.py` |
@@ -58,10 +66,12 @@ appended Electron fuse wire; not a real Electron build). No binaries are committ
 
 ## Test accounting
 
-The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) the final review to 476 ([table](#final-review-2026-10-15-evening)) and the follow-up batch to 497 ([table](#follow-up-batch-2026-10-16)); the pre-commit restart-budget fix added one test (498, [table](#re-verification-on-a-reinstalled-machine-2026-10-16)); the dashboard and tool-count work added 26 (524) and its pre-commit review 10 more (534, [table](#dashboard-and-tool-count-audit-2026-10-16-uncommitted)). Environment-gated tests, not failing:
+The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) the final review to 476 ([table](#final-review-2026-10-15-evening)) and the follow-up batch to 497 ([table](#follow-up-batch-2026-10-16)); the pre-commit restart-budget fix added one test (498, [table](#re-verification-on-a-reinstalled-machine-2026-10-16)); the dashboard and tool-count work added 26 (524) and its pre-commit review 10 more (534, [table](#dashboard-and-tool-count-audit-2026-10-16-uncommitted)); PR #1 (`9339d74`) collects 724 and the evidence-workflow feature on top of it 826 ([table](#evidence-workflow-reuse-and-cancellation-safety-2026-10-18-windows-uncommitted)). Environment-gated tests, not failing:
 
 - `tests/integration/test_ghidra_live.py` (`test_live_ghidra_providers_end_to_end` and, since
   2026-10-16, `test_live_ghidra_operations_per_provider`) is skipped unless `REVENG_NEXUS_LIVE_GHIDRA=1` and `GHIDRA_INSTALL_DIR` are set.
+- `tests/integration/test_ghidra_reuse_live.py` (since 2026-10-17) is skipped unless
+  `REVENG_NEXUS_LIVE_GHIDRA=1`, `GHIDRA_INSTALL_DIR` is set and `uvx` is on `PATH`.
 - `tests/integration/test_rea_live.py` (since 2026-10-15) is skipped unless
   `REVENG_NEXUS_LIVE_REA=1` and `REA_NODE` / `REA_ENTRY` point at existing files.
 - `tests/test_artifacts_formats.py::test_guard_refuses_symlinks` is skipped when the OS
@@ -75,6 +85,60 @@ which was a count predicted before the final run, not an observed one. The suite
 already grown from 154 to 160 tests over that session. This session added 5 tests (static
 diagnostics, `config init --create-dirs`, non-loopback HTTP refusal, DNS-rebinding
 rejection, background provider start), giving 165. Every count below was observed.
+
+## Evidence workflow, reuse and cancellation safety (2026-10-18, Windows, uncommitted)
+
+Branch `feature/evidence-workflow` on top of PR #1 (`9339d74`), not yet committed. Windows 11 Pro
+10.0.26300, Python 3.12.15, AnyIO 4.15.1, the worktree's `.venv`, `-p no:cacheprovider`. New:
+`test_questions.py`, `test_retrieval.py`, `test_reuse_idempotency.py` and the opt-in
+`tests/integration/test_ghidra_reuse_live.py` (102 tests together); `test_report.py` updated.
+
+| Command | Result |
+|---|---|
+| `pytest -q -rs` on unmodified PR #1 (`9339d74`, same machine) | 688 passed, 0 failed, **3 errors**, 34 skipped |
+| `pytest -q -rs` with the feature (826 collected) | **789 passed, 0 failed, 3 errors, 35 skipped**, 8 min 57 s; the 3 errors are exactly the baseline's, the extra skip is the new opt-in live test |
+| Reuse-block cancellation, failed-write and timeout tests (`-k`), 3 repeats | 14 passed each time |
+| ruff check, ruff format --check, compileall, `--check-config` on the example, `git diff --check` | clean |
+| mypy | 10 errors, identical to the baseline (`providers/_stdio_guard.py` ×9, `providers/mcp.py` ×1) |
+
+The suite is therefore **not entirely clean**. The 3 errors come from PR #1, not from this
+feature: `test_llm4decompile.py::test_empty_or_oversized_input_is_refused_before_any_request` has a
+48,001-character parameter in its test id, pytest copies the id into `PYTEST_CURRENT_TEST`, and
+Windows refuses environment variables over 32,767 characters, so its setup and teardown fail with
+`ValueError`; the next test, `test_stdio_lifecycle_discovery_and_health`, then fails at setup with
+"previous item was not torn down properly".
+
+What the reuse-block tests establish (behaviour: [ARCHITECTURE.md](ARCHITECTURE.md)): once a raw
+call not classified `read` has reached the engine, the block is persisted whether the call
+succeeds, fails, times out or is cancelled, through AnyIO scopes, task groups, MCP
+`notifications/cancelled` and one or repeated native `Task.cancel()`. The write is one job in a
+worker thread (the event loop is not blocked), it runs exactly once, and the cancellation is raised
+after it. A write that fails or cannot be started is audited (`reuse_block_failed`), claims no block
+and is an error when the call had succeeded; it is never reported as a success. Regression evidence,
+each from a disposable copy of the code before the fix:
+
+* with only an AnyIO shield, a second native cancel made the cleanup give up on the write
+  (`assert not task.done()`), both while the write was held and from the moment it was requested,
+  where the write was not yet queued and was dropped; the tests are ordered by events, not by loop turns, and
+  failed in 4 of 4 runs before the fix;
+* a block write the executor refused (as after its shutdown) escaped as an unaudited `RuntimeError`
+  that replaced the success error, the original error or the cancellation (3 cases).
+
+Limits: a failed or unstartable write leaves no block (audited and surfaced, never retried); the
+wait for the write is bounded by SQLite's busy timeout (10 s), not by the cancellation; if an AnyIO
+scope cancellation is already propagating and a native cancel also arrives during the write, AnyIO
+absorbs the native one into its scope (the block is still written); a custom executor shut down with
+`cancel_futures=True` is not handled (the default executor never does this); once mutated, a
+provider and target are never cached again (by design, no unblock tool).
+
+Live Ghidra on the final code (2026-10-18, Windows 11): `test_ghidra_reuse_live.py` passed (1
+passed, 31 s) against Ghidra 12.1.4 through re-mcp-ghidra 3.0.3. It verifies the decompile reuse
+path on the generated ELF fixture (reused by installation identity, `refresh` calls the engine
+again) with a temporary data directory, and performs no mutation. Mutation-triggered invalidation
+and the cancellation-safety regressions are tested only with the mocked-engine tests above, not
+with a live Ghidra mutation. Not run on the final code: the wider `test_ghidra_live.py` (it last
+passed on 2026-10-17, with the reuse test, on an earlier state of the branch), live REA, Linux and
+macOS.
 
 ## Access profiles and REA catalogue (2026-10-17, cloud Linux, uncommitted)
 
@@ -684,6 +748,7 @@ Defects found and fixed during live verification, each now covered by a test:
 | LLM4Decompile with real weights | no GPU or served checkpoint; weights deliberately not downloaded |
 | GhidrAssist → Nexus over HTTP | no Ghidra GUI session; only Nexus' HTTP endpoint is tested |
 | macOS | never run; POSIX process-group code is exercised on Linux only (cloud container, 2026-10-17) |
+| Evidence-workflow feature (2026-10-18) on Linux or macOS, against live REA, and its final code with the wider live Ghidra test or a live Ghidra mutation | run on Windows only; on the final code only the live Ghidra reuse test ran ([section](#evidence-workflow-reuse-and-cancellation-safety-2026-10-18-windows-uncommitted)); mutation invalidation and reuse-block cancellation are tested against a mocked engine |
 | Symlink refusal | needs Developer Mode/admin on this host (junction/symlink code path is skipped, not failed) |
 | ida-mcp-rs, Binary Ninja and JADX against the real upstream | only `mock_tested` (since 2026-10-14): the mock fixtures follow the pinned upstream source ([ADAPTER_CONTRACTS.md](ADAPTER_CONTRACTS.md)), which is a reading of code, not a live run; live use is blocked (no IDA licence, Binary Ninja or Maven) |
 | Mach-O beyond `LC_SYMTAB` | symbols come from `LC_SYMTAB` only (generated fixtures, unit-tested); function sizes are unknown by format; dyld export tries, chained fixups and `LC_DYSYMTAB` indirect symbols are not decoded; no real-world Mach-O was tried |

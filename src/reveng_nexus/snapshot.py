@@ -77,6 +77,10 @@ NEXUS_TOOL_OPERATIONS: dict[str, list[str]] = {
     "nexus_review": ["local"],
     "nexus_export_report": ["local"],
     "nexus_plan_analysis": ["local"],
+    "nexus_case_brief": ["local"],
+    "nexus_record_question": ["local"],
+    "nexus_update_question": ["local"],
+    "nexus_list_questions": ["local"],
 }
 
 

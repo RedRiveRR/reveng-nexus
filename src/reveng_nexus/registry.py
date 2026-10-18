@@ -11,9 +11,12 @@ never work on one target at the same time.
 from __future__ import annotations
 
 import asyncio
+import functools
+import hashlib
 import json
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -447,8 +450,14 @@ class ProviderManager:
         provider_id: str | None = None,
         record: bool = True,
         max_failover: int | None = None,
+        reuse: bool = False,
     ) -> dict[str, Any]:
-        """Run one normalised operation with routing/failover and record evidence."""
+        """Run one normalised operation with routing/failover and record evidence.
+
+        With ``reuse``, the provider routing would pick first is asked for nothing if this case
+        already holds evidence from it for the same target, operation, parameters and engine
+        fingerprint (see ``reuse_key``); that evidence is returned with ``reused: True``.
+        """
         params = dict(params or {})
         candidates, rejected = self.rank(operation, target, provider_id)
         budget = self.config.analysis.max_failover if max_failover is None else max_failover
@@ -461,6 +470,11 @@ class ProviderManager:
                 details={"attempts": attempts, "alternatives": self._alternatives(operation)},
                 remediation="Enable/configure a provider that offers this capability (see nexus_list_capabilities).",
             )
+        reuse_status: dict[str, Any] | None = None
+        if reuse and record:
+            reused, reuse_status = await self._reuse(candidates[0], operation, target, params)
+            if reused is not None:
+                return reused
         for index, provider in enumerate(candidates[: 1 + budget]):
             started = time.monotonic()
             try:
@@ -501,8 +515,12 @@ class ProviderManager:
             )
             evidence = None
             if record:
-                evidence = await anyio.to_thread.run_sync(self.record_result, result, target)
-            return {"result": result, "evidence": evidence, "attempts": attempts}
+                keys, _status = self.reuse_key(provider, operation, target, params, result)
+                evidence = await anyio.to_thread.run_sync(functools.partial(self.record_result, result, target, keys))
+            out = {"result": result, "evidence": evidence, "attempts": attempts, "reused": False}
+            if reuse_status is not None:
+                out["reuse_status"] = reuse_status
+            return out
         raise CapabilityUnavailable(
             f"{operation} failed on every candidate provider",
             details={"attempts": attempts, "alternatives": self._alternatives(operation)},
@@ -556,7 +574,88 @@ class ProviderManager:
                 out.append({"provider_id": cfg.id, "state": state})
         return out
 
-    def record_result(self, result: OperationResult, target: TargetContext) -> dict[str, Any]:
+    # -- result reuse -------------------------------------------------------------------
+    def reuse_key(
+        self,
+        provider: AnalysisProvider,
+        operation: str,
+        target: TargetContext,
+        params: dict[str, Any],
+        result: OperationResult | None = None,
+    ) -> tuple[tuple[str, str] | None, dict[str, Any]]:
+        """((reuse_key, params_hash) or None, status) for a result of ``provider``.
+
+        The key covers the target hash, provider id, operation, canonical parameters and an engine
+        fingerprint: policy/access profile, provider class and config, adapter pin, this package's
+        code, and a verified engine identity (``engine_identity``). Without a verified identity
+        nothing is reused, and ``status`` says why. AI-generated and dynamic results are never reused.
+        """
+        if provider.config.kind in {"dynamic", "ai"} or operation.startswith("ai."):
+            return None, {"eligible": False, "reason": "AI-generated and dynamic results are never reused"}
+        if result is not None and result.evidence_kind == "ai_generated":
+            return None, {"eligible": False, "reason": "AI-generated results are never reused"}
+        identity, source = engine_identity(provider)
+        if identity is None:
+            return None, {"eligible": False, "reason": source}
+        fingerprint = _engine_fingerprint(provider, self.config.policy, identity)
+        params_hash = hashlib.sha256(_canonical(params).encode("utf-8")).hexdigest()
+        key = hashlib.sha256(
+            _canonical([target.sha256, provider.id, operation, params_hash, fingerprint]).encode("utf-8")
+        ).hexdigest()
+        return (key, params_hash), {"eligible": True, "identity_source": source}
+
+    async def _reuse(
+        self, provider: AnalysisProvider, operation: str, target: TargetContext, params: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        keys, status = self.reuse_key(provider, operation, target, params)
+        if keys is None:
+            return None, {"provider_id": provider.id, **status}
+        block = await anyio.to_thread.run_sync(lambda: self.evidence.reuse_block(provider.id, target.sha256))
+        if block is not None:
+            return None, {"provider_id": provider.id, "eligible": False, "reason": block["reason"]}
+        record = await anyio.to_thread.run_sync(
+            lambda: self.evidence.find_reusable(keys[0], target.case_id, target.sha256, provider.id)
+        )
+        if record is None:
+            return None, {"provider_id": provider.id, **status, "reason": "no stored result with this key"}
+        self.audit.write(
+            "operation",
+            provider_id=provider.id,
+            operation=operation,
+            outcome="reused",
+            evidence_id=record["evidence_id"],
+            target_sha256=target.sha256,
+            case_id=target.case_id,
+        )
+        result = OperationResult(
+            provider_id=record["provider_id"],
+            operation=record["operation"],
+            tool_name=record["tool_name"],
+            engine=record.get("engine") or "",
+            engine_family=record.get("engine_family") or "",
+            evidence_kind=record["evidence_kind"],
+            normalized=record.get("normalized") or {},
+            subject_type=record.get("subject_type") or "binary",
+            subject_address=record.get("subject_address"),
+            subject_name=record.get("subject_name"),
+            engine_version=record.get("engine_version"),
+            warnings=list(record.get("warnings") or []),
+            model=record.get("model"),
+            claim=record.get("claim") or "",
+        )
+        attempt = {"provider_id": provider.id, "outcome": "reused", "evidence_id": record["evidence_id"]}
+        reuse_status = {"provider_id": provider.id, **status}
+        return {
+            "result": result,
+            "evidence": record,
+            "attempts": [attempt],
+            "reused": True,
+            "reuse_status": reuse_status,
+        }, reuse_status
+
+    def record_result(
+        self, result: OperationResult, target: TargetContext, reuse: tuple[str, str] | None = None
+    ) -> dict[str, Any]:
         raw_text = _jsonable(result.raw) if result.raw is not None else None
         return self.evidence.add_evidence(
             target_id=target.sha256,
@@ -579,6 +678,8 @@ class ProviderManager:
             warnings=result.warnings,
             model=result.model,
             confidence="medium" if result.evidence_kind != "ai_generated" else "low",
+            reuse_key=reuse[0] if reuse else None,
+            params_hash=reuse[1] if reuse else None,
         )
 
     async def call_provider_tool(
@@ -598,7 +699,73 @@ class ProviderManager:
             # concurrent operation switch (or, with max_sessions=1, close) the session in between.
             if target is not None:
                 await provider._client_for(target)  # type: ignore[attr-defined]
-            return await provider.call_tool(tool_name, arguments, internal=False, target_sha256=target_sha256)
+            # provider.call_tool checks this same catalogue entry first, with no await in between,
+            # and refuses a name it does not list (a typo, or a catalogue that could not be
+            # discovered) before any contact with the engine: such a call cannot change anything.
+            known = getattr(provider, "_tools", {}).get(tool_name)
+            changes_state = False
+            succeeded = False
+            try:
+                result = await provider.call_tool(tool_name, arguments, internal=False, target_sha256=target_sha256)
+                # It ran: anything not classified read may have changed the engine's state.
+                changes_state = known is None or known.classification.tool_class != "read"
+                succeeded = True
+                return result
+            except PolicyViolation:
+                raise  # refused before anything reached the engine
+            except BaseException:
+                # Failures (errors, timeouts, cancellation) of a listed tool that is not classified
+                # read are treated as possible mutations.
+                changes_state = known is not None and known.classification.tool_class != "read"
+                raise
+            finally:
+                if changes_state:
+                    await self._block_reuse_after_mutation(
+                        provider_id, tool_name, target_sha256 if target else None, raise_on_failure=succeeded
+                    )
+
+    async def _block_reuse_after_mutation(
+        self, provider_id: str, tool_name: str, target_sha256: str | None, *, raise_on_failure: bool
+    ) -> None:
+        """Persist the reuse block for a raw call that may have changed the engine's state.
+
+        The write cannot be skipped by cancellation: a caller cancelling the request (an MCP
+        ``notifications/cancelled``, an AnyIO scope, or plain ``Task.cancel()``, once or repeatedly)
+        after it reached the engine still gets the block persisted, and the cancellation propagates
+        once the write has finished (see ``_finish_despite_cancellation``). Cancellation cannot help
+        if the database write fails or cannot be started; that is audited, and turned into an error
+        when the call had succeeded (so it is not reported as a clean success), while an exception
+        already propagating, such as the cancellation, is left unchanged.
+        """
+        # The engine's state may have changed (rename, patch, script): results stored from this
+        # provider must not be handed out again. Their evidence stays.
+        scope = "this target" if target_sha256 else "every target (one shared server)"
+        reason = (
+            f"reuse disabled for this provider on {scope}: its analysis state was changed by a raw "
+            f"'{tool_name}' call, and state changes may not survive an engine restart or rebuild"
+        )
+        failure, cancellation = await _finish_despite_cancellation(
+            lambda: self.evidence.invalidate_reuse(provider_id, target_sha256, reason)
+        )
+        if failure is not None:
+            self.audit.write(
+                "reuse_block_failed",
+                provider_id=provider_id,
+                tool_name=tool_name,
+                outcome="failed",
+                error=describe_exception(failure)["message"],
+                target_sha256=target_sha256,
+            )
+        if cancellation is not None:
+            raise cancellation  # a cancellation that arrived during the write still wins
+        if failure is None:
+            return
+        if raise_on_failure:
+            raise ProviderCallError(
+                f"{provider_id}: '{tool_name}' ran, but stored results could not be marked non-reusable: "
+                f"{describe_exception(failure)['message']}",
+                remediation="Use refresh: true for this provider until the evidence database is writable again.",
+            ) from failure
 
     # 0.1 compatibility: ``manager.call(provider, tool, args)``
     async def call(self, provider_id: str, tool_name: str, arguments: dict[str, Any]) -> Any:
@@ -606,3 +773,228 @@ class ProviderManager:
 
     def with_config(self, **changes: Any) -> NexusConfig:
         return replace(self.config, **changes)
+
+
+async def _finish_despite_cancellation(
+    write: Callable[[], Any],
+) -> tuple[Exception | None, BaseException | None]:
+    """Run ``write`` in a worker thread and wait until it has finished, whatever cancels the caller.
+
+    Returns ``(failure, cancellation)``: the exception ``write`` raised, or the one that kept it
+    from being started, if any, and the last cancellation that arrived while waiting, which the
+    caller must re-raise. The write is one executor job, so it is neither repeated nor dropped;
+    each wait is bounded by that single job (SQLite's busy timeout). The event loop is not
+    blocked meanwhile.
+
+    An AnyIO shield alone is not enough on asyncio: it does not stop ``Task.cancel()``, and
+    ``anyio.to_thread.run_sync`` drops a job whose wait was cancelled before the worker started.
+    Here the job is submitted to the loop's executor up front and awaited through
+    ``asyncio.shield``, so a cancelled wait leaves the job running and is simply resumed.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        # Other AnyIO backends (trio) cancel only through scopes, which the shield covers.
+        failure: Exception | None = None
+        with anyio.CancelScope(shield=True):
+            try:
+                await anyio.to_thread.run_sync(write)
+            except Exception as exc:  # noqa: BLE001 - returned to the caller, which reports it
+                failure = exc
+        return failure, None
+    try:
+        job = loop.run_in_executor(None, write)
+    except Exception as exc:  # noqa: BLE001 - never started (executor shut down, no thread): a failure
+        return exc, None  # nothing was awaited yet, so no cancellation can have arrived
+    cancellation: BaseException | None = None
+    while True:
+        try:
+            with anyio.CancelScope(shield=True):  # AnyIO scope cancellation is held off here
+                await asyncio.shield(job)  # a native Task.cancel() cancels only this wait
+            return None, cancellation
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            if job.done():
+                break  # finished at the same moment; fall through to collect its outcome
+        except Exception as exc:  # noqa: BLE001 - the write's own failure, returned to the caller
+            return exc, cancellation
+    error = job.exception()
+    return (error if isinstance(error, Exception) else None), cancellation
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+@functools.lru_cache(maxsize=1)
+def _code_fingerprint() -> str:
+    """Hash of this package's Python sources: normalisation code is part of the engine."""
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parent
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _engine_fingerprint(provider: AnalysisProvider, policy: Any, identity: dict[str, Any]) -> str:
+    """Everything that decides a provider's answer, known before the call.
+
+    The policy (access profile included) is part of it: a result produced under one profile is
+    not handed back under another, where the same request might be refused.
+    """
+    from dataclasses import asdict
+
+    parts: dict[str, Any] = {
+        "policy": hashlib.sha256(_canonical(asdict(policy)).encode("utf-8")).hexdigest(),
+        "provider": provider.id,
+        "class": type(provider).__name__,
+        "engine": provider.engine,
+        "family": provider.engine_family,
+        "config": hashlib.sha256(_canonical(asdict(provider.config)).encode("utf-8")).hexdigest(),
+        "code": _code_fingerprint(),
+        "identity": identity,
+    }
+    adapter = getattr(provider, "adapter", None)
+    if adapter is not None:
+        parts["pin"] = [adapter.pin.revision, adapter.pin.package_version]
+    return _canonical(parts)
+
+
+def engine_identity(provider: AnalysisProvider) -> tuple[dict[str, Any] | None, str]:
+    """(identity, source) of the engine behind ``provider``, or (None, reason) when it is unknown.
+
+    Only identities that can be verified before a call count:
+    - built-in engine: its parser and disassembler library versions (with the package code hash);
+    - Ghidra (re-mcp-ghidra, MCPyGhidra): the installation's Ghidra/application.properties, read
+      from the GHIDRA_INSTALL_DIR the child is given (the file pyghidra reads at launch): version,
+      release, build date, Ghidra git revision and the file's hash. An in-place upgrade changes it.
+      The MCP serverInfo of these wrappers is the FastMCP framework version and is never used;
+    - REA: the server-reported rea-agents version, which the adapter pins (drift disables REA);
+    - otherwise an operator-attested ``settings.engine_identity`` string, if configured.
+    """
+    family = provider.engine_family or provider.engine
+    if type(provider).__name__ == "BuiltinStaticProvider":
+        from .providers import builtin
+
+        return {"libraries": [builtin._capstone_version(), builtin._parser_versions()]}, "builtin libraries"
+    reason = "the engine version cannot be verified for this provider"
+    if family == "ghidra" and provider.config.type not in {"mcp_stdio", "mcp_launched_http"}:
+        reason = "the Ghidra server is not launched by Nexus, so its installation cannot be identified"
+    elif family == "ghidra":
+        identity, why = ghidra_installation_identity(provider)
+        if identity is not None:
+            source = "Ghidra installation metadata (application.properties, launch.properties, JDK release)"
+            if not identity.get("jdk"):
+                source += "; JDK not identified (no JAVA_HOME for the child: Ghidra locates its own JDK)"
+            return identity, source
+        reason = why
+    elif (provider.config.adapter or "") == "rea":
+        version = (getattr(provider, "server_info", None) or {}).get("version")
+        if version:
+            return {"rea_agents": version}, "REA server version (pinned and drift-checked by the adapter)"
+        reason = "REA has not reported its version yet (not connected)"
+    attested = str((provider.config.settings or {}).get("engine_identity") or "").strip()
+    if attested:
+        return {"operator_attested": attested}, "operator-attested settings.engine_identity"
+    return (
+        None,
+        f"{reason}; reuse is disabled (set settings.engine_identity after confirming the engine version to opt in)",
+    )
+
+
+_GHIDRA_KEYS = (
+    "application.name",
+    "application.version",
+    "application.release.name",
+    "application.build.date",
+    "application.revision.ghidra",
+)
+
+
+def ghidra_installation_identity(provider: AnalysisProvider) -> tuple[dict[str, Any] | None, str]:
+    """Identity of the Ghidra installation a provider's child process will use, or (None, reason)."""
+    child_env, missing = _child_env(provider)
+    if missing:
+        return None, f"the provider environment refers to unset variables {sorted(set(missing))}"
+    value = _env_get(child_env, "GHIDRA_INSTALL_DIR")
+    if not value:
+        return None, "GHIDRA_INSTALL_DIR is not set, so the Ghidra installation cannot be identified"
+    install = Path(value)
+    if not install.is_absolute():
+        return None, "GHIDRA_INSTALL_DIR is relative (the child resolves it elsewhere), so it cannot be identified"
+    if not install.is_dir():
+        # The wrappers then fall back to other locations on their own, which Nexus cannot see.
+        return None, "GHIDRA_INSTALL_DIR is not a directory, so the Ghidra installation cannot be identified"
+    props = install / "Ghidra" / "application.properties"
+    if not props.is_file():
+        return None, "Ghidra/application.properties is missing under GHIDRA_INSTALL_DIR"
+    identity: dict[str, Any] | None = _read_ghidra_properties(props)
+    if identity is None:
+        return None, "Ghidra/application.properties does not name a Ghidra version and build"
+    launch = install / "support" / "launch.properties"  # JAVA_HOME_OVERRIDE, JVM arguments
+    if launch.is_file():
+        identity["launch_properties_sha256"] = hashlib.sha256(launch.read_bytes()).hexdigest()
+    java_home = _env_get(child_env, "JAVA_HOME")
+    identity["jdk"] = _jdk_release(Path(java_home)) if java_home and Path(java_home).is_absolute() else None
+    return identity, ""
+
+
+def _child_env(provider: AnalysisProvider) -> tuple[dict[str, str], list[str]]:
+    """The environment the provider's child process is started with (providers/mcp.py)."""
+    from .providers.mcp import build_child_env
+
+    inherit = (provider.config.settings or {}).get("inherit_env", [])
+    return build_child_env(provider.config.env or {}, inherit if isinstance(inherit, list) else [])
+
+
+def _env_get(env: dict[str, str], name: str) -> str:
+    """Look a variable up the way the child sees it: case-insensitively on Windows, where the
+    last of several case variants wins when the process environment is built."""
+    import os
+
+    if os.name != "nt":
+        return env.get(name, "")
+    value = ""
+    for key, val in env.items():
+        if key.upper() == name.upper():
+            value = val
+    return value
+
+
+def _jdk_release(java_home: Path) -> dict[str, str] | None:
+    """Runtime version and vendor from <JAVA_HOME>/release (present in every modern JDK)."""
+    try:
+        text = (java_home / "release").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    values = {}
+    for line in text.splitlines():
+        key, _, val = line.partition("=")
+        if key.strip() in {"JAVA_RUNTIME_VERSION", "JAVA_VERSION", "IMPLEMENTOR"}:
+            values[key.strip()] = val.strip().strip('"')
+    return values or None
+
+
+def _read_ghidra_properties(path: Path) -> dict[str, str] | None:
+    """Read and hash the file on every check (about 1 KB), so no replacement can go unnoticed."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    values: dict[str, str] = {}
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "!")) or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        values[key.strip()] = val.strip()
+    if values.get("application.name") != "Ghidra" or not values.get("application.version"):
+        return None
+    if not (values.get("application.build.date") or values.get("application.revision.ghidra")):
+        return None
+    out = {key: values.get(key, "") for key in _GHIDRA_KEYS}
+    out["sha256"] = hashlib.sha256(data).hexdigest()
+    return out

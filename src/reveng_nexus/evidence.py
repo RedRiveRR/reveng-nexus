@@ -10,10 +10,20 @@ Evidence kinds
 
 Validation status: ``unverified`` → ``corroborated`` / ``contradicted`` / ``verified`` /
 ``rejected`` / ``resolved``. Only an explicit review sets ``verified`` or ``rejected``.
+
+Questions (schema v3)
+---------------------
+An investigation question (an "unknown") stays visible until evidence answers it. Status:
+``open`` (unanswered) · ``investigating`` · ``partial`` · ``blocked`` · ``contradicted`` ·
+``resolved``. ``resolved`` needs an answer and supporting evidence that is not AI-generated
+alone, with no contradicting evidence still standing; ``contradicted`` needs contradicting
+evidence; ``partial`` needs some supporting evidence; ``blocked`` needs a reason. Every
+update names the revision it read, so a stale writer gets a conflict instead of overwriting.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -21,11 +31,12 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .errors import ArgumentError, NotFound, WorkspaceViolation
+from .errors import ArgumentError, NotFound, RevisionConflict, WorkspaceViolation
 
 _TARGET_ID = re.compile(r"^[0-9a-f]{64}$")
 _CASE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{2,63}$")
@@ -37,8 +48,18 @@ _STATUSES = VALIDATION_STATUSES
 LINK_RELATIONS = {"derived_from", "input_to", "agrees_with", "contradicts", "supports", "same_subject"}
 FINDING_SEVERITIES = {"info", "low", "medium", "high", "critical"}
 FINDING_STATUSES = {"hypothesis", "needs_review", "confirmed", "rejected"}
+QUESTION_STATUSES = ("open", "investigating", "partial", "blocked", "contradicted", "resolved")
+QUESTION_INITIAL_STATUSES = {"open", "investigating", "blocked"}
+# Evidence produced from the artifact's bytes or by an analysis engine. Only this kind can resolve a
+# question: agent notes and AI output are interpretation, and nexus_review cannot authenticate who
+# reviews (any MCP caller, including the agent that wrote a note, can call it), so a review never
+# turns interpretation into source evidence.
+SOURCE_KINDS = frozenset({"direct_observation", "engine_derived"})
+PAGE_CHAR_BUDGET = 150_000  # serialized characters per evidence page (tool responses are capped at 200,000)
+BRIEF_HARD_CAP = 100  # critical/high findings a case brief always lists
+QUESTION_LIST_IDS = 20  # evidence ids per role in listings; the full set is in nexus_list_questions(question_id)
 DEFAULT_CASE = "default"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 _EVIDENCE_COLUMNS = (
     "evidence_id, case_id, target_id, provider_id, tool_name, operation, subject, subject_type, "
@@ -58,6 +79,28 @@ def _new_id(prefix: str) -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _sql_statements(script: str) -> list[str]:
+    """Split a migration script into complete statements (run one by one inside a transaction)."""
+    statements: list[str] = []
+    buffer = ""
+    for part in script.split(";"):
+        buffer += part + ";"
+        if sqlite3.complete_statement(buffer):
+            if buffer.strip(" \t\r\n;"):
+                statements.append(buffer.strip())
+            buffer = ""
+    if buffer.strip(" \t\r\n;"):
+        raise ValueError("migration script ends with an incomplete statement")
+    return statements
+
+
+def _count(values: Iterator[Any] | list[Any]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for value in values:
+        out[value] = out.get(value, 0) + 1
+    return out
 
 
 def _loads(value: str | None) -> Any:
@@ -198,7 +241,76 @@ MIGRATIONS: dict[int, str] = {
             created_at TEXT NOT NULL
         );
     """,
+    3: """
+        CREATE TABLE IF NOT EXISTS questions (
+            question_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
+            target_id TEXT REFERENCES targets(target_id) ON DELETE CASCADE,
+            question TEXT NOT NULL,
+            status TEXT NOT NULL,
+            required INTEGER NOT NULL DEFAULT 1,
+            needed_evidence TEXT NOT NULL DEFAULT '',
+            search_boundary TEXT NOT NULL DEFAULT '',
+            answer TEXT NOT NULL DEFAULT '',
+            revision INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_questions_case ON questions(case_id, status);
+        CREATE INDEX IF NOT EXISTS idx_questions_target ON questions(target_id, status);
+        CREATE TABLE IF NOT EXISTS question_evidence (
+            question_id TEXT NOT NULL REFERENCES questions(question_id) ON DELETE CASCADE,
+            evidence_id TEXT NOT NULL REFERENCES evidence(evidence_id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            added_revision INTEGER NOT NULL,
+            PRIMARY KEY (question_id, evidence_id, role)
+        );
+        CREATE TABLE IF NOT EXISTS question_history (
+            question_id TEXT NOT NULL REFERENCES questions(question_id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            answer TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            basis_json TEXT,
+            required INTEGER,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (question_id, revision)
+        );
+    """,
+    4: """
+        ALTER TABLE evidence ADD COLUMN reuse_key TEXT;
+        ALTER TABLE evidence ADD COLUMN params_hash TEXT;
+        CREATE INDEX IF NOT EXISTS idx_evidence_reuse ON evidence(reuse_key, case_id);
+        CREATE TABLE IF NOT EXISTS idempotency_keys (
+            tool TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            result_type TEXT NOT NULL,
+            result_id TEXT NOT NULL,
+            warnings_json TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tool, idempotency_key)
+        );
+        CREATE TABLE IF NOT EXISTS reuse_blocks (
+            provider_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (provider_id, target_id)
+        );
+    """,
 }
+
+
+@dataclass(frozen=True)
+class Idempotency:
+    """A client-chosen key for one write. A retry with the same key and the same arguments
+    returns the original result instead of writing again; the same key with different
+    arguments is refused. The key row is written in the same transaction as the record."""
+
+    tool: str
+    key: str
+    request_hash: str
 
 
 class EvidenceStore:
@@ -238,41 +350,120 @@ class EvidenceStore:
             connection.close()
 
     def _initialize(self) -> None:
-        with self._connection() as connection:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-            )
-            applied = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
-            if not applied:
-                # A 0.1 database has tables but no migration ledger: treat v1 as applied.
-                has_v1 = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence'"
-                ).fetchone()
-                if has_v1:
-                    connection.execute("INSERT INTO schema_migrations VALUES (1, ?)", (_now(),))
-                    applied = {1}
-        for version in sorted(MIGRATIONS):
-            if version in applied:
-                continue
-            connection = self._connect()
-            try:
-                connection.executescript("BEGIN;" + MIGRATIONS[version] + "COMMIT;")
-                connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", (version, _now()))
-                connection.commit()
-            except sqlite3.Error:
-                connection.rollback()
-                raise
-            finally:
-                connection.close()
+        # Pending migrations run in one IMMEDIATE transaction that re-reads the ledger under the
+        # write lock: two processes opening an old database at once cannot both apply a version,
+        # and a failure leaves neither the schema change nor its ledger row behind.
+        connection = self._connect()
+        connection.isolation_level = None  # explicit BEGIN/COMMIT; executescript would commit implicitly
+        try:
+            if self._pending_migrations(connection):
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for version in self._pending_migrations(connection):
+                        for statement in _sql_statements(MIGRATIONS[version]):
+                            connection.execute(statement)
+                        connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", (version, _now()))
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        finally:
+            connection.close()
         try:
             self.database_path.chmod(0o600)
         except OSError:
             pass
 
+    @staticmethod
+    def _pending_migrations(connection: sqlite3.Connection) -> list[int]:
+        ledger = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        ).fetchone()
+        applied = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")} if ledger else set()
+        if (
+            not applied
+            and connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence'").fetchone()
+        ):
+            # A 0.1 database has tables but no migration ledger: v1 is already in place.
+            applied = {1}
+        pending = [v for v in sorted(MIGRATIONS) if v not in applied]
+        if pending and connection.in_transaction:
+            # Inside the write transaction: create the ledger (and record a 0.1 database's v1).
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            if applied == {1} and not connection.execute("SELECT 1 FROM schema_migrations").fetchone():
+                connection.execute("INSERT INTO schema_migrations VALUES (1, ?)", (_now(),))
+        return pending
+
     def schema_version(self) -> int:
         with self._connection() as connection:
             row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
         return int(row[0] or 0)
+
+    # -- idempotent writes -------------------------------------------------------------
+    def _prior_write(self, idem: Idempotency | None) -> dict[str, Any] | None:
+        if idem is None:
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM idempotency_keys WHERE tool = ? AND idempotency_key = ?", (idem.tool, idem.key)
+            ).fetchone()
+        if row is None:
+            return None
+        if row["request_hash"] != idem.request_hash:
+            raise ArgumentError(
+                f"idempotency_key {idem.key!r} was already used for {idem.tool} with different arguments; "
+                "use a new key for a different request"
+            )
+        return dict(row)
+
+    def _remember_warnings(self, idem: Idempotency | None, warnings: list[str]) -> None:
+        """Keep the warnings the original write returned, so a replay repeats them."""
+        if idem is not None and warnings:
+            with self._connection() as connection:
+                connection.execute(
+                    "UPDATE idempotency_keys SET warnings_json = ? WHERE tool = ? AND idempotency_key = ?",
+                    (_json(warnings), idem.tool, idem.key),
+                )
+
+    @staticmethod
+    def _claim_key(connection: sqlite3.Connection, idem: Idempotency | None, result_type: str, result_id: str) -> None:
+        if idem is not None:
+            connection.execute(
+                "INSERT INTO idempotency_keys (tool, idempotency_key, request_hash, result_type, result_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (idem.tool, idem.key, idem.request_hash, result_type, result_id, _now()),
+            )
+
+    def _replay(self, prior: dict[str, Any]) -> dict[str, Any]:
+        """The current state of the record an earlier write with this key produced."""
+        kind, rid = prior["result_type"], prior["result_id"]
+        if kind == "finding":
+            out = self.get_finding(rid)
+        elif kind == "evidence":
+            out = self.get_evidence_record(rid)
+            out.pop("excerpt", None)
+        elif kind == "question":
+            out = self.get_question(rid, history_limit=0)
+        else:
+            with self._connection() as connection:
+                row = connection.execute(
+                    "SELECT review_id, subject_type, subject_id, status FROM reviews WHERE review_id = ?", (rid,)
+                ).fetchone()
+            if row is None:
+                raise NotFound(f"review {rid!r} not found")
+            out = dict(row)
+        out["idempotent_replay"] = True
+        out["original_write_at"] = prior["created_at"]
+        if prior.get("warnings_json"):
+            out["warnings"] = _loads(prior["warnings_json"])
+        return out
+
+    def _after_race(self, idem: Idempotency | None) -> dict[str, Any] | None:
+        """A concurrent write with the same key won the unique constraint: return its result."""
+        prior = self._prior_write(idem)
+        return self._replay(prior) if prior else None
 
     # -- cases ----------------------------------------------------------------
     def create_case(self, title: str, description: str = "", case_id: str | None = None) -> dict[str, Any]:
@@ -462,7 +653,13 @@ class EvidenceStore:
         classification: str = "observation",
         status: str = "unverified",
         excerpt: str = "",
+        reuse_key: str | None = None,
+        params_hash: str | None = None,
+        idempotency: Idempotency | None = None,
     ) -> dict[str, Any]:
+        prior = self._prior_write(idempotency)
+        if prior:
+            return self._replay(prior)
         tid = target_id.lower()
         if not _TARGET_ID.fullmatch(tid):
             raise ArgumentError("target_id must be a SHA-256 hex digest")
@@ -485,43 +682,111 @@ class EvidenceStore:
                 warns.append(f"raw output truncated to {raw_limit_bytes} bytes for storage (hash covers full output)")
         evidence_id = _new_id("ev")
         now = _now()
-        with self._connection() as connection:
-            if connection.execute("SELECT 1 FROM targets WHERE target_id = ?", (tid,)).fetchone() is None:
-                raise NotFound("Unknown target_id; register the file first.")
-            connection.execute(
-                """INSERT INTO evidence (evidence_id, case_id, target_id, provider_id, tool_name, operation,
-                       subject, subject_type, subject_address, subject_name, claim, excerpt, classification,
-                       evidence_kind, confidence, status, engine, engine_family, engine_version, raw_sha256,
-                       normalized_json, warnings_json, model_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    evidence_id,
-                    cid,
-                    tid,
-                    provider_id[:128],
-                    tool_name[:256],
-                    operation[:128],
-                    subject[:512],
-                    subject_type[:64],
-                    subject_address,
-                    (subject_name or None),
-                    claim[:4000],
-                    excerpt[:12000],
-                    classification,
-                    evidence_kind,
-                    confidence,
-                    status,
-                    engine,
-                    engine_family,
-                    engine_version,
-                    raw_sha,
-                    _json(normalized) if normalized is not None else None,
-                    _json(warns) if warns else None,
-                    _json(model) if model else None,
-                    now,
-                ),
-            )
+        try:
+            with self._connection() as connection:
+                if reuse_key:
+                    # Take the write lock before the block check, so a block committed by a concurrent
+                    # raw mutation is either seen here or clears this row's key afterwards
+                    # (invalidate_reuse writes the block and clears keys in one transaction).
+                    connection.execute("BEGIN IMMEDIATE")
+                if connection.execute("SELECT 1 FROM targets WHERE target_id = ?", (tid,)).fetchone() is None:
+                    raise NotFound("Unknown target_id; register the file first.")
+                self._claim_key(connection, idempotency, "evidence", evidence_id)
+                if reuse_key and self._blocked(connection, provider_id, tid):
+                    # The provider's analysis state for this target was changed by a raw call: a
+                    # result derived from it may not be reproducible (unsaved state, restarts).
+                    reuse_key = params_hash = None
+                connection.execute(
+                    """INSERT INTO evidence (evidence_id, case_id, target_id, provider_id, tool_name, operation,
+                           subject, subject_type, subject_address, subject_name, claim, excerpt, classification,
+                           evidence_kind, confidence, status, engine, engine_family, engine_version, raw_sha256,
+                           normalized_json, warnings_json, model_json, created_at, reuse_key, params_hash)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        evidence_id,
+                        cid,
+                        tid,
+                        provider_id[:128],
+                        tool_name[:256],
+                        operation[:128],
+                        subject[:512],
+                        subject_type[:64],
+                        subject_address,
+                        (subject_name or None),
+                        claim[:4000],
+                        excerpt[:12000],
+                        classification,
+                        evidence_kind,
+                        confidence,
+                        status,
+                        engine,
+                        engine_family,
+                        engine_version,
+                        raw_sha,
+                        _json(normalized) if normalized is not None else None,
+                        _json(warns) if warns else None,
+                        _json(model) if model else None,
+                        now,
+                        reuse_key,
+                        params_hash,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            replay = self._after_race(idempotency)
+            if replay is None:
+                raise
+            return replay
         return self.get_evidence_record(evidence_id)
+
+    def invalidate_reuse(self, provider_id: str, target_id: str | None = None, reason: str = "") -> int:
+        """A raw call changed (or may have changed) the provider's analysis state.
+
+        Stored results of the provider (for one target, or all targets of a shared server) stop
+        being handed out, and a persisted block keeps later results from becoming reusable: once
+        the engine's state has been mutated, a result derived from it depends on state Nexus
+        cannot identify (an unsaved change can be lost on a restart or rebuild). Only the reuse
+        marker is cleared; the evidence records themselves are not changed.
+        """
+        tid = target_id.lower() if target_id else "*"
+        sql = "UPDATE evidence SET reuse_key = NULL WHERE provider_id = ? AND reuse_key IS NOT NULL"
+        values: list[Any] = [provider_id]
+        if target_id:
+            sql += " AND target_id = ?"
+            values.append(tid)
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO reuse_blocks (provider_id, target_id, reason, created_at) VALUES (?, ?, ?, ?)",
+                (provider_id, tid, reason[:500], _now()),
+            )
+            return connection.execute(sql, values).rowcount
+
+    @staticmethod
+    def _blocked(connection: sqlite3.Connection, provider_id: str, target_id: str) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT reason, created_at FROM reuse_blocks WHERE provider_id = ? AND target_id IN (?, '*') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (provider_id, target_id.lower()),
+        ).fetchone()
+
+    def reuse_block(self, provider_id: str, target_id: str) -> dict[str, Any] | None:
+        """Why results of this provider for this target are not reusable, if they are not."""
+        with self._connection() as connection:
+            row = self._blocked(connection, provider_id, target_id)
+        return dict(row) if row else None
+
+    def find_reusable(
+        self, reuse_key: str, case_id: str, target_id: str, provider_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """The newest evidence produced under this reuse key in this case, unless rejected or contradicted."""
+        with self._connection() as connection:
+            if provider_id and self._blocked(connection, provider_id, target_id):
+                return None
+            row = connection.execute(
+                "SELECT evidence_id FROM evidence WHERE reuse_key = ? AND case_id = ? AND target_id = ? "
+                "AND status NOT IN ('rejected', 'contradicted') ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (reuse_key, case_id, target_id.lower()),
+            ).fetchone()
+        return self.get_evidence_record(row[0]) if row else None
 
     def record_evidence(
         self,
@@ -536,6 +801,7 @@ class EvidenceStore:
         confidence: str = "medium",
         case_id: str | None = None,
         subject_address: int | None = None,
+        idempotency: Idempotency | None = None,
     ) -> dict[str, Any]:
         """Agent/analyst-submitted note (kept compatible with the 0.1 API)."""
         if not _TARGET_ID.fullmatch(target_id.lower()):
@@ -568,6 +834,7 @@ class EvidenceStore:
             classification=classification,
             confidence=confidence,
             excerpt=excerpt,
+            idempotency=idempotency,
         )
         record.pop("excerpt", None)
         return record
@@ -624,6 +891,34 @@ class EvidenceStore:
         limit: int = 50,
         include_normalized: bool = False,
     ) -> list[dict[str, Any]]:
+        filters, values = self._evidence_filters(
+            target_id, case_id, status, evidence_kind, operation, subject_address, subject_name
+        )
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+        values.append(max(1, min(int(limit), 500)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT {_EVIDENCE_COLUMNS} FROM evidence {where_sql} ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                values,
+            ).fetchall()
+        out = []
+        for row in rows:
+            record = self._decode_row(row)
+            if not include_normalized:
+                record.pop("normalized", None)
+            out.append(record)
+        return out
+
+    @staticmethod
+    def _evidence_filters(
+        target_id: str | None,
+        case_id: str | None,
+        status: str | None,
+        evidence_kind: str | None,
+        operation: str | None,
+        subject_address: int | None,
+        subject_name: str | None,
+    ) -> tuple[list[str], list[Any]]:
         filters: list[str] = []
         values: list[Any] = []
         if target_id:
@@ -648,20 +943,114 @@ class EvidenceStore:
         if subject_name:
             filters.append("subject_name = ?")
             values.append(subject_name)
+        return filters, values
+
+    @staticmethod
+    def _cursor(created_at: str, rowid: int, scope: str) -> str:
+        payload = _json({"v": 1, "c": created_at, "r": rowid, "s": scope}).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _read_cursor(cursor: str, scope: str) -> tuple[str, int]:
+        try:
+            raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            data = json.loads(raw)
+            created_at, rowid, cursor_scope = data["c"], data["r"], data["s"]
+            if data.get("v") != 1 or not isinstance(created_at, str) or not isinstance(rowid, int):
+                raise ValueError
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ArgumentError("cursor is not a value returned by this tool") from exc
+        if cursor_scope != scope:
+            raise ArgumentError("cursor belongs to a query with different filters; restart without a cursor")
+        return created_at, rowid
+
+    @staticmethod
+    def _evidence_summary(record: dict[str, Any]) -> dict[str, Any]:
+        """One line of provenance per record; the full record is one nexus_get_evidence(evidence_id) away."""
+        claim = record.get("claim") or ""
+        return {
+            "evidence_id": record["evidence_id"],
+            "operation": record.get("operation"),
+            "provider_id": record["provider_id"],
+            "tool_name": record["tool_name"][:128],
+            "engine_family": record.get("engine_family"),
+            "evidence_kind": record["evidence_kind"],
+            "classification": record["classification"],
+            "status": record["status"],
+            "confidence": record["confidence"],
+            "subject": record["subject"][:160],
+            "subject_address": record.get("subject_address"),
+            "claim": claim[:200] + ("…" if len(claim) > 200 else ""),
+            "warning_count": len(record.get("warnings") or []),
+            "created_at": record["created_at"],
+        }
+
+    def page_evidence(
+        self,
+        *,
+        target_id: str | None = None,
+        case_id: str | None = None,
+        status: str | None = None,
+        evidence_kind: str | None = None,
+        operation: str | None = None,
+        subject_address: int | None = None,
+        subject_name: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        view: str = "standard",
+        include_normalized: bool = False,
+    ) -> dict[str, Any]:
+        """Newest-first evidence with a keyset cursor over (created_at, rowid).
+
+        The order is total and evidence is never deleted, so pages neither repeat nor skip records
+        while new evidence arrives (new records sort before the first page). This assumes one
+        writer with a monotonic clock: a record committed late by a second process with an older
+        timestamp can sort behind a cursor already handed out. ``created_at`` is compared as text
+        (Nexus writes one ISO-8601 UTC format). A cursor is bound to the filters it was issued for.
+        A page also stops at PAGE_CHAR_BUDGET serialized characters (at least one record), so it
+        fits a tool response; the cursor then continues after the last record returned.
+        """
+        if view not in {"standard", "summary"}:
+            raise ArgumentError("view must be 'standard' or 'summary'")
+        filters, values = self._evidence_filters(
+            target_id, case_id, status, evidence_kind, operation, subject_address, subject_name
+        )
+        scope = hashlib.sha256(_json([filters, values]).encode("utf-8")).hexdigest()[:16]
+        if cursor:
+            created_at, rowid = self._read_cursor(cursor, scope)
+            filters.append("(created_at < ? OR (created_at = ? AND rowid < ?))")
+            values += [created_at, created_at, rowid]
+        size = max(1, min(int(limit), 500))
         where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
-        values.append(max(1, min(int(limit), 500)))
         with self._connection() as connection:
             rows = connection.execute(
-                f"SELECT {_EVIDENCE_COLUMNS} FROM evidence {where_sql} ORDER BY created_at DESC, rowid DESC LIMIT ?",
-                values,
+                f"SELECT rowid AS row_key, {_EVIDENCE_COLUMNS} FROM evidence {where_sql} "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                [*values, size + 1],
             ).fetchall()
-        out = []
+        more = len(rows) > size
+        rows = rows[:size]
+        items: list[dict[str, Any]] = []
+        used = 0
+        size_limited = False
         for row in rows:
             record = self._decode_row(row)
-            if not include_normalized:
-                record.pop("normalized", None)
-            out.append(record)
-        return out
+            record.pop("row_key", None)
+            if view == "summary":
+                item = self._evidence_summary(record)
+            else:
+                if not include_normalized:
+                    record.pop("normalized", None)
+                item = record
+            cost = len(_json(item))
+            if items and used + cost > PAGE_CHAR_BUDGET:
+                size_limited = more = True
+                break
+            items.append(item)
+            used += cost
+        last = rows[len(items) - 1] if items else None
+        next_cursor = self._cursor(last["created_at"], last["row_key"], scope) if more and last else None
+        return {"items": items, "next_cursor": next_cursor, "has_more": more, "size_limited": size_limited}
 
     def list_evidence(
         self,
@@ -698,36 +1087,56 @@ class EvidenceStore:
             ).fetchone()
         return dict(row)
 
-    def review(self, subject_type: str, subject_id: str, status: str, note: str) -> dict[str, Any]:
-        """Record an explicit human/agent review. This is the only path to 'verified'."""
+    def review(
+        self, subject_type: str, subject_id: str, status: str, note: str, *, idempotency: Idempotency | None = None
+    ) -> dict[str, Any]:
+        """Record an explicit human/agent review. This is the only path to 'verified'.
+
+        The status change and the review row are written in one transaction.
+        """
+        prior = self._prior_write(idempotency)
+        if prior:
+            return self._replay(prior)
         note = (note or "").strip()
         if not note:
             raise ArgumentError("a review note explaining the basis of the decision is required")
-        now = _now()
         if subject_type == "evidence":
             if status not in VALIDATION_STATUSES - {"unverified"}:
                 raise ArgumentError(
                     "evidence review status must be verified, rejected, corroborated, contradicted or resolved"
                 )
-            self.update_status(subject_id, status)
+            update: tuple[str, tuple[Any, ...]] = (
+                "UPDATE evidence SET status = ? WHERE evidence_id = ?",
+                (status, subject_id),
+            )
+            missing: Exception = ValueError("Evidence id not found.")
         elif subject_type == "finding":
             if status not in FINDING_STATUSES:
                 raise ArgumentError(f"finding status must be one of {sorted(FINDING_STATUSES)}")
-            with self._connection() as connection:
-                cursor = connection.execute(
-                    "UPDATE findings SET status = ?, updated_at = ? WHERE finding_id = ?", (status, now, subject_id)
-                )
-                if cursor.rowcount == 0:
-                    raise NotFound(f"finding {subject_id!r} not found")
+            update = (
+                "UPDATE findings SET status = ?, updated_at = ? WHERE finding_id = ?",
+                (status, _now(), subject_id),
+            )
+            missing = NotFound(f"finding {subject_id!r} not found")
         else:
             raise ArgumentError("subject_type must be 'evidence' or 'finding'")
         review_id = _new_id("rv")
-        with self._connection() as connection:
-            connection.execute(
-                "INSERT INTO reviews (review_id, subject_type, subject_id, status, note, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (review_id, subject_type, subject_id, status, note[:4000], now),
-            )
+        now = _now()
+        try:
+            with self._connection() as connection:
+                if connection.execute(*update).rowcount == 0:
+                    raise missing
+                self._claim_key(connection, idempotency, "review", review_id)
+                connection.execute(
+                    "INSERT INTO reviews (review_id, subject_type, subject_id, status, note, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (review_id, subject_type, subject_id, status, note[:4000], now),
+                )
+        except sqlite3.IntegrityError:
+            replay = self._after_race(idempotency)
+            if replay is None:
+                raise
+            return replay
         return {"review_id": review_id, "subject_type": subject_type, "subject_id": subject_id, "status": status}
 
     def link(self, src_id: str, dst_id: str, relation: str, note: str = "") -> None:
@@ -810,7 +1219,11 @@ class EvidenceStore:
         confidence: str = "low",
         confidence_rationale: str = "",
         contradicting_evidence_ids: list[str] | None = None,
+        idempotency: Idempotency | None = None,
     ) -> dict[str, Any]:
+        prior = self._prior_write(idempotency)
+        if prior:
+            return self._replay(prior)
         cid = self.ensure_case(case_id)
         title, description = (title or "").strip(), (description or "").strip()
         if not title or not description:
@@ -854,7 +1267,51 @@ class EvidenceStore:
                 warnings.append("some supporting evidence is contradicted or rejected")
         finding_id = _new_id("fd")
         now = _now()
+        try:
+            self._write_finding(
+                finding_id,
+                cid,
+                target_id,
+                title,
+                description,
+                severity,
+                status,
+                confidence,
+                confidence_rationale,
+                now,
+                evidence_ids,
+                contra,
+                idempotency,
+            )
+        except sqlite3.IntegrityError:
+            replay = self._after_race(idempotency)
+            if replay is None:
+                raise
+            return replay
+        self._remember_warnings(idempotency, warnings)
+        result = self.get_finding(finding_id)
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    def _write_finding(
+        self,
+        finding_id: str,
+        cid: str,
+        target_id: str | None,
+        title: str,
+        description: str,
+        severity: str,
+        status: str,
+        confidence: str,
+        confidence_rationale: str,
+        now: str,
+        evidence_ids: list[str],
+        contra: list[str],
+        idempotency: Idempotency | None,
+    ) -> None:
         with self._connection() as connection:
+            self._claim_key(connection, idempotency, "finding", finding_id)
             connection.execute(
                 "INSERT INTO findings (finding_id, case_id, target_id, title, description, severity, status, "
                 "confidence, confidence_rationale, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -876,22 +1333,31 @@ class EvidenceStore:
                 "INSERT OR IGNORE INTO finding_evidence (finding_id, evidence_id, role) VALUES (?, ?, ?)",
                 [(finding_id, e, "supports") for e in evidence_ids] + [(finding_id, e, "contradicts") for e in contra],
             )
-        result = self.get_finding(finding_id)
-        if warnings:
-            result["warnings"] = warnings
-        return result
+
+    @staticmethod
+    def _finding_links(connection: sqlite3.Connection, finding_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """Evidence links of many findings in one query, in the order they were cited."""
+        out: dict[str, list[dict[str, Any]]] = {fid: [] for fid in finding_ids}
+        if not finding_ids:
+            return out
+        rows = connection.execute(
+            "SELECT fe.finding_id, fe.evidence_id, fe.role, e.evidence_kind, e.provider_id, e.tool_name, e.status, "
+            "e.subject FROM finding_evidence fe JOIN evidence e ON e.evidence_id = fe.evidence_id "
+            f"WHERE fe.finding_id IN ({','.join('?' * len(finding_ids))}) ORDER BY fe.rowid",
+            finding_ids,
+        ).fetchall()
+        for row in rows:
+            link = dict(row)
+            out[link.pop("finding_id")].append(link)
+        return out
 
     def get_finding(self, finding_id: str) -> dict[str, Any]:
         with self._connection() as connection:
             row = connection.execute("SELECT * FROM findings WHERE finding_id = ?", (finding_id,)).fetchone()
             if row is None:
                 raise NotFound(f"finding {finding_id!r} not found")
-            links = connection.execute(
-                "SELECT fe.evidence_id, fe.role, e.evidence_kind, e.provider_id, e.tool_name, e.status, e.subject "
-                "FROM finding_evidence fe JOIN evidence e ON e.evidence_id = fe.evidence_id WHERE fe.finding_id = ?",
-                (finding_id,),
-            ).fetchall()
-        return {**dict(row), "evidence": [dict(link) for link in links]}
+            links = self._finding_links(connection, [finding_id])[finding_id]
+        return {**dict(row), "evidence": links}
 
     def list_findings(
         self, *, case_id: str | None = None, target_id: str | None = None, status: str | None = None, limit: int = 100
@@ -912,13 +1378,782 @@ class EvidenceStore:
         where = f"WHERE {' AND '.join(filters)}" if filters else ""
         values.append(max(1, min(int(limit), 500)))
         with self._connection() as connection:
-            ids = [
+            rows = connection.execute(
+                f"SELECT * FROM findings {where} ORDER BY created_at DESC, rowid DESC LIMIT ?", values
+            ).fetchall()
+            links = self._finding_links(connection, [r["finding_id"] for r in rows])
+        return [{**dict(r), "evidence": links[r["finding_id"]]} for r in rows]
+
+    # -- questions (unknowns) ---------------------------------------------------------
+    @staticmethod
+    def _cited_evidence(connection: sqlite3.Connection, ids: list[str]) -> dict[str, dict[str, Any]]:
+        rows = (
+            connection.execute(
+                f"SELECT evidence_id, case_id, target_id, evidence_kind, status FROM evidence WHERE evidence_id IN "
+                f"({','.join('?' * len(ids))})",
+                ids,
+            ).fetchall()
+            if ids
+            else []
+        )
+        found = {r["evidence_id"]: dict(r) for r in rows}
+        missing = [eid for eid in ids if eid not in found]
+        if missing:
+            raise NotFound(f"unknown evidence ids: {missing}")
+        return found
+
+    @staticmethod
+    def _check_question_scope(
+        connection: sqlite3.Connection, case_id: str, target_id: str | None, cited: dict[str, dict[str, Any]]
+    ) -> list[str]:
+        """Cited evidence must be about the question's target, or a target of its case.
+
+        Evidence recorded under another case of the same target is allowed (it is reusable), but
+        the caller is told, because that case's report holds the record, not this one.
+        """
+        case_targets = {
+            r[0] for r in connection.execute("SELECT target_id FROM case_targets WHERE case_id = ?", (case_id,))
+        }
+        warnings: list[str] = []
+        for eid, row in cited.items():
+            if target_id and row["target_id"] != target_id:
+                raise ArgumentError(f"evidence {eid} is about a different target than the question")
+            if not target_id and row["target_id"] not in case_targets:
+                raise ArgumentError(f"evidence {eid} is about a target outside case {case_id!r}")
+            if row["case_id"] != case_id:
+                warnings.append(f"evidence {eid} was recorded under case {row['case_id']!r}, not {case_id!r}")
+        return warnings
+
+    @staticmethod
+    def _assess(
+        status: str, links: list[dict[str, Any]], linked_contra: list[dict[str, Any]]
+    ) -> tuple[list[str], list[str], dict[str, Any]]:
+        """Return (problems, warnings, basis) for a question state given its evidence as it stands now.
+
+        A problem means the evidence does not support the state: a write is refused, and a stored
+        question in that state is reported as stale. Only source evidence (SOURCE_KINDS) can resolve
+        a question; a review status never upgrades a note or AI output, because reviews are not
+        authenticated. Contradicting evidence (cited, or linked as 'contradicts' against the
+        support) blocks resolution until it is rejected; if it was source evidence, its rejection is
+        itself only an unauthenticated review, so the resolution is marked contested (it is
+        recorded, but does not count towards completion).
+        """
+        live = [link for link in links if link["status"] != "rejected"]
+        supports = [link for link in live if link["role"] == "supports" and link["status"] != "contradicted"]
+        all_contra = [link for link in links if link["role"] == "contradicts"] + linked_contra
+        contradicts = [c for c in all_contra if c["status"] != "rejected"]
+        dismissed = sorted(
+            {c["evidence_id"] for c in all_contra if c["status"] == "rejected" and c["evidence_kind"] in SOURCE_KINDS}
+        )
+        problems: list[str] = []
+        warnings: list[str] = []
+        basis: dict[str, Any] = {}
+        if status == "resolved":
+            source = [link for link in supports if link["evidence_kind"] in SOURCE_KINDS]
+            if not supports:
+                problems.append("resolved needs supporting evidence that is not rejected or contradicted")
+            elif not source:
+                problems.append(
+                    "a question can only be resolved by evidence parsed from the artifact or produced by an "
+                    "engine; agent notes and AI output never resolve one, even when reviewed (nexus_review "
+                    "cannot authenticate the reviewer)"
+                )
+            if contradicts:
+                ids = sorted({c["evidence_id"] for c in contradicts})
+                problems.append(
+                    f"contradicting evidence still stands ({ids}); review it (nexus_review status 'rejected') "
+                    "or mark the question 'contradicted'"
+                )
+            if any(link["status"] == "unverified" for link in source):
+                warnings.append("some supporting evidence is still unverified")
+            basis = {"source_evidence_ids": sorted({link["evidence_id"] for link in source})}
+            if dismissed:
+                basis["dismissed_source_contradictions"] = dismissed
+                warnings.append(
+                    f"contested: source evidence against this answer ({dismissed}) was dismissed only by "
+                    "nexus_review, which cannot prove an independent reviewer; the question does not count "
+                    "as resolved for completeness"
+                )
+        elif status == "contradicted":
+            if not contradicts:
+                problems.append("contradicted needs at least one contradicting evidence id that is not rejected")
+            elif all(c["evidence_kind"] == "ai_generated" for c in contradicts):
+                warnings.append("the only contradicting evidence is AI-generated")
+        elif status == "partial" and not supports:
+            problems.append("partial needs at least one supporting evidence id that is not rejected")
+        return problems, warnings, basis
+
+    def _gate(
+        self, status: str, answer: str, links: list[dict[str, Any]], linked_contra: list[dict[str, Any]]
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Refuse a question state its evidence does not support; return (warnings, basis) otherwise."""
+        if status in {"resolved", "partial", "blocked"} and not answer.strip():
+            what = "a reason" if status == "blocked" else "an answer"
+            raise ArgumentError(f"a {status} question needs {what}")
+        problems, warnings, basis = self._assess(status, links, linked_contra)
+        if problems:
+            raise ArgumentError("; ".join(problems))
+        return warnings, basis
+
+    @staticmethod
+    def _question_links(connection: sqlite3.Connection, question_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        out: dict[str, list[dict[str, Any]]] = {qid: [] for qid in question_ids}
+        if not question_ids:
+            return out
+        rows = connection.execute(
+            "SELECT qe.question_id, qe.evidence_id, qe.role, qe.added_revision, e.evidence_kind, e.status, "
+            "e.provider_id, e.operation, e.subject FROM question_evidence qe "
+            "JOIN evidence e ON e.evidence_id = qe.evidence_id "
+            f"WHERE qe.question_id IN ({','.join('?' * len(question_ids))}) ORDER BY qe.added_revision, qe.rowid",
+            question_ids,
+        ).fetchall()
+        for row in rows:
+            link = dict(row)
+            out[link.pop("question_id")].append(link)
+        return out
+
+    @staticmethod
+    def _linked_contradictions(
+        connection: sqlite3.Connection, links_by_question: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Evidence recorded elsewhere (evidence_links 'contradicts') against a question's support."""
+        support_ids = sorted(
+            {
+                link["evidence_id"]
+                for links in links_by_question.values()
+                for link in links
+                if link["role"] == "supports"
+            }
+        )
+        out: dict[str, list[dict[str, Any]]] = {qid: [] for qid in links_by_question}
+        if not support_ids:
+            return out
+        marks = ",".join("?" * len(support_ids))
+        rows = connection.execute(
+            "SELECT l.src_id, l.dst_id, s.evidence_kind AS src_kind, s.status AS src_status, "
+            "d.evidence_kind AS dst_kind, d.status AS dst_status FROM evidence_links l "
+            "JOIN evidence s ON s.evidence_id = l.src_id JOIN evidence d ON d.evidence_id = l.dst_id "
+            f"WHERE l.relation = 'contradicts' AND (l.src_id IN ({marks}) OR l.dst_id IN ({marks}))",
+            [*support_ids, *support_ids],
+        ).fetchall()
+        against: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            for mine, other, kind, status in (
+                (row["src_id"], row["dst_id"], row["dst_kind"], row["dst_status"]),
+                (row["dst_id"], row["src_id"], row["src_kind"], row["src_status"]),
+            ):
+                against.setdefault(mine, []).append(
+                    {"evidence_id": other, "against": mine, "evidence_kind": kind, "status": status}
+                )
+        for qid, links in links_by_question.items():
+            supports = {
+                link["evidence_id"] for link in links if link["role"] == "supports" and link["status"] != "rejected"
+            }
+            # Kept even when the opposing record is itself cited as support: citing both sides of a
+            # disagreement must not hide it.
+            out[qid] = [c for sid in sorted(supports) for c in against.get(sid, [])]
+        return out
+
+    def _question_view(
+        self, row: sqlite3.Row, links: list[dict[str, Any]], linked_contra: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        item = dict(row)
+        item["required"] = bool(item["required"])
+        item["evidence"] = links
+        item["supporting_evidence_ids"] = [x["evidence_id"] for x in links if x["role"] == "supports"]
+        item["contradicting_evidence_ids"] = [x["evidence_id"] for x in links if x["role"] == "contradicts"]
+        if linked_contra:
+            item["linked_contradictions"] = linked_contra
+        # Missing evidence stays visible: no supporting evidence that still stands.
+        item["evidence_missing"] = not any(
+            x["role"] == "supports" and x["status"] not in {"rejected", "contradicted"} for x in links
+        )
+        # Re-check the stored state against the evidence as it stands now (reviews may have
+        # rejected support since): a state its evidence no longer supports is reported as stale.
+        problems, _, basis = self._assess(item["status"], links, linked_contra)
+        item["stale"] = bool(problems)
+        if problems:
+            item["stale_reasons"] = problems
+        item["contested"] = bool(item["status"] == "resolved" and basis.get("dismissed_source_contradictions"))
+        if item["status"] == "resolved" and basis:
+            item["resolution_basis"] = basis
+        return item
+
+    def _views(self, connection: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+        ids = [r["question_id"] for r in rows]
+        links = self._question_links(connection, ids)
+        contra = self._linked_contradictions(connection, links)
+        views = [self._question_view(r, links[r["question_id"]], contra[r["question_id"]]) for r in rows]
+        # A question that was ever required stays required for every consumer (counts, checklist,
+        # brief, report), even if a database written by an earlier build stored it as optional later.
+        if ids:
+            ever = {
                 r[0]
                 for r in connection.execute(
-                    f"SELECT finding_id FROM findings {where} ORDER BY created_at DESC LIMIT ?", values
+                    f"SELECT DISTINCT question_id FROM question_history WHERE required = 1 AND question_id IN "
+                    f"({','.join('?' * len(ids))})",
+                    ids,
                 )
+            }
+            for view in views:
+                view["required"] = view["required"] or view["question_id"] in ever
+        return views
+
+    @staticmethod
+    def _compact_question(item: dict[str, Any], text_limit: int = 500) -> dict[str, Any]:
+        """A bounded listing row: ids (capped) and counts instead of per-link detail."""
+        out = {k: v for k, v in item.items() if k not in {"evidence", "linked_contradictions"}}
+        for key in ("supporting_evidence_ids", "contradicting_evidence_ids"):
+            ids = item[key]
+            out[key.replace("_ids", "_count")] = len(ids)
+            out[key] = ids[:QUESTION_LIST_IDS]
+        if item.get("linked_contradictions"):
+            out["linked_contradiction_ids"] = sorted({c["evidence_id"] for c in item["linked_contradictions"]})[
+                :QUESTION_LIST_IDS
             ]
-        return [self.get_finding(fid) for fid in ids]
+        for key in ("question", "answer", "needed_evidence", "search_boundary"):
+            if len(out.get(key) or "") > text_limit:
+                out[key] = out[key][:text_limit] + "…"
+                out.setdefault("truncated_fields", []).append(key)
+        return out
+
+    def record_question(
+        self,
+        *,
+        case_id: str | None,
+        question: str,
+        target_id: str | None = None,
+        status: str = "open",
+        required: bool = True,
+        needed_evidence: str = "",
+        search_boundary: str = "",
+        answer: str = "",
+        evidence_ids: list[str] | None = None,
+        contradicting_evidence_ids: list[str] | None = None,
+        note: str = "",
+        idempotency: Idempotency | None = None,
+    ) -> dict[str, Any]:
+        prior = self._prior_write(idempotency)
+        if prior:
+            return self._replay(prior)
+        cid = self.ensure_case(case_id)
+        question = (question or "").strip()
+        if not question:
+            raise ArgumentError("question text is required")
+        if status not in QUESTION_INITIAL_STATUSES:
+            raise ArgumentError(
+                f"a new question starts as one of {sorted(QUESTION_INITIAL_STATUSES)}; "
+                "record evidence, then move it on with nexus_update_question"
+            )
+        if target_id:
+            target_id = target_id.lower()
+            if not _TARGET_ID.fullmatch(target_id):
+                raise ArgumentError("target_id must be a SHA-256 hex digest")
+        supports, contra = list(evidence_ids or []), list(contradicting_evidence_ids or [])
+        question_id = _new_id("q")
+        now = _now()
+        try:
+            warnings = self._write_question(
+                question_id,
+                cid,
+                question,
+                target_id,
+                status,
+                required,
+                needed_evidence,
+                search_boundary,
+                answer,
+                supports,
+                contra,
+                note,
+                now,
+                idempotency,
+            )
+        except sqlite3.IntegrityError:
+            replay = self._after_race(idempotency)
+            if replay is None:
+                raise
+            return replay
+        self._remember_warnings(idempotency, warnings)
+        result = self.get_question(question_id, history_limit=0)
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    def _write_question(
+        self,
+        question_id: str,
+        cid: str,
+        question: str,
+        target_id: str | None,
+        status: str,
+        required: bool,
+        needed_evidence: str,
+        search_boundary: str,
+        answer: str,
+        supports: list[str],
+        contra: list[str],
+        note: str,
+        now: str,
+        idempotency: Idempotency | None,
+    ) -> list[str]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._claim_key(connection, idempotency, "question", question_id)
+            if (
+                target_id
+                and not connection.execute(
+                    "SELECT 1 FROM case_targets WHERE case_id = ? AND target_id = ?", (cid, target_id)
+                ).fetchone()
+            ):
+                raise ArgumentError(f"target is not part of case {cid!r}")
+            cited = self._cited_evidence(connection, [*supports, *contra])
+            warnings = self._check_question_scope(connection, cid, target_id, cited)
+            links = [{**cited[e], "role": "supports"} for e in supports] + [
+                {**cited[e], "role": "contradicts"} for e in contra
+            ]
+            linked = self._linked_contradictions(connection, {question_id: links})[question_id]
+            gate_warnings, basis = self._gate(status, answer, links, linked)
+            warnings += gate_warnings
+            connection.execute(
+                "INSERT INTO questions (question_id, case_id, target_id, question, status, required, needed_evidence, "
+                "search_boundary, answer, revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    question_id,
+                    cid,
+                    target_id,
+                    question[:2000],
+                    status,
+                    int(bool(required)),
+                    needed_evidence[:2000],
+                    search_boundary[:2000],
+                    answer[:4000],
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO question_evidence (question_id, evidence_id, role, added_revision) "
+                "VALUES (?, ?, ?, 1)",
+                [(question_id, link["evidence_id"], link["role"]) for link in links],
+            )
+            connection.execute(
+                "INSERT INTO question_history (question_id, revision, status, answer, note, basis_json, required, "
+                "created_at) VALUES (?, 1, ?, ?, ?, ?, ?, ?)",
+                (
+                    question_id,
+                    status,
+                    answer[:4000],
+                    note[:2000],
+                    _json(basis) if basis else None,
+                    int(bool(required)),
+                    now,
+                ),
+            )
+        return warnings
+
+    def update_question(
+        self,
+        question_id: str,
+        *,
+        expected_revision: int,
+        status: str | None = None,
+        answer: str | None = None,
+        evidence_ids: list[str] | None = None,
+        contradicting_evidence_ids: list[str] | None = None,
+        needed_evidence: str | None = None,
+        search_boundary: str | None = None,
+        required: bool | None = None,
+        note: str = "",
+        idempotency: Idempotency | None = None,
+    ) -> dict[str, Any]:
+        """Move a question on. Fails with a revision conflict if it changed since ``expected_revision``.
+
+        With an idempotency key, a retry of an update that already went through returns the
+        question as it is now (flagged) instead of a revision conflict.
+        """
+        prior = self._prior_write(idempotency)
+        if prior:
+            return self._replay(prior)
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+            raise ArgumentError("expected_revision must be the integer revision you last read")
+        if status is not None and status not in QUESTION_STATUSES:
+            raise ArgumentError(f"status must be one of {list(QUESTION_STATUSES)}")
+        supports, contra = list(evidence_ids or []), list(contradicting_evidence_ids or [])
+        changes = (status, answer, needed_evidence, search_boundary, required)
+        if all(value is None for value in changes) and not supports and not contra:
+            raise ArgumentError("nothing to update")
+        now = _now()
+        with self._connection() as connection:
+            # Take the write lock before reading so the revision check and the write are one step.
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM questions WHERE question_id = ?", (question_id,)).fetchone()
+            if row is None:
+                raise NotFound(f"question {question_id!r} not found")
+            if (
+                idempotency is not None
+                and connection.execute(
+                    "SELECT 1 FROM idempotency_keys WHERE tool = ? AND idempotency_key = ?",
+                    (idempotency.tool, idempotency.key),
+                ).fetchone()
+            ):
+                # A concurrent retry with this key committed first: report its result.
+                return self._replay(self._prior_write(idempotency) or {})
+            self._claim_key(connection, idempotency, "question", question_id)
+            if row["revision"] != expected_revision:
+                raise RevisionConflict(
+                    f"question {question_id!r} is at revision {row['revision']}, not {expected_revision}; "
+                    "re-read it and apply your change to the current state",
+                    details={
+                        "current_revision": row["revision"],
+                        "status": row["status"],
+                        "updated_at": row["updated_at"],
+                    },
+                )
+            cited = self._cited_evidence(connection, [*supports, *contra])
+            warnings = self._check_question_scope(connection, row["case_id"], row["target_id"], cited)
+            new_revision = row["revision"] + 1
+            connection.executemany(
+                "INSERT OR IGNORE INTO question_evidence (question_id, evidence_id, role, added_revision) "
+                "VALUES (?, ?, ?, ?)",
+                [(question_id, e, "supports", new_revision) for e in supports]
+                + [(question_id, e, "contradicts", new_revision) for e in contra],
+            )
+            links = self._question_links(connection, [question_id])
+            linked = self._linked_contradictions(connection, links)[question_id]
+            new_status = status or row["status"]
+            new_answer = row["answer"] if answer is None else answer[:4000]
+            # The gate runs on the resulting state even when the status is unchanged, so new
+            # contradicting evidence cannot be attached to a resolved question silently.
+            gate_warnings, basis = self._gate(new_status, new_answer, links[question_id], linked)
+            warnings += gate_warnings
+            new_required = bool(row["required"]) if required is None else bool(required)
+            if row["required"] and not new_required:
+                # Requiredness only ever increases. Relaxing it could take the question out of the
+                # completeness count (e.g. resolve -> optional -> reopen), and no caller of this
+                # interface can be authenticated as an operator entitled to waive it.
+                raise ArgumentError(
+                    "a required question cannot be made optional (requiredness only increases through this "
+                    "interface); mark it 'blocked' with a reason instead, which keeps it visible as incomplete",
+                    details={"rule": "required_is_monotonic", "question_id": question_id},
+                )
+            cursor = connection.execute(
+                "UPDATE questions SET status = ?, answer = ?, needed_evidence = ?, search_boundary = ?, required = ?, "
+                "revision = ?, updated_at = ? WHERE question_id = ? AND revision = ?",
+                (
+                    new_status,
+                    new_answer,
+                    row["needed_evidence"] if needed_evidence is None else needed_evidence[:2000],
+                    row["search_boundary"] if search_boundary is None else search_boundary[:2000],
+                    int(new_required),
+                    new_revision,
+                    now,
+                    question_id,
+                    row["revision"],
+                ),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - guarded by BEGIN IMMEDIATE
+                raise RevisionConflict(f"question {question_id!r} changed during the update; re-read it")
+            connection.execute(
+                "INSERT INTO question_history (question_id, revision, status, answer, note, basis_json, required, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    question_id,
+                    new_revision,
+                    new_status,
+                    new_answer,
+                    note[:2000],
+                    _json(basis) if basis else None,
+                    int(new_required),
+                    now,
+                ),
+            )
+        self._remember_warnings(idempotency, warnings)
+        result = self.get_question(question_id, history_limit=0)
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    def get_question(self, question_id: str, *, history_limit: int = 10) -> dict[str, Any]:
+        """One question with full link detail and its newest ``history_limit`` revisions (oldest first)."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM questions WHERE question_id = ?", (question_id,)).fetchone()
+            if row is None:
+                raise NotFound(f"question {question_id!r} not found")
+            item = self._views(connection, [row])[0]
+            item["history_count"] = row["revision"]
+            limit = max(0, min(int(history_limit), 100))
+            if limit:
+                item["history"] = [
+                    dict(r)
+                    for r in connection.execute(
+                        "SELECT revision, status, answer, note, basis_json, required, created_at FROM question_history "
+                        "WHERE question_id = ? ORDER BY revision DESC LIMIT ?",
+                        (question_id, limit),
+                    )
+                ][::-1]
+        return item
+
+    def list_questions(
+        self,
+        *,
+        case_id: str | None = None,
+        target_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Questions in creation order (a checklist): compact rows with capped evidence ids and counts.
+
+        Questions are never deleted and new ones sort last, so ``offset`` paging is stable.
+        """
+        filters, values = self._question_filters(case_id, target_id)
+        if status:
+            if status not in QUESTION_STATUSES:
+                raise ArgumentError(f"status must be one of {list(QUESTION_STATUSES)}")
+            filters.append("status = ?")
+            values.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        values += [max(1, min(int(limit), 200)), max(0, int(offset))]
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM questions {where} ORDER BY created_at, rowid LIMIT ? OFFSET ?", values
+            ).fetchall()
+            return [self._compact_question(view) for view in self._views(connection, rows)]
+
+    def _all_questions(self, case_id: str) -> list[dict[str, Any]]:
+        """Every question of a case (a report must not drop rows), read in pages of 200."""
+        out: list[dict[str, Any]] = []
+        while True:
+            page = self.list_questions(case_id=case_id, limit=200, offset=len(out))
+            out += page
+            if len(page) < 200:
+                return out
+
+    @staticmethod
+    def _question_filters(case_id: str | None, target_id: str | None) -> tuple[list[str], list[Any]]:
+        filters: list[str] = []
+        values: list[Any] = []
+        if case_id:
+            filters.append("case_id = ?")
+            values.append(case_id)
+        if target_id:
+            if not _TARGET_ID.fullmatch(target_id.lower()):
+                raise ArgumentError("target_id must be a SHA-256 hex digest.")
+            filters.append("target_id = ?")
+            values.append(target_id.lower())
+        return filters, values
+
+    def question_counts(self, *, case_id: str | None = None, target_id: str | None = None) -> dict[str, Any]:
+        """Counts by stored status over all matching questions (not limited).
+
+        A question whose stored state its evidence no longer supports is counted as ``stale``, and
+        a stale or unresolved required question keeps the investigation incomplete.
+        """
+        filters, values = self._question_filters(case_id, target_id)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with self._connection() as connection:
+            rows = connection.execute(f"SELECT * FROM questions {where}", values).fetchall()
+            views = self._views(connection, rows)
+        by_status = dict.fromkeys(QUESTION_STATUSES, 0)
+        for view in views:
+            by_status[view["status"]] += 1
+        unresolved = [v for v in views if v["status"] != "resolved" or v["stale"] or v["contested"]]
+        required_unresolved = sum(1 for v in unresolved if v["required"])
+        return {
+            "total": len(views),
+            "by_status": by_status,
+            "stale": sum(1 for v in views if v["stale"]),
+            "contested": sum(1 for v in views if v["contested"]),
+            "unresolved": len(unresolved),
+            "required_unresolved": required_unresolved,
+            "complete": bool(views) and required_unresolved == 0,
+        }
+
+    def evidence_overview(self, target_id: str) -> list[dict[str, Any]]:
+        """Per-operation evidence counts for one target, with the newest evidence id of each."""
+        tid = target_id.lower()
+        if not _TARGET_ID.fullmatch(tid):
+            raise ArgumentError("target_id must be a SHA-256 hex digest.")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT operation, evidence_kind, provider_id, evidence_id, created_at, n FROM ("
+                "  SELECT operation, evidence_kind, provider_id, evidence_id, created_at,"
+                "         COUNT(*) OVER (PARTITION BY operation) AS n,"
+                "         ROW_NUMBER() OVER (PARTITION BY operation ORDER BY created_at DESC, rowid DESC) AS rn"
+                "  FROM evidence WHERE target_id = ?"
+                ") WHERE rn = 1 ORDER BY operation",
+                (tid,),
+            ).fetchall()
+        return [
+            {
+                "operation": r["operation"],
+                "count": r["n"],
+                "latest_evidence_id": r["evidence_id"],
+                "latest_kind": r["evidence_kind"],
+                "latest_provider_id": r["provider_id"],
+                "latest_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    # -- compact case brief ----------------------------------------------------------
+    def case_brief(
+        self, *, case_id: str | None = None, target_id: str | None = None, limit: int = 20
+    ) -> dict[str, Any]:
+        """A bounded summary to hand to a delegated agent: counts over everything, ids for detail.
+
+        Counts always cover every matching record. Lists are capped at ``limit``, except that every
+        critical/high finding that is not rejected is listed (up to BRIEF_HARD_CAP), and whatever a
+        list leaves out is reported in ``omitted`` rather than dropped silently.
+        """
+        if not case_id and not target_id:
+            raise ArgumentError("give case_id or target")
+        size = max(1, min(int(limit), 100))
+        brief: dict[str, Any] = {"scope": {"case_id": case_id, "target": target_id.lower() if target_id else None}}
+        if case_id:
+            case = self.get_case(case_id)
+            brief["case"] = {"case_id": case["case_id"], "title": case["title"]}
+            targets = case["targets"]
+            if target_id:
+                targets = [t for t in targets if t["target_id"] == target_id.lower()]
+                if not targets:
+                    raise ArgumentError(f"target is not part of case {case_id!r}")
+        else:
+            targets = [self.get_target(target_id or "")]
+        brief["targets"] = [
+            {k: t.get(k) for k in ("target_id", "display_name", "format", "kind")} for t in targets[:size]
+        ]
+        omitted: dict[str, int] = {}
+        if len(targets) > size:
+            omitted["targets"] = len(targets) - size
+        ev_filters, ev_values = self._evidence_filters(target_id, case_id, None, None, None, None, None)
+        ev_where = f"WHERE {' AND '.join(ev_filters)}" if ev_filters else ""
+        # A finding belongs to a target if it names it, cites evidence about it, or is a case-level
+        # finding without evidence in one of the target's cases (findings.target_id only holds the
+        # target of the first cited evidence).
+        fd_filters: list[str] = []
+        fd_values: list[Any] = []
+        if case_id:
+            fd_filters.append("f.case_id = ?")
+            fd_values.append(case_id)
+        if target_id:
+            tid = target_id.lower()
+            fd_filters.append(
+                "(f.target_id = ? OR EXISTS (SELECT 1 FROM finding_evidence x JOIN evidence e "
+                "ON e.evidence_id = x.evidence_id WHERE x.finding_id = f.finding_id AND e.target_id = ?) "
+                "OR (f.target_id IS NULL AND NOT EXISTS (SELECT 1 FROM finding_evidence y WHERE y.finding_id = "
+                "f.finding_id) AND f.case_id IN (SELECT case_id FROM case_targets WHERE target_id = ?)))"
+            )
+            fd_values += [tid, tid, tid]
+        fd_where = f"WHERE {' AND '.join(fd_filters)}" if fd_filters else ""
+        with self._connection() as connection:
+            kinds = connection.execute(
+                f"SELECT evidence_kind, status, COUNT(*) AS n, MAX(created_at) AS last FROM evidence {ev_where} "
+                "GROUP BY evidence_kind, status",
+                ev_values,
+            ).fetchall()
+            operations = connection.execute(
+                f"SELECT operation, COUNT(*) AS n, MAX(created_at) AS last FROM evidence {ev_where} "
+                "GROUP BY operation ORDER BY n DESC, operation",
+                ev_values,
+            ).fetchall()
+            contradiction_count = connection.execute(
+                f"SELECT COUNT(*) FROM evidence {ev_where} {'AND' if ev_where else 'WHERE'} "
+                "(status = 'contradicted' OR classification = 'contradiction')",
+                ev_values,
+            ).fetchone()[0]
+            comparisons = connection.execute(
+                f"SELECT assessment, COUNT(*) AS n FROM comparisons {ev_where} GROUP BY assessment", ev_values
+            ).fetchall()
+            findings = connection.execute(
+                "SELECT f.finding_id, f.title, f.severity, f.status, f.confidence, f.target_id, f.created_at, "
+                "SUM(fe.role = 'supports') AS supporting, SUM(fe.role = 'contradicts') AS contradicting "
+                f"FROM findings f LEFT JOIN finding_evidence fe ON fe.finding_id = f.finding_id {fd_where} "
+                "GROUP BY f.finding_id",
+                fd_values,
+            ).fetchall()
+        by_kind: dict[str, int] = {}
+        by_status: dict[str, int] = {}
+        for row in kinds:
+            by_kind[row["evidence_kind"]] = by_kind.get(row["evidence_kind"], 0) + row["n"]
+            by_status[row["status"]] = by_status.get(row["status"], 0) + row["n"]
+        brief["evidence"] = {
+            "total": sum(by_kind.values()),
+            "by_kind": by_kind,
+            "by_status": by_status,
+            "contradictions": contradiction_count,
+            "latest_at": max((row["last"] for row in kinds), default=None),
+            "operations": [
+                {"operation": r["operation"], "count": r["n"], "latest_at": r["last"]} for r in operations[:size]
+            ],
+            "comparisons_by_assessment": {r["assessment"]: r["n"] for r in comparisons},
+        }
+        if len(operations) > size:
+            omitted["operations"] = len(operations) - size
+
+        rank_sev = {s: i for i, s in enumerate(("critical", "high", "medium", "low", "info"))}
+        rank_status = {s: i for i, s in enumerate(("confirmed", "needs_review", "hypothesis", "rejected"))}
+        # Newest first within each severity/status rank (two stable sorts).
+        ordered = sorted(findings, key=lambda f: f["created_at"], reverse=True)
+        ordered.sort(key=lambda f: (rank_sev.get(f["severity"], 9), rank_status.get(f["status"], 9)))
+        significant = [f for f in ordered if f["severity"] in {"critical", "high"} and f["status"] != "rejected"]
+        significant_ids = {f["finding_id"] for f in significant}
+        rest = [f for f in ordered if f["finding_id"] not in significant_ids]
+        listed = significant[:BRIEF_HARD_CAP] + rest[: max(0, size - len(significant))]
+        brief["findings"] = {
+            "total": len(findings),
+            "by_status": _count(f["status"] for f in findings),
+            "by_severity": _count(f["severity"] for f in findings),
+            "listed": [
+                {
+                    "finding_id": f["finding_id"],
+                    "title": f["title"][:160] + ("…" if len(f["title"]) > 160 else ""),
+                    "severity": f["severity"],
+                    "status": f["status"],
+                    "confidence": f["confidence"],
+                    "supporting_evidence": int(f["supporting"] or 0),
+                    "contradicting_evidence": int(f["contradicting"] or 0),
+                }
+                for f in listed
+            ],
+        }
+        if len(findings) > len(listed):
+            omitted["findings"] = len(findings) - len(listed)
+        if len(significant) > BRIEF_HARD_CAP:
+            omitted["significant_findings"] = len(significant) - BRIEF_HARD_CAP
+
+        counts = self.question_counts(case_id=case_id, target_id=target_id)
+        open_rows = [
+            q
+            for q in self.list_questions(case_id=case_id, target_id=target_id, limit=200)
+            if q["status"] != "resolved" or q["stale"] or q["contested"]
+        ]
+        open_rows.sort(key=lambda q: not q["required"])
+        brief["questions"] = {
+            **counts,
+            "unresolved_list": [
+                {
+                    "question_id": q["question_id"],
+                    "question": q["question"][:200] + ("…" if len(q["question"]) > 200 else ""),
+                    "status": q["status"],
+                    "required": q["required"],
+                    "revision": q["revision"],
+                    "evidence_missing": q["evidence_missing"],
+                    "stale": q["stale"],
+                    "contested": q["contested"],
+                }
+                for q in open_rows[:size]
+            ],
+        }
+        if counts["unresolved"] > min(len(open_rows), size):
+            omitted["unresolved_questions"] = counts["unresolved"] - min(len(open_rows), size)
+        brief["omitted"] = omitted
+        brief["detail"] = (
+            "Counts cover every record. For detail: nexus_get_findings, nexus_list_questions(question_id), "
+            "nexus_get_evidence(view='summary', cursor=...) or nexus_get_evidence(evidence_id)."
+        )
+        return brief
 
     # -- 0.1 compatibility: cross-provider candidate grouping -----------------------
     def cross_check_candidates(self, target_id: str, limit: int = 100) -> list[dict[str, Any]]:
@@ -995,6 +2230,8 @@ class EvidenceStore:
             "links": links,
             "comparisons": self.list_comparisons(case_id=case_id, limit=500),
             "findings": self.list_findings(case_id=case_id, limit=500),
+            "questions": self._all_questions(case_id),
+            "question_counts": self.question_counts(case_id=case_id),
             "reviews": reviews,
             "schema_version": self.schema_version(),
         }
