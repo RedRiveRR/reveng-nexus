@@ -49,6 +49,7 @@ appended Electron fuse wire; not a real Electron build). No binaries are committ
 | Ghidra reuse by installation identity (same identity reused without an engine call; wrapper/framework version change alone is not an identity change; in-place upgrade under the same path invalidates; unknown identity disables reuse with a reason; refresh calls the engine); REA by its pinned version (drift disables); operator-attested identity opt-in | `test_reuse_idempotency.py`; live: `tests/integration/test_ghidra_reuse_live.py` (opt-in, `REVENG_NEXUS_LIVE_GHIDRA=1`) |
 | Reuse and idempotency (schema v4): identical request reused with audit and `refresh`, no reuse across parameters/targets/cases, rejected evidence not reused, server-version and code-fingerprint changes prevent reuse, unknown version means no reuse, workflows stay fresh; idempotent replay for all five write tools, changed arguments refused, failed write keeps the key free, concurrent retries write once, lost-response retry of a question update, v3 → v4 migration | `test_reuse_idempotency.py` |
 | Review remediation (2026-10-18): a comparison links only records of one operation, pair by pair (a real `nexus_compare_function` with a decompilation disagreement leaves listings unlinked as contradictions); a disagreement survives a re-run of either side (new evidence id) and is not inherited by other targets, subjects, operations or providers, nor by agreeing results; neutral `same_subject` outcomes never clear it, only an agreement from the same engine build does, and a newer disagreement restores it; name-only runs inherit only through the provider's unambiguous name-to-address mapping; legacy cross-operation links are ignored; target-scoped counts, briefs, listings and plan checklists include the case's case-level questions; required unresolved questions rank first beyond 200 questions; evidence pages and question listings stay valid JSON within the response cap with every record returned exactly once, an oversized record is returned (elided, flagged), never skipped; the report shows contradictions linked against a question's support | `test_questions.py`, `test_retrieval.py` |
+| Correctness follow-up (2026-10-19): a reuse read that overlaps a state-changing raw call (inside the engine, after its cancellation, or while its block write is held) is not served the earlier result and runs the engine after the mutation; a block that could not be persisted keeps reuse off (lookups and newly stored results) for the life of the process; idempotent writes store the original warnings in the write's own transaction (a concurrent replay sees them, a failed warning write rolls the whole write back); test node ids stay under 1,000 characters | `test_reuse_idempotency.py`, `test_suite_guards.py` (guard in `conftest.py`) |
 | Mutation reuse block (2026-10-18): unknown tool names and policy-refused calls do not block; the store-time block check is atomic with the insert; a call that reached the engine blocks reuse whether it succeeds, fails, times out or is cancelled (`move_on_after`, task group, MCP `notifications/cancelled` over JSON-RPC (the test asserts the server received it; since the review remediation), one native `Task.cancel()`, a second one while the write is held, a storm from the moment the write is requested): the write runs exactly once, the cancellation is still raised, and the stale cached result is not reused; a block write that fails or cannot be started is audited (`reuse_block_failed`), claims no block and is never a success | `test_reuse_idempotency.py` |
 | Investigation questions (schema v3): revision conflicts incl. concurrent writers, evidence gates (AI/agent-note-only, standing and linked contradictions, partial, blocked), stale states after reviews, scope checks, bounded listings/history/checklist, offset paging, report section, v2 → v3 migration preserving rows, concurrent and failing migrations, MCP tools | `test_questions.py` |
 | Cross-engine comparison: independence, rebasing, disagreement preservation, AI checks, per-group verdicts | `test_compare.py` |
@@ -67,7 +68,7 @@ appended Electron fuse wire; not a real Electron build). No binaries are committ
 
 ## Test accounting
 
-The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) the final review to 476 ([table](#final-review-2026-10-15-evening)) and the follow-up batch to 497 ([table](#follow-up-batch-2026-10-16)); the pre-commit restart-budget fix added one test (498, [table](#re-verification-on-a-reinstalled-machine-2026-10-16)); the dashboard and tool-count work added 26 (524) and its pre-commit review 10 more (534, [table](#dashboard-and-tool-count-audit-2026-10-16-uncommitted)); PR #1 (`9339d74`) collects 724, the evidence-workflow feature on top of it 826 and its review remediation 840 ([table](#pr-2-review-remediation-2026-10-18-windows-uncommitted); [table](#evidence-workflow-reuse-and-cancellation-safety-2026-10-18-windows-pr-2)). Environment-gated tests, not failing:
+The suite collected **260 tests** at the end of 2026-10-14 (165 until 2026-10-13; on 2026-10-14: 17 in the regression re-run, 44 in the afternoon (43 adapter mock tests, 1 handshake test), 34 in the evening (upstream-contract regressions and previously uncovered paths)). On 2026-10-15 `test_frida_mocked.py`, `test_rea_mocked.py`, `test_rea_live.py` and two policy tests in `test_security.py` were added; the observed total is in the [2026-10-15 table](#rea-integration-frida-contracts-and-policy-fixes-2026-10-15) (328 collected at that point, before the security audit); the security audit raised it to 419 ([table](#security-audit-remediation-2026-10-15)) the final review to 476 ([table](#final-review-2026-10-15-evening)) and the follow-up batch to 497 ([table](#follow-up-batch-2026-10-16)); the pre-commit restart-budget fix added one test (498, [table](#re-verification-on-a-reinstalled-machine-2026-10-16)); the dashboard and tool-count work added 26 (524) and its pre-commit review 10 more (534, [table](#dashboard-and-tool-count-audit-2026-10-16-uncommitted)); PR #1 (`9339d74`) collects 724, the evidence-workflow feature on top of it 826, its review remediation 840 and the correctness follow-up 848 ([table](#correctness-follow-up-2026-10-19-windows); [table](#pr-2-review-remediation-2026-10-18-windows-commit-39e1974); [table](#evidence-workflow-reuse-and-cancellation-safety-2026-10-18-windows-pr-2)). Environment-gated tests, not failing:
 
 - `tests/integration/test_ghidra_live.py` (`test_live_ghidra_providers_end_to_end` and, since
   2026-10-16, `test_live_ghidra_operations_per_provider`) is skipped unless `REVENG_NEXUS_LIVE_GHIDRA=1` and `GHIDRA_INSTALL_DIR` are set.
@@ -87,9 +88,35 @@ already grown from 154 to 160 tests over that session. This session added 5 test
 diagnostics, `config init --create-dirs`, non-loopback HTTP refusal, DNS-rebinding
 rejection, background provider start), giving 165. Every count below was observed.
 
-## PR #2 review remediation (2026-10-18, Windows, uncommitted)
+## Correctness follow-up (2026-10-19, Windows)
 
-Changes on top of `c0df391` (PR #2) after its independent review; not yet committed. Same machine
+On top of `39e1974` (PR #2). Windows 11 Pro 10.0.26300, Python 3.12.15, AnyIO 4.15.1, MCP SDK
+2.3.0, the worktree's `.venv`, `-p no:cacheprovider`.
+
+| Defect | Root cause | Fix |
+|---|---|---|
+| 3 errors in every Windows run: `test_llm4decompile.py::test_empty_or_oversized_input_is_refused_before_any_request` at setup and teardown, then `test_mcp_providers.py::test_stdio_lifecycle_discovery_and_health` at setup | the 48,001-character parameter became part of the node id (48,105 characters); pytest exports the node id as `PYTEST_CURRENT_TEST` and Windows refuses environment variables over 32,767 characters. The failed teardown left the module on pytest's setup stack, so the next test errored with "previous item was not torn down properly" (it passes alone and in its own module) | explicit `ids=` for that parametrization and for `test_malformed_inputs_do_not_crash`, whose ids embedded `os.urandom` bytes (1,541 characters, different on every run); every case is kept. `conftest.py` stops collection when a node id exceeds 1,000 characters (the longest is now 225) |
+| A reuse read overlapping a state-changing raw call could be served the pre-mutation result | `_reuse` saw only committed blocks and shares no lock with the mutation, so a read during the engine call, after a cancellation or while the block write was pending got the cached result; a failed block write left reuse enabled | an in-memory marker per provider and target (or every target of a shared server), set before the call is sent and cleared only after the block write has finished; lookups and newly stored results honour it, and a failed block write keeps reuse off for the life of the process |
+| A concurrent idempotent replay could miss the original warnings | the warnings were stored in a separate transaction after the record and its key had been committed | they are stored in the write's own transaction (findings, question creation, question updates) |
+
+| Command | Result |
+|---|---|
+| The new tests on unmodified `39e1974` (disposable copy, its own `src` imported) | 6 of 6 failed at their intended assertions: two concurrent replays got no warnings; a failed warning write left the finding committed; a read while the block write was held and a read while the mutation was in the engine were answered from the cache; after a failed block write the result was still reused. With the old ids, the new guard stopped collection (48,105 characters); the old module order reproduced the 3 errors |
+| Related modules (questions, evidence, retrieval, report, reuse and cancellation, orchestrator, compare, MCP providers incl. stdio lifecycle, audit regressions, server, dashboard, access profiles, LLM4Decompile, artifacts and formats, suite guards) | 425 passed, 1 failed, 1 skipped: the failing test builds `ProviderManager` without `__init__` and lacked the new state; with its setup completed, `test_reuse_idempotency.py` passed (55) |
+| `pytest -q -rfEsxX` (848 collected) | **813 passed, 0 failed, 0 errors, 35 skipped**, 0 xfailed, 0 xpassed, 8 min 22 s. The Windows suite is clean; the skips are the 4 opt-in live tests, the symlink test (Developer Mode) and 30 POSIX-only process tests |
+| ruff check, ruff format --check, compileall, `--check-config`, `git diff --check` | clean |
+| mypy | 10 errors, all in files this change does not touch (`providers/_stdio_guard.py` x9, `providers/mcp.py` x1) |
+
+The race tests order every step by events (the recorded `_reuse` decision, the held block write,
+the engine contact), not by timing. Limits: the in-memory protection lasts for the process; after a
+failed block write, results stored before the mutation keep their reuse markers on disk, so a
+restart re-enables them (the failure is audited as `reuse_block_failed`). A read that overlaps a
+mutation waits for the provider and runs the engine after the mutation. Not run: live Ghidra, live
+REA, Linux and macOS.
+
+## PR #2 review remediation (2026-10-18, Windows, commit 39e1974)
+
+Changes on top of `c0df391` (PR #2) after its independent review, committed as `39e1974`. Same machine
 and environment as the next section.
 
 | Defect found in review | Fix |
@@ -133,7 +160,7 @@ Linux and macOS.
 
 Branch `feature/evidence-workflow`, committed as `c0df391` and opened as PR #2, stacked on PR #1
 (`9339d74`). The results in this section are for `c0df391`; the review remediation made after it
-is recorded in [PR #2 review remediation](#pr-2-review-remediation-2026-10-18-windows-uncommitted). Windows 11 Pro
+is recorded in [PR #2 review remediation](#pr-2-review-remediation-2026-10-18-windows-commit-39e1974). Windows 11 Pro
 10.0.26300, Python 3.12.15, AnyIO 4.15.1, the worktree's `.venv`, `-p no:cacheprovider`. New:
 `test_questions.py`, `test_retrieval.py`, `test_reuse_idempotency.py` and the opt-in
 `tests/integration/test_ghidra_reuse_live.py` (102 tests together); `test_report.py` updated.

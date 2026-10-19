@@ -15,7 +15,7 @@ import functools
 import hashlib
 import json
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -91,6 +91,12 @@ class ProviderManager:
         self._provider_sems: dict[str, asyncio.Semaphore] = {}
         self._group_locks: dict[tuple[str, str], asyncio.Lock] = defaultdict(asyncio.Lock)
         self._global_sem = asyncio.Semaphore(config.analysis.max_concurrent_provider_calls)
+        # Reuse protection that does not wait for the database, keyed (provider, target or '*' for
+        # a shared server) like the persisted reuse blocks: raw calls that may change an engine's
+        # state and have not finished writing their block yet, and blocks whose write failed (kept
+        # for the life of the process, so a failed write fails closed instead of re-enabling reuse).
+        self._mutations_in_flight: Counter[tuple[str, str]] = Counter()
+        self._unpersisted_blocks: dict[tuple[str, str], str] = {}
         self._started = False
         self._start_lock = asyncio.Lock()
         # Set once start() has finished (successfully or not) so the MCP server can answer
@@ -516,6 +522,8 @@ class ProviderManager:
             evidence = None
             if record:
                 keys, _status = self.reuse_key(provider, operation, target, params, result)
+                if self._reuse_guard(provider.id, target.sha256):
+                    keys = None  # an engine-state change is in flight or its block was not persisted
                 evidence = await anyio.to_thread.run_sync(functools.partial(self.record_result, result, target, keys))
             out = {"result": result, "evidence": evidence, "attempts": attempts, "reused": False}
             if reuse_status is not None:
@@ -604,12 +612,26 @@ class ProviderManager:
         ).hexdigest()
         return (key, params_hash), {"eligible": True, "identity_source": source}
 
+    def _reuse_guard(self, provider_id: str, target_sha256: str) -> str | None:
+        """Why results of this provider for this target must not be reused right now, if so."""
+        for scope in (target_sha256.lower(), "*"):
+            if self._mutations_in_flight.get((provider_id, scope)):
+                return (
+                    f"a raw call that may change {provider_id}'s analysis state is still running or "
+                    "writing its reuse block"
+                )
+            if (provider_id, scope) in self._unpersisted_blocks:
+                return self._unpersisted_blocks[(provider_id, scope)]
+        return None
+
     async def _reuse(
         self, provider: AnalysisProvider, operation: str, target: TargetContext, params: dict[str, Any]
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         keys, status = self.reuse_key(provider, operation, target, params)
         if keys is None:
             return None, {"provider_id": provider.id, **status}
+        if guard := self._reuse_guard(provider.id, target.sha256):
+            return None, {"provider_id": provider.id, "eligible": False, "reason": guard}
         block = await anyio.to_thread.run_sync(lambda: self.evidence.reuse_block(provider.id, target.sha256))
         if block is not None:
             return None, {"provider_id": provider.id, "eligible": False, "reason": block["reason"]}
@@ -618,6 +640,8 @@ class ProviderManager:
         )
         if record is None:
             return None, {"provider_id": provider.id, **status, "reason": "no stored result with this key"}
+        if guard := self._reuse_guard(provider.id, target.sha256):  # a mutation started meanwhile
+            return None, {"provider_id": provider.id, "eligible": False, "reason": guard}
         self.audit.write(
             "operation",
             provider_id=provider.id,
@@ -703,6 +727,12 @@ class ProviderManager:
             # and refuses a name it does not list (a typo, or a catalogue that could not be
             # discovered) before any contact with the engine: such a call cannot change anything.
             known = getattr(provider, "_tools", {}).get(tool_name)
+            # Marked before the call (no await in between) and cleared only after the reuse block
+            # write below has finished, so a concurrent reuse lookup cannot see the gap.
+            marked = known is not None and known.classification.tool_class != "read"
+            mark = (provider_id, (target_sha256 or "").lower() if target is not None else "*")
+            if marked:
+                self._mutations_in_flight[mark] += 1
             changes_state = False
             succeeded = False
             try:
@@ -719,10 +749,16 @@ class ProviderManager:
                 changes_state = known is not None and known.classification.tool_class != "read"
                 raise
             finally:
-                if changes_state:
-                    await self._block_reuse_after_mutation(
-                        provider_id, tool_name, target_sha256 if target else None, raise_on_failure=succeeded
-                    )
+                try:
+                    if changes_state:
+                        await self._block_reuse_after_mutation(
+                            provider_id, tool_name, target_sha256 if target else None, raise_on_failure=succeeded
+                        )
+                finally:
+                    if marked:
+                        self._mutations_in_flight[mark] -= 1
+                        if self._mutations_in_flight[mark] <= 0:
+                            del self._mutations_in_flight[mark]
 
     async def _block_reuse_after_mutation(
         self, provider_id: str, tool_name: str, target_sha256: str | None, *, raise_on_failure: bool
@@ -748,6 +784,10 @@ class ProviderManager:
             lambda: self.evidence.invalidate_reuse(provider_id, target_sha256, reason)
         )
         if failure is not None:
+            # Fail closed: without the persisted block, keep reuse off here for the life of the process.
+            self._unpersisted_blocks[(provider_id, target_sha256.lower() if target_sha256 else "*")] = (
+                f"{reason}; the persisted reuse block could not be written, so reuse stays off until restart"
+            )
             self.audit.write(
                 "reuse_block_failed",
                 provider_id=provider_id,

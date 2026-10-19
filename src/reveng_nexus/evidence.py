@@ -433,14 +433,16 @@ class EvidenceStore:
             )
         return dict(row)
 
-    def _remember_warnings(self, idem: Idempotency | None, warnings: list[str]) -> None:
-        """Keep the warnings the original write returned, so a replay repeats them."""
+    @staticmethod
+    def _store_warnings(connection: sqlite3.Connection, idem: Idempotency | None, warnings: list[str]) -> None:
+        """Keep the warnings the original write returned, so a replay repeats them. Called inside
+        the write's own transaction: a replay can never see the key without its warnings, and a
+        failure here rolls the whole write back."""
         if idem is not None and warnings:
-            with self._connection() as connection:
-                connection.execute(
-                    "UPDATE idempotency_keys SET warnings_json = ? WHERE tool = ? AND idempotency_key = ?",
-                    (_json(warnings), idem.tool, idem.key),
-                )
+            connection.execute(
+                "UPDATE idempotency_keys SET warnings_json = ? WHERE tool = ? AND idempotency_key = ?",
+                (_json(warnings), idem.tool, idem.key),
+            )
 
     @staticmethod
     def _claim_key(connection: sqlite3.Connection, idem: Idempotency | None, result_type: str, result_id: str) -> None:
@@ -1327,13 +1329,13 @@ class EvidenceStore:
                 evidence_ids,
                 contra,
                 idempotency,
+                warnings,
             )
         except sqlite3.IntegrityError:
             replay = self._after_race(idempotency)
             if replay is None:
                 raise
             return replay
-        self._remember_warnings(idempotency, warnings)
         result = self.get_finding(finding_id)
         if warnings:
             result["warnings"] = warnings
@@ -1354,9 +1356,11 @@ class EvidenceStore:
         evidence_ids: list[str],
         contra: list[str],
         idempotency: Idempotency | None,
+        warnings: list[str],
     ) -> None:
         with self._connection() as connection:
             self._claim_key(connection, idempotency, "finding", finding_id)
+            self._store_warnings(connection, idempotency, warnings)
             connection.execute(
                 "INSERT INTO findings (finding_id, case_id, target_id, title, description, severity, status, "
                 "confidence, confidence_rationale, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1856,7 +1860,6 @@ class EvidenceStore:
             if replay is None:
                 raise
             return replay
-        self._remember_warnings(idempotency, warnings)
         result = self.get_question(question_id, history_limit=0)
         if warnings:
             result["warnings"] = warnings
@@ -1932,6 +1935,7 @@ class EvidenceStore:
                     now,
                 ),
             )
+            self._store_warnings(connection, idempotency, warnings)
         return warnings
 
     def update_question(
@@ -2050,7 +2054,7 @@ class EvidenceStore:
                     now,
                 ),
             )
-        self._remember_warnings(idempotency, warnings)
+            self._store_warnings(connection, idempotency, warnings)
         result = self.get_question(question_id, history_limit=0)
         if warnings:
             result["warnings"] = warnings

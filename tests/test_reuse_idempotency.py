@@ -4,6 +4,7 @@ import contextlib
 import json
 import sqlite3
 import threading
+from typing import Any
 
 import pytest
 from conftest import mock_engine
@@ -506,6 +507,7 @@ def test_identity_follows_the_case_variant_the_child_sees(tmp_path, monkeypatch)
 
 async def test_mutating_raw_calls_invalidate_stored_results(tmp_path, workspace, elf_sample):
     import asyncio
+    from collections import Counter
     from types import SimpleNamespace
 
     from reveng_nexus.artifacts import identify
@@ -544,6 +546,7 @@ async def test_mutating_raw_calls_invalidate_stored_results(tmp_path, workspace,
     provider = SimpleNamespace(id="p", started=True, per_target=False, _tools=tools, call_tool=call_tool)
     mgr = ProviderManager.__new__(ProviderManager)
     mgr.providers, mgr.evidence, mgr._provider_sems = {"p": provider}, store, {"p": asyncio.Semaphore(1)}
+    mgr._mutations_in_flight, mgr._unpersisted_blocks = Counter(), {}  # state __init__ would create
 
     stored()
     await mgr.call_provider_tool("p", "read_x", {})
@@ -1264,3 +1267,212 @@ async def test_a_block_write_that_cannot_be_started_is_audited_and_never_a_succe
     assert mgr.evidence.reuse_block("ghidra_a", sha) is None  # ... and no block is claimed
     audit = mgr.audit.path.read_text(encoding="utf-8")
     assert '"reuse_block_failed"' in audit and "cannot schedule new futures after shutdown" in audit
+
+
+# -- idempotent writes: the original warnings are stored with the write, atomically ---------------
+def _warning_store(tmp_path, workspace, elf_sample):
+    from reveng_nexus.artifacts import identify
+
+    store = EvidenceStore(tmp_path / "e.sqlite3", (str(workspace),))
+    ident = identify(elf_sample)
+    cid = store.create_case("Warnings")["case_id"]
+    store.upsert_target(ident, cid)
+    ev = store.add_evidence(
+        target_id=ident.sha256,
+        case_id=cid,
+        provider_id="builtin",
+        tool_name="metadata",
+        operation="binary.metadata",
+        evidence_kind="engine_derived",
+        claim="header",
+        subject="binary",
+    )["evidence_id"]
+    store.review("evidence", ev, "contradicted", "a second parser disagrees")
+    return store, ident.sha256, cid, ev
+
+
+def _hold_after(store, method_name, monkeypatch):
+    """Pause the writing thread right after ``method_name`` (the write transaction) returns."""
+    committed, release = threading.Event(), threading.Event()
+    original = getattr(store, method_name)
+
+    def held(*args, **kwargs):
+        out = original(*args, **kwargs)
+        committed.set()
+        release.wait(10)
+        return out
+
+    monkeypatch.setattr(store, method_name, held)
+    return committed, release
+
+
+def test_a_concurrent_replay_sees_the_original_warnings_of_a_finding(tmp_path, workspace, elf_sample, monkeypatch):
+    store, _sha, cid, ev = _warning_store(tmp_path, workspace, elf_sample)
+    key = Idempotency("nexus_record_finding", "warned-race-01", "same-args")
+    args = {"case_id": cid, "title": "t", "description": "d", "evidence_ids": [ev], "status": "confirmed"}
+    committed, release = _hold_after(store, "_write_finding", monkeypatch)
+    results: dict[str, Any] = {}
+    writer = threading.Thread(target=lambda: results.update(first=store.record_finding(**args, idempotency=key)))
+    writer.start()
+    try:
+        assert committed.wait(10)  # the finding and its key are committed; the writer has not returned
+        replay = store.record_finding(**args, idempotency=key)
+    finally:
+        release.set()
+        writer.join(10)
+    expected = ["some supporting evidence is contradicted or rejected"]
+    assert replay["idempotent_replay"] is True and replay.get("warnings") == expected
+    assert results["first"]["warnings"] == expected
+
+
+def test_a_concurrent_replay_sees_the_original_warnings_of_a_question(tmp_path, workspace, elf_sample, monkeypatch):
+    from reveng_nexus.artifacts import identify
+
+    store, sha, _cid, ev = _warning_store(tmp_path, workspace, elf_sample)
+    other_case = store.create_case("Second case")["case_id"]
+    store.upsert_target(identify(elf_sample), other_case)  # same target, evidence recorded in the first case
+    key = Idempotency("nexus_record_question", "warned-race-02", "same-args")
+    args = {"case_id": other_case, "target_id": sha, "question": "Q?", "evidence_ids": [ev]}
+    committed, release = _hold_after(store, "_write_question", monkeypatch)
+    results: dict[str, Any] = {}
+    writer = threading.Thread(target=lambda: results.update(first=store.record_question(**args, idempotency=key)))
+    writer.start()
+    try:
+        assert committed.wait(10)
+        replay = store.record_question(**args, idempotency=key)
+    finally:
+        release.set()
+        writer.join(10)
+    expected = [f"evidence {ev} was recorded under case {_cid!r}, not {other_case!r}"]
+    assert results["first"]["warnings"] == expected
+    assert replay["idempotent_replay"] is True and replay.get("warnings") == expected
+
+
+def test_a_write_whose_warnings_cannot_be_stored_leaves_nothing_behind(tmp_path, workspace, elf_sample):
+    store, _sha, cid, ev = _warning_store(tmp_path, workspace, elf_sample)
+    key = Idempotency("nexus_record_finding", "warned-fail-01", "same-args")
+    args = {"case_id": cid, "title": "t", "description": "d", "evidence_ids": [ev], "status": "confirmed"}
+    with sqlite3.connect(store.database_path) as con:
+        con.execute(
+            "CREATE TRIGGER fail_warnings BEFORE UPDATE OF warnings_json ON idempotency_keys "
+            "BEGIN SELECT RAISE(ABORT, 'injected warning-store failure'); END"
+        )
+    with pytest.raises(sqlite3.DatabaseError, match="injected"):
+        store.record_finding(**args, idempotency=key)
+    with sqlite3.connect(store.database_path) as con:
+        assert con.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 0  # rolled back with the key
+        assert con.execute("SELECT COUNT(*) FROM idempotency_keys").fetchone()[0] == 0
+        con.execute("DROP TRIGGER fail_warnings")
+    retried = store.record_finding(**args, idempotency=key)
+    assert "idempotent_replay" not in retried and retried["warnings"]
+    assert store.record_finding(**args, idempotency=key)["warnings"] == retried["warnings"]
+
+
+# -- reuse reads overlapping a mutation never return the pre-mutation result ---------------------
+async def _read_task(client, sha):
+    import asyncio
+
+    return asyncio.create_task(_decompile(client, sha))
+
+
+def _watch_reuse_decisions(mgr):
+    """Record each reuse decision ((reused record or None), status) the moment it is made. The
+    lookup never waits for the provider, so a test can wait for it without timing guesses."""
+    import asyncio
+
+    decisions: list[tuple[Any, dict[str, Any]]] = []
+    made = asyncio.Event()
+    original = mgr._reuse
+
+    async def watched(*args, **kwargs):
+        out = await original(*args, **kwargs)
+        decisions.append(out)
+        made.set()
+        return out
+
+    mgr._reuse = watched
+    return decisions, made
+
+
+async def test_a_read_while_a_completed_mutation_writes_its_block_is_not_served_stale(gateway, elf_sample, tmp_path):
+    install = _ghidra_install(tmp_path / "ghidra")
+    app, mgr = await gateway([_mutable_engine(install)], policy={"access_profile": "full_access"})
+    async with Client(app.server) as client:
+        sha, _ = await _inspect(client, elf_sample)
+        first = await _cached_decompile(client, sha)
+        with _gated_block_write(mgr) as gate:
+            mutation = await _mutation_task(mgr)  # the engine accepts the rename; the block write is held
+            await _write_started_or_task_done(mutation, gate)
+            assert gate.started.is_set() and not mutation.done()
+            decisions, made = _watch_reuse_decisions(mgr)
+            read = await _read_task(client, sha)
+            await made.wait()
+            reused, status = decisions[-1]
+            assert reused is None, "the pre-mutation result would have been served"
+            assert "still running or writing its reuse block" in status["reason"]
+            # It runs the engine instead, after the mutation (which still holds the provider).
+            assert not read.done()
+            gate.release.set()
+            await mutation
+            after = await read
+        assert after["reused"] is False and after["evidence_id"] != first["evidence_id"]
+        assert mgr._mutations_in_flight == {}  # cleared once the block was written
+
+
+async def test_reads_during_a_cancelled_mutation_are_not_served_stale(gateway, elf_sample, tmp_path):
+    import asyncio
+
+    install = _ghidra_install(tmp_path / "ghidra")
+    app, mgr = await gateway([_mutable_engine(install)], policy={"access_profile": "full_access"})
+    async with Client(app.server) as client:
+        sha, _ = await _inspect(client, elf_sample)
+        first = await _cached_decompile(client, sha)
+        contacted, _cancelled = _parked_engine(mgr.providers["ghidra_a"])
+        with _gated_block_write(mgr) as gate:
+            mutation = await _mutation_task(mgr)
+            await contacted.wait()  # the mutation is inside the engine
+            decisions, made = _watch_reuse_decisions(mgr)
+            during_call = await _read_task(client, sha)
+            await made.wait()
+            assert decisions[-1][0] is None, "served stale while the mutation was in the engine"
+            mutation.cancel()  # abandoned: the block write starts and is held
+            await _write_started_or_task_done(mutation, gate)
+            assert gate.started.is_set()
+            made.clear()
+            during_write = await _read_task(client, sha)
+            await made.wait()
+            reused, status = decisions[-1]
+            assert reused is None, "served stale while the block write was pending"
+            assert "still running or writing its reuse block" in status["reason"]
+            gate.release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await mutation
+            results = [await during_call, await during_write]
+        assert all(r["reused"] is False and r["evidence_id"] != first["evidence_id"] for r in results)
+        assert mgr._reuse_guard("ghidra_a", sha) is None  # the persisted block now does the job
+        await _assert_blocked_and_not_reused(client, mgr, sha)
+
+
+async def test_a_block_that_could_not_be_persisted_keeps_reuse_off_for_the_process(gateway, elf_sample, tmp_path):
+    from reveng_nexus.errors import ProviderCallError
+
+    install = _ghidra_install(tmp_path / "ghidra")
+    app, mgr = await gateway([_mutable_engine(install)], policy={"access_profile": "full_access"})
+    async with Client(app.server) as client:
+        sha, _ = await _inspect(client, elf_sample)
+        first = await _cached_decompile(client, sha)
+
+        def broken(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        real = mgr.evidence.invalidate_reuse
+        mgr.evidence.invalidate_reuse = broken
+        with pytest.raises(ProviderCallError, match="could not be marked non-reusable"):
+            await mgr.call_provider_tool("ghidra_a", "rename_function", _rename_args())
+        mgr.evidence.invalidate_reuse = real
+        assert mgr.evidence.reuse_block("ghidra_a", sha) is None  # nothing persisted ...
+        again = await _decompile(client, sha)  # ... but the stale result is not served
+        assert again["reused"] is False and again["evidence_id"] != first["evidence_id"]
+        assert "could not be written" in again["reuse_status"]["reason"]
+        later = await _decompile(client, sha)  # and the fresh result was not stored as reusable
+        assert later["reused"] is False and later["evidence_id"] != again["evidence_id"]

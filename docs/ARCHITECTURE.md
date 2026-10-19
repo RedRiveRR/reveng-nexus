@@ -245,7 +245,13 @@ a tool name the provider does not list, since neither reaches the engine. The sh
 help if the database write itself fails or cannot be started (for example a worker pool that is
 already shut down): that is audited (`reuse_block_failed`), no block is claimed, and it is
 reported as an error when the call itself had succeeded; an error or cancellation already
-propagating is left unchanged. One ordering edge is accepted: if an AnyIO scope cancellation is
+propagating is left unchanged. Reuse then stays off for that provider and target (or every target
+of a shared server) for the life of the process, so a failed write fails closed; results stored
+before the mutation keep their reuse markers on disk, so a restart re-enables them. Until the
+block is written, an in-memory marker set before the call is sent
+(per provider and target, like the block) keeps lookups from reusing results and keeps new results
+from being stored as reusable, so a read that overlaps the mutation, its cancellation or its block
+write runs the engine after the mutation instead of being served the earlier result. One ordering edge is accepted: if an AnyIO scope cancellation is
 already propagating and a native `Task.cancel()` also arrives during the write, AnyIO attributes
 the native cancellation to its own scope (it follows the exception chain) and that scope absorbs
 both; the block is still persisted.
@@ -274,7 +280,9 @@ key row is written in the same transaction as the record, so a failed write does
 the key and concurrent retries write once; the same key with the same arguments returns the
 current state of the original record (`idempotent_replay: true`), with different arguments it
 is refused. The request is hashed as the handler reads it (lower-case target, parsed
-address, schema defaults filled), and a replay repeats the original write's warnings. There
+address, schema defaults filled), and a replay repeats the original write's warnings, which are
+stored in the same transaction as the record and its key (a concurrent replay never sees the key
+without them, and a write whose warnings cannot be stored is rolled back as a whole). There
 is no automatic retry anywhere in the gateway.
 
 ## Cross-engine comparison
