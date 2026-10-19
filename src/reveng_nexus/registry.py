@@ -38,6 +38,7 @@ from .errors import (
     describe_exception,
 )
 from .evidence import EvidenceStore
+from .mutation_journal import ALL_TARGETS, MutationJournal
 from .policy import PolicyEngine
 from .providers import OPERATIONS, AnalysisProvider, OperationResult, ProviderRuntime, TargetContext, create_provider
 
@@ -97,6 +98,11 @@ class ProviderManager:
         # for the life of the process, so a failed write fails closed instead of re-enabling reuse).
         self._mutations_in_flight: Counter[tuple[str, str]] = Counter()
         self._unpersisted_blocks: dict[tuple[str, str], str] = {}
+        # The same protection on disk, so it survives a failed block write and a restart (see
+        # mutation_journal). Until start() has recovered it, no result is reused at all.
+        self.mutation_journal = MutationJournal(Path(config.data_dir) / "mutation-journal")
+        self._journal_recovered = False
+        self._journal_unreadable: str | None = None
         self._started = False
         self._start_lock = asyncio.Lock()
         # Set once start() has finished (successfully or not) so the MCP server can answer
@@ -124,6 +130,7 @@ class ProviderManager:
         async with self._start_lock:
             if self._started:
                 return
+            await self._recover_mutation_journal()
             pending = []
             for cfg in self.provider_configs.values():
                 if only is not None and cfg.id not in only and cfg.type != "builtin":
@@ -614,6 +621,10 @@ class ProviderManager:
 
     def _reuse_guard(self, provider_id: str, target_sha256: str) -> str | None:
         """Why results of this provider for this target must not be reused right now, if so."""
+        if not self._journal_recovered:
+            return "reuse is held off until the mutation journal has been recovered at start"
+        if self._journal_unreadable:
+            return self._journal_unreadable
         for scope in (target_sha256.lower(), "*"):
             if self._mutations_in_flight.get((provider_id, scope)):
                 return (
@@ -733,35 +744,133 @@ class ProviderManager:
             mark = (provider_id, (target_sha256 or "").lower() if target is not None else "*")
             if marked:
                 self._mutations_in_flight[mark] += 1
-            changes_state = False
-            succeeded = False
             try:
-                result = await provider.call_tool(tool_name, arguments, internal=False, target_sha256=target_sha256)
-                # It ran: anything not classified read may have changed the engine's state.
-                changes_state = known is None or known.classification.tool_class != "read"
-                succeeded = True
-                return result
-            except PolicyViolation:
-                raise  # refused before anything reached the engine
-            except BaseException:
-                # Failures (errors, timeouts, cancellation) of a listed tool that is not classified
-                # read are treated as possible mutations.
-                changes_state = known is not None and known.classification.tool_class != "read"
-                raise
-            finally:
+                # Durable before the call is sent; if it cannot be written, nothing is sent.
+                entry = await self._open_mutation_entry(provider_id, mark[1], tool_name) if marked else None
+                changes_state = False
+                succeeded = False
                 try:
+                    result = await provider.call_tool(tool_name, arguments, internal=False, target_sha256=target_sha256)
+                    # It ran: anything not classified read may have changed the engine's state.
+                    changes_state = known is None or known.classification.tool_class != "read"
+                    succeeded = True
+                    return result
+                except PolicyViolation:
+                    raise  # refused before anything reached the engine
+                except BaseException:
+                    # Failures (errors, timeouts, cancellation) of a listed tool that is not
+                    # classified read are treated as possible mutations.
+                    changes_state = known is not None and known.classification.tool_class != "read"
+                    raise
+                finally:
                     if changes_state:
                         await self._block_reuse_after_mutation(
-                            provider_id, tool_name, target_sha256 if target else None, raise_on_failure=succeeded
+                            provider_id,
+                            tool_name,
+                            target_sha256 if target else None,
+                            raise_on_failure=succeeded,
+                            journal_entry=entry,
                         )
-                finally:
-                    if marked:
-                        self._mutations_in_flight[mark] -= 1
-                        if self._mutations_in_flight[mark] <= 0:
-                            del self._mutations_in_flight[mark]
+                    elif entry is not None:
+                        # Refused before the engine was contacted: nothing can have changed.
+                        await self._close_mutation_entry(entry)
+            finally:
+                if marked:
+                    self._mutations_in_flight[mark] -= 1
+                    if self._mutations_in_flight[mark] <= 0:
+                        del self._mutations_in_flight[mark]
+
+    async def _open_mutation_entry(self, provider_id: str, scope: str, tool_name: str) -> Path:
+        """Durably journal a call that may change engine state, before it is sent."""
+        created: dict[str, Path] = {}
+
+        def record() -> None:
+            created["entry"] = self.mutation_journal.record(provider_id, scope, tool_name)
+
+        failure, cancellation = await _finish_despite_cancellation(record)
+        if cancellation is not None:
+            if failure is None:  # written, but the call will not be sent: drop the entry again
+                await self._close_mutation_entry(created["entry"])
+            raise cancellation
+        if failure is not None:
+            self.audit.write(
+                "mutation_journal_failed",
+                provider_id=provider_id,
+                tool_name=tool_name,
+                outcome="refused",
+                error=describe_exception(failure)["message"],
+            )
+            raise ProviderCallError(
+                f"{provider_id}: '{tool_name}' was not sent: the mutation journal could not be written "
+                f"durably ({describe_exception(failure)['message']})",
+                remediation="Check that the data directory is writable; nothing reached the engine.",
+            ) from failure
+        return created["entry"]
+
+    async def _close_mutation_entry(self, entry: Path) -> bool:
+        """Remove a resolved journal entry. A failure keeps it: reuse then stays blocked at the next
+        start, where recovery re-applies the (idempotent) block and removes it."""
+        failure, cancellation = await _finish_despite_cancellation(lambda: self.mutation_journal.resolve(entry))
+        if failure is not None:
+            self.audit.write(
+                "mutation_journal_failed",
+                outcome="kept",
+                error=describe_exception(failure)["message"],
+            )
+        if cancellation is not None:
+            raise cancellation
+        return failure is None
+
+    async def _recover_mutation_journal(self) -> None:
+        """Re-apply the reuse block for every journal entry left by an earlier process (a failed
+        block write, or a stop before it). Until this has run, nothing is reused; an entry whose
+        block cannot be written now keeps reuse off in this process and stays on disk."""
+        try:
+            entries, unknown = await anyio.to_thread.run_sync(self.mutation_journal.pending)
+        except OSError as exc:
+            self._journal_unreadable = (
+                "reuse is off for every provider: the mutation journal could not be read "
+                f"({describe_exception(exc)['message']}); fix or remove {self.mutation_journal.directory}"
+            )
+            self.audit.write("mutation_journal_unreadable", outcome="failed", error=self._journal_unreadable)
+            self._journal_recovered = True
+            return
+        if unknown:
+            self._journal_unreadable = (
+                "reuse is off for every provider: the mutation journal holds entries that cannot be read "
+                f"({unknown[:5]}); inspect and remove them in {self.mutation_journal.directory}"
+            )
+            self.audit.write("mutation_journal_unreadable", outcome="failed", error=self._journal_unreadable)
+        for provider_id, scope, path in entries:
+            target_id = None if scope == ALL_TARGETS else scope
+            scope_text = "every target (one shared server)" if target_id is None else "this target"
+            reason = (
+                f"reuse disabled for this provider on {scope_text}: a raw call that may have changed its "
+                "analysis state was journalled, but its reuse block was not confirmed before the gateway stopped"
+            )
+            self._unpersisted_blocks[(provider_id, scope)] = reason
+            failure, _ = await _finish_despite_cancellation(
+                functools.partial(self.evidence.invalidate_reuse, provider_id, target_id, reason)
+            )
+            if failure is None and await self._close_mutation_entry(path):
+                self._unpersisted_blocks.pop((provider_id, scope), None)  # the persisted block now applies
+            self.audit.write(
+                "mutation_journal_recovered",
+                provider_id=provider_id,
+                target_sha256=target_id,
+                outcome="ok" if failure is None else "failed",
+                error=describe_exception(failure)["message"] if failure is not None else None,
+            )
+        self._journal_recovered = True
 
     async def _block_reuse_after_mutation(
-        self, provider_id: str, tool_name: str, target_sha256: str | None, *, raise_on_failure: bool
+        self,
+        provider_id: str,
+        tool_name: str,
+        target_sha256: str | None,
+        *,
+        raise_on_failure: bool,
+        journal_entry: Path | None = None,
     ) -> None:
         """Persist the reuse block for a raw call that may have changed the engine's state.
 
@@ -783,10 +892,26 @@ class ProviderManager:
         failure, cancellation = await _finish_despite_cancellation(
             lambda: self.evidence.invalidate_reuse(provider_id, target_sha256, reason)
         )
+        if failure is None and journal_entry is not None:
+            # The block is persisted: the journal entry has done its job. Removing it is cancellation
+            # safe like the write; if it fails, the next start re-applies the block and removes it.
+            removal_failure, late = await _finish_despite_cancellation(
+                lambda: self.mutation_journal.resolve(journal_entry)
+            )
+            cancellation = cancellation or late
+            if removal_failure is not None:
+                self.audit.write(
+                    "mutation_journal_failed",
+                    provider_id=provider_id,
+                    outcome="kept",
+                    error=describe_exception(removal_failure)["message"],
+                )
         if failure is not None:
-            # Fail closed: without the persisted block, keep reuse off here for the life of the process.
+            # Fail closed: without the persisted block, keep reuse off here for the life of the process
+            # (the journal entry stays on disk, so the next start keeps it off and retries the block).
             self._unpersisted_blocks[(provider_id, target_sha256.lower() if target_sha256 else "*")] = (
-                f"{reason}; the persisted reuse block could not be written, so reuse stays off until restart"
+                f"{reason}; the persisted reuse block could not be written, so reuse stays off (the mutation "
+                "journal keeps it off after a restart until the block is written)"
             )
             self.audit.write(
                 "reuse_block_failed",

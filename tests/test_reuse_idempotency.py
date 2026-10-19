@@ -512,6 +512,7 @@ async def test_mutating_raw_calls_invalidate_stored_results(tmp_path, workspace,
 
     from reveng_nexus.artifacts import identify
     from reveng_nexus.errors import PolicyViolation
+    from reveng_nexus.mutation_journal import MutationJournal
     from reveng_nexus.registry import ProviderManager
 
     store = EvidenceStore(tmp_path / "e.sqlite3", (str(workspace),))
@@ -547,6 +548,11 @@ async def test_mutating_raw_calls_invalidate_stored_results(tmp_path, workspace,
     mgr = ProviderManager.__new__(ProviderManager)
     mgr.providers, mgr.evidence, mgr._provider_sems = {"p": provider}, store, {"p": asyncio.Semaphore(1)}
     mgr._mutations_in_flight, mgr._unpersisted_blocks = Counter(), {}  # state __init__ would create
+    mgr.mutation_journal, mgr._journal_recovered, mgr._journal_unreadable = (
+        MutationJournal(tmp_path / "mutation-journal"),
+        True,
+        None,
+    )
 
     stored()
     await mgr.call_provider_tool("p", "read_x", {})
@@ -1222,7 +1228,8 @@ def _refuse_block_write_submission(mgr, monkeypatch):
     mgr.evidence.invalidate_reuse = lambda *args, **kwargs: runs.append(args) or real(*args, **kwargs)
 
     def refuse(executor, func, *args):
-        if getattr(func, "__module__", None) == "reveng_nexus.registry":
+        # Only the reuse block write (not the mutation journal, which is written before the call).
+        if getattr(func, "__qualname__", "").startswith("ProviderManager._block_reuse_after_mutation"):
             raise RuntimeError("cannot schedule new futures after shutdown")
         return submit(executor, func, *args)
 

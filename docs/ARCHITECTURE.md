@@ -246,12 +246,37 @@ help if the database write itself fails or cannot be started (for example a work
 already shut down): that is audited (`reuse_block_failed`), no block is claimed, and it is
 reported as an error when the call itself had succeeded; an error or cancellation already
 propagating is left unchanged. Reuse then stays off for that provider and target (or every target
-of a shared server) for the life of the process, so a failed write fails closed; results stored
-before the mutation keep their reuse markers on disk, so a restart re-enables them. Until the
-block is written, an in-memory marker set before the call is sent
-(per provider and target, like the block) keeps lookups from reusing results and keeps new results
-from being stored as reusable, so a read that overlaps the mutation, its cancellation or its block
-write runs the engine after the mutation instead of being served the earlier result. One ordering edge is accepted: if an AnyIO scope cancellation is
+of a shared server): a failed write fails closed, in this process and after a restart (below).
+Until the block is written, an in-memory marker set before the call is sent (per provider and
+target, like the block) keeps lookups from reusing results and keeps new results from being
+stored as reusable, so a read that overlaps the mutation, its cancellation or its block write runs
+the engine after the mutation instead of being served the earlier result.
+
+The protection is also kept on disk, in a mutation journal (`<data_dir>/mutation-journal/`, one
+small file per call, independent of the SQLite file whose write may fail). Before such a call is
+sent, an entry is written durably: a temporary file is written, flushed and fsynced, then renamed
+into place, and the directory is fsynced where the platform allows it (not on Windows, where NTFS
+journals the metadata itself). If the entry cannot be written, the call is not sent (an error
+names the cause and the audit log records `mutation_journal_failed`). The entry is removed only
+after the reuse block is confirmed, or when the call was refused before reaching the engine or
+cancelled before it was sent. When a gateway starts, it reads the journal before anything can be
+reused (until then no result is reused at all) and, for every entry left behind - a failed block
+write, or a stop between recording the call and confirming its block - re-applies the block and
+then removes the entry; if the block still cannot be written, reuse stays off in that process and
+the entry stays for the next start. This is conservative: a stop after the entry was written but
+before the call left the gateway still blocks reuse for that provider and target, because a new
+process cannot tell whether the engine saw the call. Entry names carry the provider id and the
+target hash (or `all-targets`); the content adds only the tool name, process id and time, never
+arguments, credentials, environment values or evidence. An entry whose content is damaged still
+blocks what its name says. A file whose name cannot be parsed, or a journal location that cannot be
+listed, turns reuse off for every provider until an operator inspects and removes it (the reason is
+in each result's `reuse_status` and in the audit log as `mutation_journal_unreadable`); leftover
+`.tmp` files come from a stop while recording, before the call could be sent, and are ignored.
+Removing an entry by hand re-enables reuse only for results that no persisted block covers.
+Gateways that share a data directory share the journal: one that starts while another has a call
+in flight re-applies that call's block (the block the call itself would write) before removing its
+entry, so this errs towards blocking.
+One ordering edge is accepted: if an AnyIO scope cancellation is
 already propagating and a native `Task.cancel()` also arrives during the write, AnyIO attributes
 the native cancellation to its own scope (it follows the exception chain) and that scope absorbs
 both; the block is still persisted.
