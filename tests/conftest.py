@@ -20,6 +20,25 @@ MOCK_ENGINE = str(TESTS / "mock_servers" / "mock_engine.py")
 MOCK_LAUNCHED = str(TESTS / "mock_servers" / "mock_launched.py")
 
 # The permanent runtime layout (docs/DEPLOYMENT.md). Tests must never write there.
+# pytest exports each test's node id as PYTEST_CURRENT_TEST, and Windows refuses environment
+# variables longer than 32,767 characters: a parametrized id that embeds a large value then errors
+# in setup and teardown (and the next test errors as a knock-on). Collection fails early instead.
+MAX_NODE_ID_CHARS = 1000
+
+
+def oversized_node_ids(node_ids: list[str], limit: int = MAX_NODE_ID_CHARS) -> list[str]:
+    return [node_id for node_id in node_ids if len(node_id) > limit]
+
+
+def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
+    too_long = oversized_node_ids([item.nodeid for item in items])
+    if too_long:
+        raise pytest.UsageError(
+            f"test node ids must stay under {MAX_NODE_ID_CHARS} characters (pass explicit ids= to "
+            "parametrize):\n" + "\n".join(f"  {len(n)} chars: {n[:120]}..." for n in too_long)
+        )
+
+
 PERMANENT_RUNTIME = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "RevEngNexus"
 
 

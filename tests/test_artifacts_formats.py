@@ -138,6 +138,8 @@ def test_strings_have_offsets_and_virtual_addresses(elf_sample):
         b"dex\n035\x00" + b"\x00" * 10,
         os.urandom(512),
     ],
+    # Stable ids: the default ids embed the random bytes (long, and different on every run).
+    ids=["elf-truncated", "pe-random-body", "macho-truncated", "dex-truncated", "random-512-bytes"],
 )
 def test_malformed_inputs_do_not_crash(tmp_path, payload):
     path = tmp_path / "bad.bin"

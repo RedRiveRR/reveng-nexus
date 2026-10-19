@@ -76,6 +76,12 @@ class NotFound(NexusError, LookupError):
     code = "not_found"
 
 
+class RevisionConflict(NexusError, ValueError):
+    """A write named a revision that is no longer current (another writer got there first)."""
+
+    code = "revision_conflict"
+
+
 def describe_exception(exc: BaseException) -> dict[str, Any]:
     """Return a bounded, redacted diagnostic for any exception."""
     if isinstance(exc, NexusError):

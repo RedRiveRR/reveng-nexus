@@ -181,6 +181,9 @@ async def test_ai_unavailable_is_explained(config_factory, workspace, elf_sample
 @pytest.mark.parametrize(
     ("text", "match"),
     [("", "non-empty"), ("  \n\t ", "non-empty"), ("x" * 48_001, "exceeds 48000")],
+    # Explicit ids: the default would embed the 48,001-character text in the node id, which pytest
+    # exports as PYTEST_CURRENT_TEST and Windows refuses (environment variables are limited to 32,767).
+    ids=["empty", "whitespace-only", "oversized-48001-chars"],
 )
 async def test_empty_or_oversized_input_is_refused_before_any_request(
     config_factory, workspace, elf_sample, fake, text, match

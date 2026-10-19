@@ -39,6 +39,11 @@ def _hex(value: Any) -> str:
     return f"{value:#x}" if isinstance(value, int) else ("" if value is None else str(value))
 
 
+def _id_list(ids: list[str], total: int) -> str:
+    text = ", ".join(f"`{e}`" for e in ids)
+    return f"{text} (+{total - len(ids)} more)" if total > len(ids) else text
+
+
 def build_bundle(store: EvidenceStore, case_id: str, *, include_raw: bool = False) -> dict[str, Any]:
     bundle = store.case_bundle(case_id, include_raw=include_raw)
     bundle["generated_at"] = datetime.now(UTC).isoformat()
@@ -101,6 +106,46 @@ def render_markdown(bundle: dict[str, Any], *, code_excerpt_lines: int = 60) -> 
         if any(ev["evidence_kind"] == "ai_generated" for ev in finding["evidence"]):
             lines.append("")
             lines.append("> ⚠ This finding cites AI-generated evidence; treat those parts as hypotheses.")
+        lines.append("")
+
+    questions = bundle.get("questions") or []
+    counts = bundle.get("question_counts") or {}
+    lines += ["## Investigation questions", ""]
+    if not questions:
+        lines += ["_No questions recorded; this report makes no completeness claim._", ""]
+    else:
+        open_required = counts.get("required_unresolved", 0)
+        lines.append(
+            f"**Incomplete:** {open_required} required question(s) are not resolved."
+            if open_required
+            else "All required questions are resolved (resolution means cited evidence, not proof of absence elsewhere)."
+        )
+        lines += [
+            "",
+            "| Question | Status | Required | Answer / reason | Supporting | Contradicting |",
+            "|---|---|---|---|---|---|",
+        ]
+        for q in questions:
+            support = _id_list(q["supporting_evidence_ids"], q["supporting_evidence_count"]) or "**missing**"
+            if q["evidence_missing"] and q["supporting_evidence_ids"]:
+                support += " (none still stands: **missing**)"
+            contra = _id_list(q["contradicting_evidence_ids"], q["contradicting_evidence_count"]) or "—"
+            # Evidence linked as contradicting the support (a comparison), not cited on the question.
+            linked = q.get("linked_contradiction_ids") or []
+            if linked:
+                text = ", ".join(f"`{e}`" for e in linked) + " (linked against its support)"
+                contra = text if contra == "—" else f"{contra}; {text}"
+            status = q["status"]
+            if q["stale"]:
+                status += " (**stale**: evidence no longer supports it)"
+            elif q["contested"]:
+                status += (
+                    " (**contested**: contradicting source evidence was dismissed only by an unauthenticated review)"
+                )
+            lines.append(
+                f"| {_md_escape(q['question'])[:300]} | {status} | {'yes' if q['required'] else 'no'} | "
+                f"{_md_escape(q['answer'])[:300] or '—'} | {support} | {contra} |"
+            )
         lines.append("")
 
     comparisons = bundle["comparisons"]
@@ -227,5 +272,7 @@ def export_report(
             "evidence": len(bundle["evidence"]),
             "findings": len(bundle["findings"]),
             "comparisons": len(bundle["comparisons"]),
+            "questions": len(bundle.get("questions") or []),
         },
+        "required_questions_unresolved": (bundle.get("question_counts") or {}).get("required_unresolved", 0),
     }

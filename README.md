@@ -114,15 +114,20 @@ For MCP clients that only speak HTTP (for example GhidrAssist's MCP client):
 | JavaScript/Electron (REA) | `nexus_analyze_javascript_app` (ASAR parsed as inert text), `nexus_get_electron_fuses` |
 | Dynamic | `nexus_dynamic_analysis_status` (read-only status; instrumentation is policy-gated) |
 | Findings/evidence | `nexus_record_finding`, `nexus_get_findings`, `nexus_record_evidence`, `nexus_get_evidence`, `nexus_review`, `nexus_export_report` |
+| Compact retrieval | `nexus_case_brief` (bounded case/target summary for delegated work: counts, critical/high findings (up to 100; more are counted in `omitted`), unresolved questions ranked required-first, an `omitted` map); `nexus_get_evidence` pages newest-first with `next_cursor` and has `view: summary` |
+| Reuse and retries | Single-operation tools return an existing result (`reused: true`) when this case already holds one from the same provider for the same target, operation, parameters and engine fingerprint; `refresh: true` runs again. Writes (`nexus_record_finding`, `nexus_record_evidence`, `nexus_review`, `nexus_record_question`, `nexus_update_question`) take an optional `idempotency_key`: a retry with the same arguments writes nothing and returns the record's current state with the original warnings (`idempotent_replay: true`); different arguments are refused |
+| Investigation questions | `nexus_record_question`, `nexus_update_question` (needs `expected_revision`; evidence-gated states), `nexus_list_questions`; `nexus_plan_analysis(target)` adds a bounded checklist of open questions and existing evidence |
 | Escape hatch | `nexus_call_provider_tool` (raw upstream tool, policy-checked and audited; refused for adapter-only providers such as REA) |
 
 Every result carries an `evidence_id` and provenance (provider, original tool, engine,
 engine family, version, raw-output hash). `server.tool_mode: namespaced` additionally
 exposes each callable upstream tool as `<provider>__<tool>`.
 
-Typical agent flow: `nexus_status` → `nexus_inspect_target` → `nexus_analyze_binary` →
-focused tools → `nexus_compare_function` on important functions → `nexus_record_finding`
-citing evidence ids → `nexus_review` → `nexus_export_report`.
+Typical agent flow: `nexus_status` → `nexus_inspect_target` → `nexus_plan_analysis(target)`
+(reuse existing evidence, see open questions) → `nexus_record_question` for each unknown →
+`nexus_analyze_binary` → focused tools → `nexus_compare_function` on important functions → `nexus_record_finding`
+citing evidence ids → `nexus_update_question` as answers arrive → `nexus_review` →
+`nexus_export_report` (lists unresolved questions; never calls an incomplete case complete).
 
 ## Optional engines (manual prerequisites)
 
